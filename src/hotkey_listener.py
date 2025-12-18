@@ -14,10 +14,11 @@ class HotkeyListener(QObject):
         self.hotkey_str = hotkey_str
         self.logger = logging.getLogger("whisperboard.hotkey")
         self.listener_thread = None
-        self.hotkey = keyboard.HotKey(
-            keyboard.HotKey.parse(self.hotkey_str),
-            self.on_activate
-        )
+        # Store listener so canonical uses same instance
+        self._listener = None
+        parsed = keyboard.HotKey.parse(self.hotkey_str)
+        self.logger.info("Parsed hotkey '%s' as %s", self.hotkey_str, parsed)
+        self.hotkey = keyboard.HotKey(parsed, self.on_activate)
 
     def on_activate(self):
         self.logger.debug("Hotkey %s activated.", self.hotkey_str)
@@ -33,20 +34,20 @@ class HotkeyListener(QObject):
             self.logger.info("Hotkey listener started for '%s'.", self.hotkey_str)
 
     def _run_listener(self):
-        with keyboard.Listener(on_press=self.for_canonical(self.hotkey.press), on_release=self.for_canonical(self.hotkey.release)) as listener:
+        with keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release,
+        ) as listener:
+            self._listener = listener
             listener.join()
-    
-    def for_canonical(self, f):
-        return lambda k: f(self.listener.canonical(k))
-    
-    # This method is needed for pynput to work correctly
-    @property
-    def listener(self):
-        if hasattr(keyboard.Listener, 'canonical'):
-             # This is a bit of a hack to get the listener instance
-             # for the canonical method.
-            return keyboard.Listener(on_press=None)
-        return None
+
+    def _on_press(self, key):
+        if self._listener:
+            self.hotkey.press(self._listener.canonical(key))
+
+    def _on_release(self, key):
+        if self._listener:
+            self.hotkey.release(self._listener.canonical(key))
 
 
 
