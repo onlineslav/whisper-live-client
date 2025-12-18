@@ -23,21 +23,23 @@ class WhisperBoardApp:
         self.app.setQuitOnLastWindowClosed(False)
 
         self.is_capturing = False
+        self._capture_waiting_for_connection = False
         self.connection_status = "Disconnected"
         self.keyboard = Controller()
 
         # Load settings
         self.load_settings()
+        self._apply_launch_on_startup(self.settings.get("launch_on_startup", False))
 
         # UI Windows
         self.settings_window = None
         self.capture_box = CaptureBox()
 
         # Core Components
+        self.audio_capture = AudioCapture()
         self._init_tray_icon()
         self._init_hotkey_listener()
         self._init_websocket_client()
-        self.audio_capture = AudioCapture()
         
         # Connect signals
         self.audio_capture.audio_chunk_ready.connect(self.websocket_client.send_audio)
@@ -52,6 +54,7 @@ class WhisperBoardApp:
         self._create_menu()
         self.tray_icon.setContextMenu(self.menu)
         self.tray_icon.show()
+        self._sync_icon_state()
 
     def _create_menu(self):
         self.status_action = QAction("Status: Disconnected")
@@ -129,33 +132,59 @@ class WhisperBoardApp:
         elif self.connection_status == "Connecting":
             self._set_tray_icon_state("connecting")
         else:
-            self._set_tray_icon_state("error")
+            if self.settings.get("connect_on_demand", False):
+                self._set_tray_icon_state("ready")
+            else:
+                self._set_tray_icon_state("error")
 
     def _init_hotkey_listener(self):
+        self._start_hotkey_listener(self.settings["capture_hotkey"])
+
+    def _start_hotkey_listener(self, hotkey_str):
         try:
-            hotkey_str = self.settings["capture_hotkey"]
-            
             # Validate the hotkey to ensure it's not just modifiers
-            keys = set(part.strip().lower() for part in hotkey_str.split('+'))
+            keys = set(part.strip('<>').strip().lower() for part in hotkey_str.split('+'))
             modifier_keys = {'ctrl', 'alt', 'shift', 'cmd'}
             if not keys or keys.issubset(modifier_keys):
                 raise ValueError("Hotkey must include at least one non-modifier key (e.g., 'a', 'f1').")
+
+            if hasattr(self, "hotkey_listener") and self.hotkey_listener:
+                try:
+                    self.hotkey_listener.stop()
+                except Exception:
+                    self.logger.exception("Failed to stop previous hotkey listener.")
 
             self.hotkey_listener = HotkeyListener(hotkey_str)
             self.hotkey_listener.hotkey_activated.connect(self.on_hotkey_activated)
             self.hotkey_listener.run()
         except Exception as e:
             self.logger.exception("Failed to initialize hotkey listener.")
-            QMessageBox.critical(None, "Hotkey Error", f"Failed to register hotkey '{self.settings['capture_hotkey']}'. Please change it in the settings.\n\nError: {e}")
+            QMessageBox.critical(None, "Hotkey Error", f"Failed to register hotkey '{hotkey_str}'. Please change it in the settings.\n\nError: {e}")
 
     def _init_websocket_client(self):
+        previous_client = getattr(self, "websocket_client", None)
+        if previous_client:
+            try:
+                self.audio_capture.audio_chunk_ready.disconnect(previous_client.send_audio)
+            except Exception:
+                pass
+            try:
+                previous_client.disconnect()
+            except Exception:
+                self.logger.exception("Failed to disconnect previous WebSocket client.")
+
         self.websocket_client = WebSocketClient(
             self.settings["server_address"],
             self.settings.get("model", "tiny.en"),
+            sample_rate=self.audio_capture.rate,
+            channels=self.audio_capture.channels,
+            audio_format=self.audio_capture.audio_format,
         )
         self.websocket_client.connection_status_changed.connect(self.on_connection_status_changed)
         self.websocket_client.message_received.connect(self.on_message_received)
-        self.websocket_client.connect()
+        self.audio_capture.audio_chunk_ready.connect(self.websocket_client.send_audio)
+        if not self.settings.get("connect_on_demand", False):
+            self.websocket_client.connect()
 
     def load_settings(self):
         try:
@@ -163,10 +192,69 @@ class WhisperBoardApp:
                 self.settings = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             self.settings = DEFAULT_SETTINGS
+        # Ensure new defaults exist
+        if "connect_on_demand" not in self.settings:
+            self.settings["connect_on_demand"] = DEFAULT_SETTINGS.get("connect_on_demand", False)
+        self.settings["capture_hotkey"] = self._normalize_hotkey_string(
+            self.settings.get("capture_hotkey", DEFAULT_SETTINGS["capture_hotkey"])
+        )
+
+    def _normalize_hotkey_string(self, hotkey: str) -> str:
+        """Ensure modifiers are wrapped for pynput parsing."""
+        if not hotkey:
+            return ""
+        parts = []
+        for token in hotkey.split('+'):
+            t = token.strip().lower()
+            if not t:
+                continue
+            if t in ("<ctrl>", "ctrl", "control"):
+                parts.append("<ctrl>")
+            elif t in ("<alt>", "alt"):
+                parts.append("<alt>")
+            elif t in ("<shift>", "shift"):
+                parts.append("<shift>")
+            elif t in ("<cmd>", "cmd", "win", "windows", "meta", "super"):
+                parts.append("<cmd>")
+            else:
+                t = t.strip("<>")
+                parts.append(t)
+        return "+".join(parts)
+
+    def _startup_command(self) -> str:
+        if getattr(sys, "frozen", False):
+            return f"\"{sys.executable}\""
+        return f"\"{sys.executable}\" \"{os.path.abspath(__file__)}\""
+
+    def _apply_launch_on_startup(self, enabled: bool):
+        """Create or remove the Run key entry for autostart on Windows."""
+        try:
+            import winreg
+            run_key = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
+                if enabled:
+                    winreg.SetValueEx(key, "WhisperBoard", 0, winreg.REG_SZ, self._startup_command())
+                else:
+                    try:
+                        winreg.DeleteValue(key, "WhisperBoard")
+                    except FileNotFoundError:
+                        pass
+        except Exception:
+            self.logger.exception("Failed to update launch on startup setting.")
 
     def on_connection_status_changed(self, status):
         self.connection_status = status
-        self.status_action.setText(f"Status: {status}")
+        status_label = status
+        if status == "Disconnected" and self.settings.get("connect_on_demand", False):
+            status_label = "Disconnected (on-demand)"
+        self.status_action.setText(f"Status: {status_label}")
+
+        if status == "Connected" and self.is_capturing and self._capture_waiting_for_connection:
+            self._capture_waiting_for_connection = False
+            self.capture_box.set_text("Listening...")
+            self.audio_capture.start_streaming()
+            self.websocket_client.reset_eos()
+
         self._sync_icon_state()
         self.logger.info("Connection status changed: %s", status)
 
@@ -176,8 +264,14 @@ class WhisperBoardApp:
         
         try:
             message = json.loads(message_str)
-            if "segments" in message and message["segments"]:
-                full_text = "".join(seg["text"] for seg in message["segments"])
+            full_text = ""
+            if isinstance(message, dict):
+                if message.get("segments"):
+                    full_text = "".join(seg.get("text", "") for seg in message["segments"] if isinstance(seg, dict))
+                elif "text" in message:
+                    full_text = str(message.get("text", ""))
+
+            if full_text:
                 self.capture_box.set_text(full_text.strip())
         except json.JSONDecodeError:
             self.logger.warning("Received non-JSON message: %s", message_str)
@@ -189,23 +283,35 @@ class WhisperBoardApp:
             return
         if not self.is_capturing:
             self.is_capturing = True
-            self.capture_box.set_text("Listening...")
-            self.capture_box.show_at_cursor()
-            self.audio_capture.start_streaming()
-            self.websocket_client.reset_eos()
-            self._sync_icon_state()
+            self._capture_waiting_for_connection = False
+            on_demand = self.settings.get("connect_on_demand", False)
+            if on_demand and self.connection_status != "Connected":
+                self._capture_waiting_for_connection = True
+                self.capture_box.set_text("Connecting...")
+                self.capture_box.show_at_cursor()
+                self._sync_icon_state()
+                self.websocket_client.connect()
+            else:
+                self.capture_box.set_text("Listening...")
+                self.capture_box.show_at_cursor()
+                self.audio_capture.start_streaming()
+                self.websocket_client.reset_eos()
+                self._sync_icon_state()
             self.logger.debug("Capture started via hotkey.")
         else:
-            self.on_capture_confirmed(self.capture_box.text_label.text())
+            self.on_capture_confirmed(self.capture_box.text_area.toPlainText())
 
     def on_capture_confirmed(self, text):
         if not self.is_capturing:
             return
         self.is_capturing = False
+        self._capture_waiting_for_connection = False
         # Hide the capture UI to return focus to the previous app
         self.capture_box.hide()
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
+        if self.settings.get("connect_on_demand", False):
+            self.websocket_client.disconnect()
         self._sync_icon_state()
         self.logger.debug("Capture confirmed with text length %d", len(text))
 
@@ -228,10 +334,13 @@ class WhisperBoardApp:
         if not self.is_capturing:
             return
         self.is_capturing = False
+        self._capture_waiting_for_connection = False
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
+        if self.settings.get("connect_on_demand", False):
+            self.websocket_client.disconnect()
         self._sync_icon_state()
-        self.write_to_history(self.capture_box.text_label.text(), status="CANCELLED")
+        self.write_to_history(self.capture_box.text_area.toPlainText(), status="CANCELLED")
         self.logger.debug("Capture cancelled.")
 
     def write_to_history(self, text, status="CONFIRMED"):
@@ -253,11 +362,38 @@ class WhisperBoardApp:
             QMessageBox.critical(None, "Error", f"Could not open history file.\n\nError: {e}")
 
     def open_settings(self):
+        try:
+            if hasattr(self, "hotkey_listener") and self.hotkey_listener:
+                self.hotkey_listener.stop()
+        except Exception:
+            self.logger.exception("Error stopping hotkey listener before opening settings.")
+
         if self.settings_window is None:
             self.settings_window = SettingsWindow()
-            self.settings_window.save_button.clicked.connect(lambda: None)
+            self.settings_window.settings_saved.connect(self.on_settings_saved)
+            self.settings_window.window_closed.connect(self.on_settings_closed)
+        else:
+            self.settings_window.load_settings()
+            try:
+                self.settings_window.window_closed.disconnect()
+            except Exception:
+                pass
+            self.settings_window.window_closed.connect(self.on_settings_closed)
         self.settings_window.show()
         self.settings_window.activateWindow()
+
+    def on_settings_closed(self):
+        """Resume hotkey listener when settings window closes."""
+        self._start_hotkey_listener(self.settings["capture_hotkey"])
+
+    def on_settings_saved(self, updated_settings):
+        """Apply updated settings from the Settings window."""
+        self.settings = updated_settings
+        self.settings["capture_hotkey"] = self._normalize_hotkey_string(self.settings.get("capture_hotkey", ""))
+        self._apply_launch_on_startup(self.settings.get("launch_on_startup", False))
+        self._start_hotkey_listener(self.settings["capture_hotkey"])
+        self._init_websocket_client()
+        self._sync_icon_state()
 
     def run(self):
         sys.exit(self.app.exec())

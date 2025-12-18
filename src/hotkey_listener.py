@@ -49,6 +49,14 @@ class HotkeyListener(QObject):
         if self._listener:
             self.hotkey.release(self._listener.canonical(key))
 
+    def stop(self):
+        """Stop listening and wait for the listener thread to finish."""
+        if self._listener:
+            self._listener.stop()
+        if self.listener_thread and self.listener_thread.is_alive():
+            self.listener_thread.join(timeout=1)
+        self._listener = None
+
 
 
 if __name__ == '__main__':

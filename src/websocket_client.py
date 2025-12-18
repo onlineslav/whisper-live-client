@@ -13,10 +13,13 @@ class WebSocketClient(QObject):
     connection_status_changed = Signal(str)  # Emits "Connecting", "Connected", "Disconnected", "Error"
     message_received = Signal(str)           # Emits the raw JSON string from the server
     
-    def __init__(self, server_address, model):
+    def __init__(self, server_address, model="tiny.en", sample_rate=16000, channels=1, audio_format="pcm_s16le"):
         super().__init__()
         self.server_address = server_address
         self.model = model
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.audio_format = audio_format
         self.logger = logging.getLogger("whisperboard.websocket")
         self.websocket = None
         self.thread = None
@@ -37,7 +40,8 @@ class WebSocketClient(QObject):
             self.is_running = False
             if self.loop and self.loop.is_running():
                 self.loop.call_soon_threadsafe(self.loop.stop)
-            self.thread.join()
+            if self.thread:
+                self.thread.join()
             self.connection_status_changed.emit("Disconnected")
             self.logger.info("WebSocket client disconnected.")
 
@@ -69,6 +73,9 @@ class WebSocketClient(QObject):
                         "language": "en",
                         "task": "transcribe",
                         "model": self.model,
+                        "sample_rate": self.sample_rate,
+                        "format": self.audio_format,
+                        "channels": self.channels,
                     }))
                     self.logger.debug("Handshake sent.")
 
