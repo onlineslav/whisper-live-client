@@ -183,6 +183,10 @@ class WhisperBoardApp:
             self.logger.warning("Received non-JSON message: %s", message_str)
     
     def on_hotkey_activated(self):
+        # Ignore hotkey while settings window is open to prevent accidental activation during configuration
+        if self.settings_window and self.settings_window.isVisible():
+            self.logger.debug("Hotkey pressed while settings window open; ignoring.")
+            return
         if not self.is_capturing:
             self.is_capturing = True
             self.capture_box.set_text("Listening...")
