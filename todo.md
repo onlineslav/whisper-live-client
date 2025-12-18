@@ -64,3 +64,15 @@ This checklist outlines the tasks required to build the WhisperBoard application
     - [x] Write a `README.md` on how to set up and run the application.
     - [ ] Test the application thoroughly.
     - [ ] (Optional) Create a `pyinstaller` spec file to bundle the application into a `.exe`.
+
+## Post-audit follow-ups
+- [ ] Fix crash when confirming/cancelling: replace `capture_box.text_label` with `capture_box.text_area` in `src/main.py`.
+- [ ] Fix `setWordWrapMode` usage in `src/capture_box.py` (use a proper `QTextOption` wrap mode) so the capture box instantiates cleanly.
+- [ ] Add click-away-to-cancel behavior and optional fade-in/out animations for the capture box; prefer caret-aware positioning over mouse-based.
+- [ ] Align audio format with WhisperLive expectations (likely 16 kHz mono int16 PCM) and include any required handshake metadata (e.g., sample rate/format).
+- [ ] Improve hotkey picker: switch settings hotkey input to `QKeySequenceEdit` and map to the `pynput` string; reload listener after saving.
+- [ ] Implement launch-on-startup toggle wiring for Windows (e.g., shortcut in Startup folder or registry entry).
+- [ ] Add user feedback when history file is missing; optionally create it on demand.
+- [ ] Ensure clean shutdown of WebSocket/audio threads when exiting from tray.
+- [ ] Expand message handling to cover alternative WhisperLive schemas (`text`/`segments`/`is_final`) and ignore unexpected payloads gracefully.
+- [ ] Add smoke tests/validation runs for connection, capture loop, and paste behavior.
