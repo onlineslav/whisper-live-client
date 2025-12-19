@@ -14,7 +14,22 @@ WhisperBoard is a sleek, hotkey-driven dictation utility for Windows. It capture
 ## Prerequisites
 
 1.  **Python 3.8+**
-2.  **A running `whisper-live` server instance.** This project acts as a client. You must have an instance of the [collabora/WhisperLive](https://github.com/collabora/WhisperLive) server running. The easiest way is via Docker.
+2.  **A running `whisper-live` server instance.** This project acts as a client. You must have an instance of the [collabora/WhisperLive](https://github.com/collabora/WhisperLive) server running. The easiest way is via Docker Desktop (see instructions below).
+
+## Run the WhisperLive server (Docker)
+
+1. Install **Docker Desktop** if you do not have it already.
+2. Run **ONE** of these commands in a terminal and leave it running:
+
+   **CPU:**
+   ```bash
+   docker run -it -p 9090:9090 ghcr.io/collabora/whisperlive-cpu:latest
+   ```
+
+   **NVIDIA GPU:**
+   ```bash
+   docker run -it --gpus all -p 9090:9090 ghcr.io/collabora/whisperlive-gpu:latest
+   ```
 
 ## Setup Instructions
 
