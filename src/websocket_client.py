@@ -36,14 +36,21 @@ class WebSocketClient(QObject):
             self.logger.info("Starting WebSocket client thread for %s", self.server_address)
 
     def disconnect(self):
-        if self.is_running:
-            self.is_running = False
-            if self.loop and self.loop.is_running():
-                self.loop.call_soon_threadsafe(self.loop.stop)
-            if self.thread:
-                self.thread.join()
-            self.connection_status_changed.emit("Disconnected")
-            self.logger.info("WebSocket client disconnected.")
+        if not self.is_running:
+            return
+        self.is_running = False
+        # Nudge the event loop to exit its wait and close the websocket cleanly
+        if self.loop and self.loop.is_running():
+            try:
+                if self.websocket:
+                    asyncio.run_coroutine_threadsafe(self.websocket.close(), self.loop)
+                self.loop.call_soon_threadsafe(lambda: None)
+            except Exception:
+                self.logger.exception("Failed to request websocket shutdown.")
+        if self.thread:
+            self.thread.join()
+        self.connection_status_changed.emit("Disconnected")
+        self.logger.info("WebSocket client disconnected.")
 
     def _run(self):
         try:
@@ -54,7 +61,8 @@ class WebSocketClient(QObject):
             self.connection_status_changed.emit("Error")
             self.logger.exception("WebSocket client error.")
         finally:
-            self.loop.close()
+            if self.loop and not self.loop.is_closed():
+                self.loop.close()
 
     async def _main_loop(self):
         while self.is_running:
@@ -81,7 +89,15 @@ class WebSocketClient(QObject):
 
                     # Listen for messages
                     while self.is_running:
-                        message = await self.websocket.recv()
+                        raw_message = await self.websocket.recv()
+                        if isinstance(raw_message, (bytes, bytearray)):
+                            try:
+                                message = raw_message.decode("utf-8", errors="ignore")
+                            except Exception:
+                                self.logger.warning("Dropped binary message of len %d (decode failed).", len(raw_message))
+                                continue
+                        else:
+                            message = raw_message
                         self.message_received.emit(message)
                         self.logger.debug("Message received (%d bytes).", len(message))
 
@@ -95,7 +111,7 @@ class WebSocketClient(QObject):
                 self.is_running = False # Stop on unexpected errors
 
     def send_audio(self, audio_chunk):
-        if self.websocket and self.loop and self.is_running:
+        if self.websocket and self.loop and self.is_running and not self._eos_sent:
             self.logger.debug("Sending audio chunk (%d bytes).", len(audio_chunk))
             asyncio.run_coroutine_threadsafe(self.websocket.send(audio_chunk), self.loop)
 
@@ -105,8 +121,9 @@ class WebSocketClient(QObject):
             if self._eos_sent:
                 return
             self._eos_sent = True
-            self.logger.debug("Sending EOS marker (binary).")
-            asyncio.run_coroutine_threadsafe(self.websocket.send(b"EOS"), self.loop)
+            # WhisperLive expects a binary sentinel
+            self.logger.debug("Sending EOS marker (binary END_OF_AUDIO).")
+            asyncio.run_coroutine_threadsafe(self.websocket.send(b"END_OF_AUDIO"), self.loop)
 
     def reset_eos(self):
         """Allow sending EOS again on the next capture."""

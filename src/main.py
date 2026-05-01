@@ -7,7 +7,7 @@ from datetime import datetime
 from pynput.keyboard import Controller, Key
 from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QPen, QGuiApplication
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QMessageBox
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, QTimer
 from settings_window import SettingsWindow, DEFAULT_SETTINGS, CONFIG_FILE
 from hotkey_listener import HotkeyListener
 from websocket_client import WebSocketClient
@@ -24,6 +24,7 @@ class WhisperBoardApp:
 
         self.is_capturing = False
         self._capture_waiting_for_connection = False
+        self._post_capture_grace_until = 0.0
         self.connection_status = "Disconnected"
         self.keyboard = Controller()
 
@@ -42,7 +43,6 @@ class WhisperBoardApp:
         self._init_websocket_client()
         
         # Connect signals
-        self.audio_capture.audio_chunk_ready.connect(self.websocket_client.send_audio)
         self.capture_box.confirmed.connect(self.on_capture_confirmed)
         self.capture_box.cancelled.connect(self.on_capture_cancelled)
 
@@ -259,20 +259,35 @@ class WhisperBoardApp:
         self.logger.info("Connection status changed: %s", status)
 
     def on_message_received(self, message_str):
-        if not self.is_capturing:
+        now = time.time()
+        if not self.is_capturing and now > self._post_capture_grace_until:
+            self.logger.debug("Dropping message outside capture window.")
             return
-        
+
         try:
+            if isinstance(message_str, (bytes, bytearray)):
+                try:
+                    message_str = message_str.decode("utf-8", errors="ignore")
+                except Exception:
+                    self.logger.warning("Failed to decode binary message of len %d", len(message_str))
+                    return
             message = json.loads(message_str)
             full_text = ""
             if isinstance(message, dict):
+                # Prefer segments if present; otherwise fall back to text/is_final payloads
                 if message.get("segments"):
                     full_text = "".join(seg.get("text", "") for seg in message["segments"] if isinstance(seg, dict))
                 elif "text" in message:
                     full_text = str(message.get("text", ""))
+                # Some schemas send { "is_final": true, "text": "..." }
+                if not full_text and isinstance(message.get("segment"), dict):
+                    full_text = str(message["segment"].get("text", ""))
 
             if full_text:
                 self.capture_box.set_text(full_text.strip())
+                self.logger.debug("Updated capture text (%d chars).", len(full_text))
+            else:
+                self.logger.debug("Message received but no text found: %s", message)
         except json.JSONDecodeError:
             self.logger.warning("Received non-JSON message: %s", message_str)
     
@@ -306,12 +321,12 @@ class WhisperBoardApp:
             return
         self.is_capturing = False
         self._capture_waiting_for_connection = False
+        self._post_capture_grace_until = time.time() + 8.0
         # Hide the capture UI to return focus to the previous app
         self.capture_box.hide()
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
-        if self.settings.get("connect_on_demand", False):
-            self.websocket_client.disconnect()
+        self._schedule_on_demand_disconnect()
         self._sync_icon_state()
         self.logger.debug("Capture confirmed with text length %d", len(text))
 
@@ -335,13 +350,19 @@ class WhisperBoardApp:
             return
         self.is_capturing = False
         self._capture_waiting_for_connection = False
+        self._post_capture_grace_until = time.time() + 8.0
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
-        if self.settings.get("connect_on_demand", False):
-            self.websocket_client.disconnect()
+        self._schedule_on_demand_disconnect()
         self._sync_icon_state()
         self.write_to_history(self.capture_box.text_area.toPlainText(), status="CANCELLED")
         self.logger.debug("Capture cancelled.")
+
+    def _schedule_on_demand_disconnect(self):
+        if not self.settings.get("connect_on_demand", False):
+            return
+        # Delay disconnect slightly so the server can deliver final transcripts after EOS.
+        QTimer.singleShot(1200, self.websocket_client.disconnect)
 
     def write_to_history(self, text, status="CONFIRMED"):
         try:
