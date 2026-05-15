@@ -1,4 +1,5 @@
 import copy
+import ctypes
 import sys
 import json
 import os
@@ -6,7 +7,7 @@ import logging
 import time
 from datetime import datetime
 from pynput.keyboard import Controller, Key
-from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QPen, QGuiApplication
+from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QPen
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QMessageBox
 from PySide6.QtCore import Qt, QRectF, QTimer
 from settings_window import SettingsWindow, DEFAULT_SETTINGS, APP_DATA_DIR, CONFIG_FILE
@@ -42,6 +43,9 @@ class WhisperBoardApp:
         self._post_capture_grace_until = 0.0
         self.connection_status = "Disconnected"
         self.keyboard = Controller()
+        # Win32 handle of the window that had focus before the Capture Box
+        # appeared, so paste can be routed back to it (e.g. Notepad).
+        self._prev_foreground_hwnd = None
 
         # Load settings
         self.load_settings()
@@ -320,6 +324,8 @@ class WhisperBoardApp:
         if not self.is_capturing:
             self.is_capturing = True
             self._capture_waiting_for_connection = False
+            # Record the target window now, before the Capture Box steals focus.
+            self._prev_foreground_hwnd = self._get_foreground_window()
             on_demand = self.settings.get("connect_on_demand", False)
             if on_demand and self.connection_status != "Connected":
                 self._capture_waiting_for_connection = True
@@ -435,9 +441,28 @@ class WhisperBoardApp:
         self._init_websocket_client()
         self._sync_icon_state()
 
+    @staticmethod
+    def _get_foreground_window():
+        """Return the Win32 handle of the current foreground window, or None."""
+        if sys.platform != "win32":
+            return None
+        try:
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+            return hwnd or None
+        except Exception:
+            return None
+
     def _do_paste(self):
-        focused = QGuiApplication.focusWindow()
-        self.logger.debug("Focused window before paste: %s", focused)
+        # Restore focus to the window that was active before the Capture Box
+        # opened, so Ctrl+V lands in the user's target app (e.g. Notepad).
+        # The app currently owns the foreground, so it is allowed to reassign it.
+        if sys.platform == "win32" and self._prev_foreground_hwnd:
+            try:
+                ctypes.windll.user32.SetForegroundWindow(self._prev_foreground_hwnd)
+                QApplication.processEvents()
+            except Exception:
+                self.logger.exception("Failed to restore foreground window before paste.")
+
         with self.keyboard.pressed(Key.ctrl):
             self.keyboard.press('v')
             self.keyboard.release('v')

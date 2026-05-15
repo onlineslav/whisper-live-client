@@ -1,4 +1,7 @@
+import array
+import collections
 import logging
+import math
 import pyaudio
 import threading
 from PySide6.QtCore import QObject, Signal
@@ -19,6 +22,19 @@ class AudioCapture(QObject):
         self.audio_format = "f32le"  # Handshake/metadata format string
         self.logger = logging.getLogger("whisperboard.audio")
 
+        # Client-side voice activity gating. Whisper hallucinates words when fed
+        # near-silent audio, and the server's own VAD leaks. Gating here means
+        # silence never reaches the server, so it cannot hallucinate on it.
+        #   - threshold: RMS of a chunk (float32 samples in -1..1) below this is
+        #     treated as silence. ~0.012 sits above mic noise floor, below speech.
+        #   - hangover: keep streaming this many chunks after speech stops so
+        #     trailing word tails and short inter-word pauses are not clipped.
+        #   - preroll: chunks of pre-speech audio flushed on speech onset so the
+        #     first syllable is not lost. (~64ms per chunk at 1024/16000.)
+        self._silence_threshold = 0.012
+        self._hangover_chunks = 8
+        self._preroll_chunks = 3
+
         self._p = pyaudio.PyAudio()
         self._stream = None
         self._thread = None
@@ -37,8 +53,20 @@ class AudioCapture(QObject):
             self._thread.join()
         self.logger.info("Audio capture stopped.")
     
+    @staticmethod
+    def _chunk_rms(data: bytes) -> float:
+        """Root-mean-square level of a float32 PCM chunk."""
+        samples = array.array("f")
+        samples.frombytes(data)
+        if not samples:
+            return 0.0
+        return math.sqrt(sum(s * s for s in samples) / len(samples))
+
     def _run_capture(self):
         self._stream = None
+        preroll = collections.deque(maxlen=self._preroll_chunks)
+        speaking = False
+        silent_run = 0
         try:
             self._stream = self._p.open(format=self.format,
                                         channels=self.channels,
@@ -49,10 +77,33 @@ class AudioCapture(QObject):
             while self._is_running:
                 try:
                     data = self._stream.read(self.chunk_size, exception_on_overflow=False)
-                    self.audio_chunk_ready.emit(data)
                 except IOError as e:
                     self.logger.warning("Audio capture warning: %s", e)
                     continue
+
+                is_speech = self._chunk_rms(data) >= self._silence_threshold
+                if is_speech:
+                    silent_run = 0
+                    if not speaking:
+                        # Speech onset: flush buffered pre-roll so the first
+                        # syllable is not clipped, then mark as speaking.
+                        for buffered in preroll:
+                            self.audio_chunk_ready.emit(buffered)
+                        preroll.clear()
+                        speaking = True
+                    self.audio_chunk_ready.emit(data)
+                elif speaking:
+                    # Silence after speech: keep streaming through the hangover
+                    # window (covers word tails and brief pauses), then stop.
+                    silent_run += 1
+                    if silent_run <= self._hangover_chunks:
+                        self.audio_chunk_ready.emit(data)
+                    else:
+                        speaking = False
+                        preroll.append(data)
+                else:
+                    # Sustained silence: buffer as pre-roll, send nothing.
+                    preroll.append(data)
 
         except Exception:
             self.logger.exception("Audio capture failed to open stream.")
