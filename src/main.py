@@ -1,5 +1,4 @@
 import copy
-import ctypes
 import sys
 import json
 import os
@@ -15,6 +14,7 @@ from hotkey_listener import HotkeyListener
 from websocket_client import WebSocketClient
 from audio_capture import AudioCapture
 from capture_box import CaptureBox
+from win_focus import get_foreground_window, focus_window
 
 HISTORY_FILE = os.path.join(APP_DATA_DIR, "transcription_history.log")
 
@@ -325,7 +325,7 @@ class WhisperBoardApp:
             self.is_capturing = True
             self._capture_waiting_for_connection = False
             # Record the target window now, before the Capture Box steals focus.
-            self._prev_foreground_hwnd = self._get_foreground_window()
+            self._prev_foreground_hwnd = get_foreground_window()
             on_demand = self.settings.get("connect_on_demand", False)
             if on_demand and self.connection_status != "Connected":
                 self._capture_waiting_for_connection = True
@@ -441,27 +441,20 @@ class WhisperBoardApp:
         self._init_websocket_client()
         self._sync_icon_state()
 
-    @staticmethod
-    def _get_foreground_window():
-        """Return the Win32 handle of the current foreground window, or None."""
-        if sys.platform != "win32":
-            return None
-        try:
-            hwnd = ctypes.windll.user32.GetForegroundWindow()
-            return hwnd or None
-        except Exception:
-            return None
-
     def _do_paste(self):
         # Restore focus to the window that was active before the Capture Box
-        # opened, so Ctrl+V lands in the user's target app (e.g. Notepad).
-        # The app currently owns the foreground, so it is allowed to reassign it.
-        if sys.platform == "win32" and self._prev_foreground_hwnd:
-            try:
-                ctypes.windll.user32.SetForegroundWindow(self._prev_foreground_hwnd)
+        # opened, then simulate Ctrl+V so the text lands at its caret.
+        hwnd = self._prev_foreground_hwnd
+        if hwnd:
+            if focus_window(hwnd):
+                # Let Windows settle the foreground/focus change before keys.
                 QApplication.processEvents()
-            except Exception:
-                self.logger.exception("Failed to restore foreground window before paste.")
+            else:
+                self.logger.warning(
+                    "Could not restore focus to target window 0x%X; "
+                    "paste may land in the wrong place.", hwnd)
+        else:
+            self.logger.warning("No target window recorded; cannot route paste.")
 
         with self.keyboard.pressed(Key.ctrl):
             self.keyboard.press('v')
