@@ -326,19 +326,21 @@ class WhisperBoardApp:
             self._capture_waiting_for_connection = False
             # Record the target window now, before the Capture Box steals focus.
             self._prev_foreground_hwnd = get_foreground_window()
-            on_demand = self.settings.get("connect_on_demand", False)
-            if on_demand and self.connection_status != "Connected":
-                self._capture_waiting_for_connection = True
-                self.capture_box.set_text("Connecting...")
-                self.capture_box.show_at_cursor()
-                self._sync_icon_state()
-                self.websocket_client.connect()
-            else:
+            self.capture_box.show_at_cursor()
+            if self.connection_status == "Connected":
                 self.capture_box.set_text("Listening...")
-                self.capture_box.show_at_cursor()
                 self.audio_capture.start_streaming()
                 self.websocket_client.reset_eos()
-                self._sync_icon_state()
+            else:
+                # Not connected yet. Happens on the first capture in
+                # connect-on-demand mode, and after every capture in persistent
+                # mode (WhisperLive closes the socket in response to our
+                # END_OF_AUDIO). Wait for the connection — on_connection_status_
+                # changed() starts streaming once it reports "Connected".
+                self._capture_waiting_for_connection = True
+                self.capture_box.set_text("Connecting...")
+                self.websocket_client.connect()
+            self._sync_icon_state()
             self.logger.debug("Capture started via hotkey.")
         else:
             if self._capture_waiting_for_connection:

@@ -67,6 +67,10 @@ class WebSocketClient(QObject):
             self._stop_event = None
             if self.loop and not self.loop.is_closed():
                 self.loop.close()
+            # The client thread has fully stopped — make sure the app knows the
+            # connection is gone. Without this, connection_status stays stale at
+            # "Connected" and the next capture streams into a dead socket.
+            self.connection_status_changed.emit("Disconnected")
 
     async def _interruptible_sleep(self, seconds: float):
         """Sleep up to `seconds`, waking early if disconnect() sets _stop_event."""
@@ -120,8 +124,14 @@ class WebSocketClient(QObject):
 
             except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK, OSError) as e:
                 self.connection_status_changed.emit("Disconnected")
-                self.logger.warning("Connection closed: %s. Reconnecting...", e)
-                await self._interruptible_sleep(1)
+                if self._eos_sent:
+                    # Expected: WhisperLive closes the socket in response to our
+                    # END_OF_AUDIO. Reconnect immediately so the next capture
+                    # has a fresh, live connection ready with minimal delay.
+                    self.logger.info("Connection closed after EOS; reconnecting.")
+                else:
+                    self.logger.warning("Connection closed: %s. Reconnecting...", e)
+                    await self._interruptible_sleep(1)
             except Exception:
                 self.connection_status_changed.emit("Error")
                 self.logger.exception("Unexpected WebSocket error; will retry.")
