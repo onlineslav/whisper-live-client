@@ -1,3 +1,4 @@
+import copy
 import sys
 import json
 import os
@@ -8,13 +9,27 @@ from pynput.keyboard import Controller, Key
 from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QPen, QGuiApplication
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QMessageBox
 from PySide6.QtCore import Qt, QRectF, QTimer
-from settings_window import SettingsWindow, DEFAULT_SETTINGS, CONFIG_FILE
+from settings_window import SettingsWindow, DEFAULT_SETTINGS, APP_DATA_DIR, CONFIG_FILE
 from hotkey_listener import HotkeyListener
 from websocket_client import WebSocketClient
 from audio_capture import AudioCapture
 from capture_box import CaptureBox
 
-HISTORY_FILE = "transcription_history.log"
+HISTORY_FILE = os.path.join(APP_DATA_DIR, "transcription_history.log")
+
+# Whisper is known to emit these strings on silence/noise. Drop any segment
+# whose normalized text matches. WhisperLive issue #185 tracks the upstream bug.
+HALLUCINATION_PHRASES = {
+    "", ".", "you", "thank you", "thanks for watching",
+    "thank you for watching", "thanks", "okay", "ok", "bye",
+    "the end", "subscribe", "please subscribe",
+    "thanks for watching the video", "thank you very much",
+}
+
+
+def _is_hallucination(text: str) -> bool:
+    normalized = text.strip().lower().strip(".,!?\"' ")
+    return normalized in HALLUCINATION_PHRASES
 
 class WhisperBoardApp:
     def __init__(self):
@@ -45,6 +60,7 @@ class WhisperBoardApp:
         # Connect signals
         self.capture_box.confirmed.connect(self.on_capture_confirmed)
         self.capture_box.cancelled.connect(self.on_capture_cancelled)
+        self.app.aboutToQuit.connect(self._shutdown)
 
     def _init_tray_icon(self):
         self.state_icons = self._build_state_icons()
@@ -175,7 +191,7 @@ class WhisperBoardApp:
 
         self.websocket_client = WebSocketClient(
             self.settings["server_address"],
-            self.settings.get("model", "tiny.en"),
+            self.settings.get("model", "distil-small.en"),
             sample_rate=self.audio_capture.rate,
             channels=self.audio_capture.channels,
             audio_format=self.audio_capture.audio_format,
@@ -191,7 +207,7 @@ class WhisperBoardApp:
             with open(CONFIG_FILE, "r") as f:
                 self.settings = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            self.settings = DEFAULT_SETTINGS
+            self.settings = copy.deepcopy(DEFAULT_SETTINGS)
         # Ensure new defaults exist
         if "connect_on_demand" not in self.settings:
             self.settings["connect_on_demand"] = DEFAULT_SETTINGS.get("connect_on_demand", False)
@@ -230,7 +246,7 @@ class WhisperBoardApp:
         """Create or remove the Run key entry for autostart on Windows."""
         try:
             import winreg
-            run_key = r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+            run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
                 if enabled:
                     winreg.SetValueEx(key, "WhisperBoard", 0, winreg.REG_SZ, self._startup_command())
@@ -274,14 +290,19 @@ class WhisperBoardApp:
             message = json.loads(message_str)
             full_text = ""
             if isinstance(message, dict):
-                # Prefer segments if present; otherwise fall back to text/is_final payloads
                 if message.get("segments"):
-                    full_text = "".join(seg.get("text", "") for seg in message["segments"] if isinstance(seg, dict))
+                    kept = [
+                        seg.get("text", "")
+                        for seg in message["segments"]
+                        if isinstance(seg, dict) and not _is_hallucination(seg.get("text", ""))
+                    ]
+                    full_text = "".join(kept)
                 elif "text" in message:
-                    full_text = str(message.get("text", ""))
-                # Some schemas send { "is_final": true, "text": "..." }
+                    text = str(message.get("text", ""))
+                    full_text = "" if _is_hallucination(text) else text
                 if not full_text and isinstance(message.get("segment"), dict):
-                    full_text = str(message["segment"].get("text", ""))
+                    seg_text = str(message["segment"].get("text", ""))
+                    full_text = "" if _is_hallucination(seg_text) else seg_text
 
             if full_text:
                 self.capture_box.set_text(full_text.strip())
@@ -314,7 +335,10 @@ class WhisperBoardApp:
                 self._sync_icon_state()
             self.logger.debug("Capture started via hotkey.")
         else:
-            self.on_capture_confirmed(self.capture_box.text_area.toPlainText())
+            if self._capture_waiting_for_connection:
+                self.on_capture_cancelled()
+            else:
+                self.on_capture_confirmed(self.capture_box.text_area.toPlainText())
 
     def on_capture_confirmed(self, text):
         if not self.is_capturing:
@@ -333,17 +357,12 @@ class WhisperBoardApp:
         # Save to history log
         self.write_to_history(text, status="CONFIRMED")
 
-        # Paste text at cursor
+        # Set clipboard and schedule paste after focus returns to the target app.
+        # processEvents() flushes the hide/focus-change events synchronously so
+        # the OS has time to restore focus to the previous window before paste fires.
         QApplication.clipboard().setText(text)
         QApplication.processEvents()
-        time.sleep(0.18)  # let focus return to the target app
-        focused = QGuiApplication.focusWindow()
-        self.logger.debug("Focused window before paste: %s", focused)
-        with self.keyboard.pressed(Key.ctrl):
-            self.keyboard.press('v')
-            self.keyboard.release('v')
-        time.sleep(0.02)
-        self.logger.debug("Paste triggered via Ctrl+V.")
+        QTimer.singleShot(220, self._do_paste)
 
     def on_capture_cancelled(self):
         if not self.is_capturing:
@@ -415,6 +434,19 @@ class WhisperBoardApp:
         self._start_hotkey_listener(self.settings["capture_hotkey"])
         self._init_websocket_client()
         self._sync_icon_state()
+
+    def _do_paste(self):
+        focused = QGuiApplication.focusWindow()
+        self.logger.debug("Focused window before paste: %s", focused)
+        with self.keyboard.pressed(Key.ctrl):
+            self.keyboard.press('v')
+            self.keyboard.release('v')
+        self.logger.debug("Paste triggered via Ctrl+V.")
+
+    def _shutdown(self):
+        self.audio_capture.shutdown()
+        if getattr(self, "websocket_client", None):
+            self.websocket_client.disconnect()
 
     def run(self):
         sys.exit(self.app.exec())

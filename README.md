@@ -31,6 +31,22 @@ WhisperBoard is a sleek, hotkey-driven dictation utility for Windows. It capture
    docker run -it --gpus all -p 9090:9090 ghcr.io/collabora/whisperlive-gpu:latest
    ```
 
+   The `ghcr.io/collabora/whisperlive-*` images load the Whisper model once and share it across all connections by default. (Pass `--no_single_model` to `run_server.py` only if you specifically want per-client model loading — strongly not recommended for desktop dictation.)
+
+## Model selection
+
+WhisperBoard defaults to `distil-small.en`, which gives the best balance of accuracy, speed, and low hallucination rate for English dictation on a typical desktop CPU.
+
+Other good options (set via Settings → Model):
+
+| Model | Hardware | Notes |
+|---|---|---|
+| `distil-small.en` | CPU (default) | Trained to suppress hallucinations; good accuracy for short dictation |
+| `small.en` | CPU | Slightly more accurate than distil, slightly more prone to filler hallucinations |
+| `distil-medium.en` | CPU (8GB+ RAM) or GPU | Near-medium accuracy, lower hallucination rate |
+| `large-v3-turbo` | GPU | Best accuracy and lowest latency on modern NVIDIA GPUs |
+| `tiny.en` / `base.en` | Low-end | Avoid for dictation — hallucinate "Okay", "Thanks for watching", etc. on short utterances |
+
 ## Setup Instructions
 
 1.  **Clone the Repository:**

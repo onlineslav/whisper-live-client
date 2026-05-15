@@ -38,30 +38,33 @@ class AudioCapture(QObject):
         self.logger.info("Audio capture stopped.")
     
     def _run_capture(self):
+        self._stream = None
         try:
             self._stream = self._p.open(format=self.format,
                                         channels=self.channels,
                                         rate=self.rate,
                                         input=True,
                                         frames_per_buffer=self.chunk_size)
-            
+
             while self._is_running:
                 try:
                     data = self._stream.read(self.chunk_size, exception_on_overflow=False)
                     self.audio_chunk_ready.emit(data)
                 except IOError as e:
-                    # This can happen if the buffer overflows.
-                    # We can ignore it and continue.
                     self.logger.warning("Audio capture warning: %s", e)
                     continue
 
+        except Exception:
+            self.logger.exception("Audio capture failed to open stream.")
         finally:
             if self._stream:
                 self._stream.stop_stream()
                 self._stream.close()
+                self._stream = None
 
-    def __del__(self):
-        # Ensure PyAudio is terminated properly
+    def shutdown(self):
+        """Stop capture and release PyAudio. Call before app exit."""
+        self.stop_streaming()
         self._p.terminate()
 
 if __name__ == '__main__':

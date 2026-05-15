@@ -182,10 +182,13 @@ class CaptureBox(QWidget):
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.accept()
             self.on_confirm()
         elif event.key() == Qt.Key_Escape:
+            event.accept()
             self.on_cancel()
-        super().keyPressEvent(event)
+        else:
+            super().keyPressEvent(event)
 
     def focusOutEvent(self, event: QFocusEvent):
         super().focusOutEvent(event)

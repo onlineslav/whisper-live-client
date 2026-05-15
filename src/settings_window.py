@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from PySide6.QtWidgets import (
@@ -15,13 +16,15 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QKeySequence
 
-CONFIG_FILE = "config.json"
+APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WhisperBoard")
+os.makedirs(APP_DATA_DIR, exist_ok=True)
+CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 
 DEFAULT_SETTINGS = {
     "server_address": "ws://localhost:9090",
     "capture_hotkey": "ctrl+`",
     "launch_on_startup": False,
-    "model": "tiny.en",
+    "model": "distil-small.en",
     "connect_on_demand": True,
 }
 
@@ -50,7 +53,7 @@ class SettingsWindow(QWidget):
 
         form_layout.addRow(QLabel("Server Address:"), self.server_address_edit)
         form_layout.addRow(QLabel("Capture Hotkey:"), self.capture_hotkey_edit)
-        form_layout.addRow(QLabel("Model (e.g., tiny.en):"), self.model_edit)
+        form_layout.addRow(QLabel("Model (e.g., distil-small.en):"), self.model_edit)
         form_layout.addRow(QLabel("Connection Mode:"), self.connect_on_demand_checkbox)
 
         layout.addLayout(form_layout)
@@ -77,7 +80,7 @@ class SettingsWindow(QWidget):
             with open(path, "r") as f:
                 settings = json.load(f)
         else:
-            settings = DEFAULT_SETTINGS
+            settings = copy.deepcopy(DEFAULT_SETTINGS)
 
         self.server_address_edit.setText(settings.get("server_address", DEFAULT_SETTINGS["server_address"]))
         capture_hotkey = settings.get("capture_hotkey", DEFAULT_SETTINGS["capture_hotkey"])

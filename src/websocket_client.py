@@ -13,7 +13,7 @@ class WebSocketClient(QObject):
     connection_status_changed = Signal(str)  # Emits "Connecting", "Connected", "Disconnected", "Error"
     message_received = Signal(str)           # Emits the raw JSON string from the server
     
-    def __init__(self, server_address, model="tiny.en", sample_rate=16000, channels=1, audio_format="pcm_s16le"):
+    def __init__(self, server_address, model="distil-small.en", sample_rate=16000, channels=1, audio_format="pcm_s16le"):
         super().__init__()
         self.server_address = server_address
         self.model = model
@@ -25,8 +25,9 @@ class WebSocketClient(QObject):
         self.thread = None
         self.loop = None
         self.is_running = False
-        self.uid = "whisperboard-client" # A unique ID for the client
+        self.uid = "whisperboard-client"
         self._eos_sent = False
+        self._stop_event: asyncio.Event | None = None
 
     def connect(self):
         if self.thread is None or not self.thread.is_alive():
@@ -39,30 +40,43 @@ class WebSocketClient(QObject):
         if not self.is_running:
             return
         self.is_running = False
-        # Nudge the event loop to exit its wait and close the websocket cleanly
         if self.loop and self.loop.is_running():
             try:
+                if self._stop_event:
+                    self.loop.call_soon_threadsafe(self._stop_event.set)
                 if self.websocket:
                     asyncio.run_coroutine_threadsafe(self.websocket.close(), self.loop)
-                self.loop.call_soon_threadsafe(lambda: None)
             except Exception:
                 self.logger.exception("Failed to request websocket shutdown.")
         if self.thread:
-            self.thread.join()
-        self.connection_status_changed.emit("Disconnected")
+            self.thread.join(timeout=3.0)
+            if self.thread.is_alive():
+                self.logger.warning("WebSocket thread did not exit cleanly within timeout.")
         self.logger.info("WebSocket client disconnected.")
 
     def _run(self):
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+            self._stop_event = asyncio.Event()
             self.loop.run_until_complete(self._main_loop())
-        except Exception as e:
+        except Exception:
             self.connection_status_changed.emit("Error")
             self.logger.exception("WebSocket client error.")
         finally:
+            self._stop_event = None
             if self.loop and not self.loop.is_closed():
                 self.loop.close()
+
+    async def _interruptible_sleep(self, seconds: float):
+        """Sleep up to `seconds`, waking early if disconnect() sets _stop_event."""
+        if self._stop_event is None:
+            await asyncio.sleep(seconds)
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(self._stop_event.wait()), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
     async def _main_loop(self):
         while self.is_running:
@@ -74,20 +88,23 @@ class WebSocketClient(QObject):
                     self.connection_status_changed.emit("Connected")
                     self.logger.info("WebSocket connected.")
                     self._eos_sent = False
-                    
-                    # Send handshake
+
+                    # Note: sample_rate / format / channels are silently ignored by the
+                    # WhisperLive server (it hardcodes 16k mono float32). The VAD/dedup
+                    # knobs below are the ones that actually reduce hallucinations on
+                    # short dictation utterances. See docs in README.
                     await self.websocket.send(json.dumps({
                         "uid": self.uid,
                         "language": "en",
                         "task": "transcribe",
                         "model": self.model,
-                        "sample_rate": self.sample_rate,
-                        "format": self.audio_format,
-                        "channels": self.channels,
+                        "use_vad": True,
+                        "same_output_threshold": 4,
+                        "send_last_n_segments": 3,
+                        "clip_audio": True,
                     }))
                     self.logger.debug("Handshake sent.")
 
-                    # Listen for messages
                     while self.is_running:
                         raw_message = await self.websocket.recv()
                         if isinstance(raw_message, (bytes, bytearray)):
@@ -104,16 +121,23 @@ class WebSocketClient(QObject):
             except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK, OSError) as e:
                 self.connection_status_changed.emit("Disconnected")
                 self.logger.warning("Connection closed: %s. Reconnecting...", e)
-                await asyncio.sleep(1)  # Wait before retrying
-            except Exception as e:
+                await self._interruptible_sleep(1)
+            except Exception:
                 self.connection_status_changed.emit("Error")
-                self.logger.exception("Unexpected WebSocket error.")
-                self.is_running = False # Stop on unexpected errors
+                self.logger.exception("Unexpected WebSocket error; will retry.")
+                await self._interruptible_sleep(5)
 
     def send_audio(self, audio_chunk):
         if self.websocket and self.loop and self.is_running and not self._eos_sent:
             self.logger.debug("Sending audio chunk (%d bytes).", len(audio_chunk))
-            asyncio.run_coroutine_threadsafe(self.websocket.send(audio_chunk), self.loop)
+            fut = asyncio.run_coroutine_threadsafe(self.websocket.send(audio_chunk), self.loop)
+            fut.add_done_callback(self._on_send_done)
+
+    def _on_send_done(self, fut):
+        try:
+            fut.result()
+        except Exception:
+            self.logger.debug("Audio chunk dropped: connection was transitioning.")
 
     def send_eos(self):
         """Sends the End of Stream message."""
