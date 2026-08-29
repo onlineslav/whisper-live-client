@@ -271,9 +271,7 @@ class WhisperBoardApp:
 
         if status == "Connected" and self.is_capturing and self._capture_waiting_for_connection:
             self._capture_waiting_for_connection = False
-            self.capture_box.set_text("Listening...")
-            self.audio_capture.start_streaming()
-            self.websocket_client.reset_eos()
+            self._begin_streaming()
 
         self._sync_icon_state()
         self.logger.info("Connection status changed: %s", status)
@@ -328,15 +326,11 @@ class WhisperBoardApp:
             self._prev_foreground_hwnd = get_foreground_window()
             self.capture_box.show_at_cursor()
             if self.connection_status == "Connected":
-                self.capture_box.set_text("Listening...")
-                self.audio_capture.start_streaming()
-                self.websocket_client.reset_eos()
+                self._begin_streaming()
             else:
-                # Not connected yet. Happens on the first capture in
-                # connect-on-demand mode, and after every capture in persistent
-                # mode (WhisperLive closes the socket in response to our
-                # END_OF_AUDIO). Wait for the connection — on_connection_status_
-                # changed() starts streaming once it reports "Connected".
+                # Not connected yet — only happens before the initial connection
+                # finishes warming up, or in connect-on-demand mode. Wait for it;
+                # on_connection_status_changed() starts streaming once ready.
                 self._capture_waiting_for_connection = True
                 self.capture_box.set_text("Connecting...")
                 self.websocket_client.connect()
@@ -348,27 +342,30 @@ class WhisperBoardApp:
             else:
                 self.on_capture_confirmed(self.capture_box.text_area.toPlainText())
 
+    def _begin_streaming(self):
+        """Start audio streaming for a capture on a connected session."""
+        # Empty text => the box shows its "Listening..." placeholder, while
+        # toPlainText() stays "" so confirming without speaking pastes nothing.
+        self.capture_box.set_text("")
+        self.websocket_client.reset_eos()
+        self.audio_capture.start_streaming()
+
     def on_capture_confirmed(self, text):
         if not self.is_capturing:
             return
         self.is_capturing = False
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
-        # Hide the capture UI to return focus to the previous app
+        # Hide the capture UI to return focus to the previous app.
         self.capture_box.hide()
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
         self._schedule_on_demand_disconnect()
         self._sync_icon_state()
-        self.logger.debug("Capture confirmed with text length %d", len(text))
-
-        # Save to history log
-        self.write_to_history(text, status="CONFIRMED")
-
-        # Set clipboard and schedule paste after focus returns to the target app.
-        # processEvents() flushes the hide/focus-change events synchronously so
-        # the OS has time to restore focus to the previous window before paste fires.
-        QApplication.clipboard().setText(text)
+        self.logger.debug("Capture confirmed.")
+        # processEvents() flushes the hide/focus-change events so the OS can
+        # restore focus to the target window before the paste fires. _do_paste
+        # reads the final box text, capturing any last-moment transcript.
         QApplication.processEvents()
         QTimer.singleShot(220, self._do_paste)
 
@@ -444,6 +441,16 @@ class WhisperBoardApp:
         self._sync_icon_state()
 
     def _do_paste(self):
+        # Read the final transcription now (the box may have updated since
+        # confirm), log it, and put it on the clipboard.
+        text = self.capture_box.text_area.toPlainText().strip()
+        self.write_to_history(text, status="CONFIRMED")
+        if not text:
+            self.logger.debug("Nothing transcribed; skipping paste.")
+            return
+        QApplication.clipboard().setText(text)
+        QApplication.processEvents()
+
         # Restore focus to the window that was active before the Capture Box
         # opened, then simulate Ctrl+V so the text lands at its caret.
         hwnd = self._prev_foreground_hwnd
@@ -461,7 +468,7 @@ class WhisperBoardApp:
         with self.keyboard.pressed(Key.ctrl):
             self.keyboard.press('v')
             self.keyboard.release('v')
-        self.logger.debug("Paste triggered via Ctrl+V.")
+        self.logger.debug("Pasted %d chars via Ctrl+V.", len(text))
 
     def _shutdown(self):
         self.audio_capture.shutdown()
