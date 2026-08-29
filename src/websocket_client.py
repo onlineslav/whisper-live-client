@@ -3,6 +3,8 @@ import json
 import logging
 import threading
 import websockets
+
+import payload_log
 from PySide6.QtCore import QObject, Signal
 
 class WebSocketClient(QObject):
@@ -119,6 +121,7 @@ class WebSocketClient(QObject):
                                 continue
                         else:
                             message = raw_message
+                        payload_log.log_raw(message)
                         self.message_received.emit(message)
                         self.logger.debug("Message received (%d bytes).", len(message))
 

@@ -17,6 +17,7 @@ from websocket_client import WebSocketClient
 from audio_capture import AudioCapture
 from capture_box import CaptureBox
 import win_input
+import payload_log
 from win_focus import (
     get_foreground_window, focus_window, is_own_window, is_window,
     get_window_title,
@@ -399,6 +400,7 @@ class WhisperBoardApp:
         if not self.is_capturing:
             self.is_capturing = True
             self._capture_waiting_for_connection = False
+            payload_log.log_event("capture_start")
             # Record the target window now, before the Capture Box steals focus.
             self._record_paste_target()
             self.capture_box.show_at_cursor()
@@ -443,6 +445,7 @@ class WhisperBoardApp:
         # Empty text => the box shows its "Listening..." placeholder, while
         # toPlainText() stays "" so confirming without speaking pastes nothing.
         self.capture_box.set_text("")
+        payload_log.log_event("streaming_start")
         self.websocket_client.reset_eos()
         self.audio_capture.start_streaming()
 
@@ -452,6 +455,7 @@ class WhisperBoardApp:
         self.is_capturing = False
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
+        payload_log.log_event("capture_confirmed")
         # Hide the capture UI to return focus to the previous app.
         self.capture_box.hide()
         self.audio_capture.stop_streaming()
@@ -471,6 +475,7 @@ class WhisperBoardApp:
         self.is_capturing = False
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
+        payload_log.log_event("capture_cancelled")
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
         self._schedule_on_demand_disconnect()
