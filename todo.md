@@ -1,78 +1,69 @@
 # WhisperBoard - To-Do List
 
-This checklist outlines the tasks required to build the WhisperBoard application.
+Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for the mandate and the settings reference.
 
-- [x] **1. Project Setup**
-    - [x] Create a `src` directory for all Python source code.
-    - [x] Create a `requirements.txt` file listing the dependencies: `PySide6`, `pynput`, `websockets`, `pyaudio`.
-    - [x] Create the main application entry point: `src/main.py`.
+---
 
-- [x] **2. System Tray Icon & Application Core**
-    - [x] In `main.py`, create the main `QApplication` instance.
-    - [x] Implement a `QSystemTrayIcon`.
-    - [x] Define the icon states (Ready, Connecting, Recording, Error) and have placeholders for the icon images/colors.
-    - [x] Build the context menu for the tray icon (`Status`, `Settings`, `View History`, `Exit`).
-    - [x] Connect the `Exit` action to quit the application.
+## Done
 
-- [x] **3. Settings Window**
-    - [x] Create a new file `src/settings_window.py`.
-    - [x] Design the UI for the settings window (Server Address, Capture Hotkey, Launch on Startup).
-    - [x] Implement the logic to save and load settings from a configuration file (e.g., `config.json`).
-    - [x] Connect the `Settings` action in the tray menu to open this window.
+- [x] **Project setup** — `src/` layout, `requirements.txt`, `main.py` entry point
+- [x] **System tray** — `QSystemTrayIcon`, four programmatically drawn state icons, context menu (Status / Settings / History / Exit)
+- [x] **Settings window** — server address, hotkey, model, connection mode, launch on startup; persisted to `%APPDATA%\WhisperBoard\config.json`; applied live on save
+- [x] **Global hotkey listener** — `pynput`, configurable, reloads after settings save, validates against modifier-only combos
+- [x] **WebSocket client** — connect/disconnect/reconnect, EOS handling, status and message signals, clean thread shutdown via `asyncio.Event`
+- [x] **Audio capture** — 16 kHz mono float32, worker thread, client-side VAD gate with pre-roll and hangover
+- [x] **Capture box** — frameless translucent overlay, fade in/out, `Enter`/`Esc`, confirm/cancel buttons, screen clamping
+- [x] **Integration** — hotkey drives capture, transcripts feed the box, confirm pastes, tray reflects state
+- [x] **Transcription history** — timestamped append log, opened from the tray menu
+- [x] **Launch on startup** — registry `Run` key wiring
+- [x] **Hallucination filtering** — phrase list applied per segment
+- [x] **Multiple message schemas** — `segments` / `text` / `segment` handled, unexpected payloads ignored
+- [x] **Focus routing for paste** — foreground window recorded at capture start, restored via `AttachThreadInput` before `Ctrl+V`
+- [x] **Fix: confirm was routed to cancel** — screen-vs-local coordinate mismatch in the click-away hit test, plus the app filter seeing the `QWindow` press before the widget's and eating the click
+- [x] **Fix: capture box never held keyboard focus** — `activateWindow()` is denied to a background process, so `Enter`/`Esc` went to the app underneath
+- [x] **Click-away to cancel, properly** — driven by window activation loss; a Qt event filter cannot observe clicks in other applications, so the previous implementation never actually worked
 
-- [x] **4. Global Hotkey Listener**
-    - [x] Create a new file `src/hotkey_listener.py`.
-    - [x] Use the `pynput` library to listen for a global hotkey.
-    - [x] The hotkey should be configurable via the settings file.
-    - [x] When the hotkey is pressed, it should emit a signal to the main application.
+---
 
-- [x] **5. WebSocket Client**
-    - [x] Create a new file `src/websocket_client.py`.
-    - [x] Implement a class to manage the WebSocket connection to the `whisper-live` server.
-    - [x] It should handle connecting, disconnecting, and automatic reconnection attempts.
-    - [x] It should have methods to send audio data and receive transcription results.
-    - [x] It should emit signals for connection status changes and received messages.
+## Phase 1 — Trustworthy core (no silent failures)
 
-- [x] **6. Audio Capture**
-    - [x] Create a new file `src/audio_capture.py`.
-    - [x] Use `pyaudio` to capture audio from the default microphone.
-    - [x] The audio should be in the format expected by the `whisper-live` server.
-    - [x] Implement `start_streaming` and `stop_streaming` methods.
+- [ ] **Set the default model to `distil-small.en` and fix the live config** — currently running `tiny.en`, which the README explicitly warns against; it is the source of most observed hallucination
+- [ ] **Input level meter in the capture box**, with the VAD threshold drawn on it — a quiet mic currently streams nothing and shows an empty box with no explanation
+- [ ] **Microphone device picker** in settings — the user cannot currently see or choose which mic was opened
+- [ ] **Expose the VAD threshold** as a setting instead of the hardcoded `0.012`
+- [ ] **Log to a file** at `%APPDATA%\WhisperBoard\whisperboard.log` — the packaged build is `console=False` and currently produces no diagnostics at all
+- [ ] **Notify on paste failure** — if focus restore fails, tray balloon saying the text is on the clipboard, so it is never silently lost
+- [ ] **Tray left-click opens a status panel** — no `activated` handler is connected today, so left-click does nothing
+- [ ] **Report server status, not just socket status** — reachable, model loaded, latency
+- [ ] **Skip empty history entries** — cancelled captures with no text currently write blank lines
+- [ ] **Feedback when the history file is missing** — `open_history` currently `pass`es silently
+- [ ] **Bound the audio thread join** — `stop_streaming()` joins with no timeout on the GUI thread; a blocked PyAudio read freezes the UI
+- [ ] **Delete the dead repo-root `config.json`** — nothing reads it (real config lives in `%APPDATA%`), and it disagrees with the live one
+- [ ] **Tune the hangover window** against real dictation to protect trailing words — the chosen alternative to delaying the paste
 
-- [x] **7. Capture Box UI**
-    - [x] Create a new file `src/capture_box.py`.
-    - [x] Design the UI for the Capture Box: a borderless, semi-transparent window.
-    - [x] Add a `QLabel` to display transcribed text and two `QPushButton`s for Confirm (✓) and Cancel (X).
-    - [x] Implement logic to show the box at the current mouse cursor's position.
-    - [x] Connect keyboard shortcuts (`Enter` for Confirm, `Esc` for Cancel) and the away-click-to-cancel behavior.
+## Phase 2 — Excellent capture box
 
-- [x] **8. Integration**
-    - [x] Tie all components together in `main.py`.
-    - [x] The hotkey signal should trigger the Capture Box to appear and start audio capture/streaming.
-    - [x] The WebSocket client should feed received text into the Capture Box's `QLabel`.
-    - [x] The Confirm button should trigger the text-pasting logic (copy to clipboard, simulate `Ctrl+V`).
-    - [x] The Cancel button should hide the box and stop the audio stream.
-    - [x] Update the tray icon's state based on the WebSocket client's connection status and recording state.
+- [ ] **Make the text editable before confirming** so transcription errors can be fixed in place
+- [ ] **Real caret-aware positioning** — `QInputMethod.cursorRectangle()` only reports carets inside our own process, so the box always falls back to the mouse; needs `GetGUIThreadInfo` or UI Automation
+- [ ] **Theme support** (light / dark / follow system) — specified since day one, never built
+- [ ] **Max capture duration** so a forgotten capture cannot stream forever
+- [ ] Visual refinement: icon buttons (`✓` / `✗`) instead of text, opacity setting
 
-- [x] **9. Transcription History**
-    - [x] Implement the logic to append confirmed transcriptions to `transcription_history.log`.
-    - [x] Ensure entries are timestamped.
-    - [x] Connect the `View History` tray menu action to open this file.
+## Phase 3 — Settings depth
 
-- [ ] **10. Finalization**
-    - [x] Create final icons for all states.
-    - [x] Write a `README.md` on how to set up and run the application.
-    - [ ] Test the application thoroughly.
-    - [ ] (Optional) Create a `pyinstaller` spec file to bundle the application into a `.exe`.
+- [ ] **Tabbed settings window** — Connection / Audio / Text & Paste / Behavior / History / System
+- [ ] **Model as a dropdown** — free-text entry fails silently on a typo
+- [ ] **Restore the clipboard after pasting** — dictation currently destroys clipboard contents
+- [ ] **Paste method option** — clipboard+`Ctrl+V` or direct keystroke typing for apps that block clipboard paste
+- [ ] **Custom vocabulary / replacement rules** for names and jargon
+- [ ] **User-editable hallucination phrase list**
+- [ ] **"Test connection" button** reporting reachability, loaded model, and latency
+- [ ] **Cancel-on-focus-loss toggle**
 
-## Post-audit follow-ups
-- [ ] Fix crash when confirming/cancelling: replace `capture_box.text_label` with `capture_box.text_area` in `src/main.py`.
-- [ ] Fix `setWordWrapMode` usage in `src/capture_box.py` (use a proper `QTextOption` wrap mode) so the capture box instantiates cleanly.
-- [ ] Add click-away-to-cancel behavior and optional fade-in/out animations for the capture box; prefer caret-aware positioning over mouse-based.
-- [ ] Align audio format with WhisperLive expectations (likely 16 kHz mono int16 PCM) and include any required handshake metadata (e.g., sample rate/format).
-- [ ] Improve hotkey picker: switch settings hotkey input to `QKeySequenceEdit` and map to the `pynput` string; reload listener after saving.
-- [ ] Implement launch-on-startup toggle wiring for Windows (e.g., shortcut in Startup folder or registry entry).
-- [ ] Add user feedback when history file is missing; optionally create it on demand.
-- [ ] Ensure clean shutdown of WebSocket/audio threads when exiting from tray.
-- [ ] Expand message handling to cover alternative WhisperLive schemas (`text`/`segments`/`is_final`) and ignore unexpected payloads gracefully.
-- [ ] Add smoke tests/validation runs for connection, capture loop, and paste behavior.
+## Phase 4 — Shareable
+
+- [ ] **Single-instance guard** — two copies means two hotkey listeners fighting, likely once launch-on-startup is enabled
+- [ ] **Regression tests for the capture loop** — confirm/cancel routing has broken three times; a harness driving the box directly catches it
+- [ ] **Pin `requirements.txt`** — PySide6 and websockets have both made breaking API changes
+- [ ] **Refresh the README** — the "restart for settings to take effect" instruction is stale, and the documented default model does not match the shipped one
+- [ ] **Package properly** — application icon, first-run setup, verified `.exe` build
