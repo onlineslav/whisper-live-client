@@ -6,9 +6,11 @@ import logging
 import time
 from datetime import datetime
 from pynput.keyboard import Controller, Key
-from PySide6.QtGui import QIcon, QAction, QPixmap, QPainter, QColor, QPen
+from PySide6.QtGui import (
+    QIcon, QAction, QPixmap, QPainter, QColor, QFont, QPainterPath, QTransform,
+)
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QMessageBox
-from PySide6.QtCore import Qt, QRectF, QTimer
+from PySide6.QtCore import Qt, QTimer
 from settings_window import SettingsWindow, DEFAULT_SETTINGS, APP_DATA_DIR, CONFIG_FILE
 from hotkey_listener import HotkeyListener
 from websocket_client import WebSocketClient
@@ -17,6 +19,22 @@ from capture_box import CaptureBox
 from win_focus import get_foreground_window, focus_window
 
 HISTORY_FILE = os.path.join(APP_DATA_DIR, "transcription_history.log")
+
+# Tray icon wordmark. "W" reads cleanly at the ~16px Windows renders the tray
+# at; "WL" is legible from about 24px up and turns to mush below it.
+TRAY_LETTER = "W"
+
+# Windows asks for the tray icon at a handful of sizes depending on DPI and
+# taskbar settings. Rendering each one rather than downscaling a single large
+# bitmap keeps the letterform crisp — downscaled type blurs badly.
+TRAY_ICON_SIZES = (16, 20, 24, 32, 48, 64)
+
+TRAY_STATE_COLORS = {
+    "ready": "#2ecc71",
+    "connecting": "#3498db",
+    "recording": "#e74c3c",
+    "error": "#7f8c8d",
+}
 
 # Whisper is known to emit these strings on silence/noise. Drop any segment
 # whose normalized text matches. WhisperLive issue #185 tracks the upstream bug.
@@ -93,50 +111,57 @@ class WhisperBoardApp:
         self.menu.addAction(self.exit_action)
 
     def _build_state_icons(self):
-        """Builds simple, high-contrast tray icons for each state."""
-        def make_icon(base_color: str, overlay):
-            size = 64
+        """Builds the tray icons: a bold wordmark on a state-coloured disc."""
+
+        def render(size: int, base_color: str) -> QPixmap:
             pixmap = QPixmap(size, size)
             pixmap.fill(Qt.transparent)
             painter = QPainter(pixmap)
             painter.setRenderHint(QPainter.Antialiasing)
+
+            inset = max(1, round(size * 0.03))
+            diameter = size - 2 * inset
             painter.setBrush(QColor(base_color))
             painter.setPen(Qt.NoPen)
-            painter.drawEllipse(4, 4, size - 8, size - 8)
-            overlay(painter, size)
+            painter.drawEllipse(inset, inset, diameter, diameter)
+
+            # The wordmark is filled as a vector path rather than drawn as text.
+            # Qt's Windows font engine applies ClearType subpixel antialiasing
+            # whatever the style strategy or paint device, which bakes coloured
+            # RGB fringes into the glyph edges — visible once the icon is
+            # composited over the taskbar. Path filling uses the plain
+            # antialiasing rasteriser, so the edges stay neutral.
+            font = QFont("Segoe UI")
+            font.setBold(True)
+            font.setPixelSize(100)  # reference size; scaled to fit below
+            path = QPainterPath()
+            path.addText(0, 0, font, TRAY_LETTER)
+            bounds = path.boundingRect()
+            if bounds.isEmpty():
+                painter.end()
+                return pixmap
+
+            # Scale to fit the disc, then centre on the glyph's own ink rather
+            # than the font's line box — capitals sit high in the line box and
+            # would look bottom-heavy inside a circle.
+            scale = min(diameter * 0.74 / bounds.width(),
+                        diameter * 0.56 / bounds.height())
+            transform = QTransform()
+            transform.translate(size / 2, size / 2)
+            transform.scale(scale, scale)
+            transform.translate(-bounds.center().x(), -bounds.center().y())
+
+            painter.fillPath(transform.map(path), QColor("#ffffff"))
             painter.end()
-            return QIcon(pixmap)
+            return pixmap
 
-        def draw_ready(painter: QPainter, size: int):
-            pen = QPen(QColor("#ffffff"), 6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-            painter.setPen(pen)
-            painter.drawLine(int(size * 0.30), int(size * 0.55), int(size * 0.45), int(size * 0.72))
-            painter.drawLine(int(size * 0.45), int(size * 0.72), int(size * 0.72), int(size * 0.38))
+        def make_icon(base_color: str) -> QIcon:
+            icon = QIcon()
+            for size in TRAY_ICON_SIZES:
+                icon.addPixmap(render(size, base_color))
+            return icon
 
-        def draw_connecting(painter: QPainter, size: int):
-            pen = QPen(QColor("#ffffff"), 6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-            painter.setPen(pen)
-            rect = QRectF(size * 0.20, size * 0.20, size * 0.60, size * 0.60)
-            painter.drawArc(rect, 30 * 16, 210 * 16)
-            painter.drawArc(rect, -150 * 16, 210 * 16)
-
-        def draw_recording(painter: QPainter, size: int):
-            painter.setBrush(QColor("#ffffff"))
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(int(size * 0.34), int(size * 0.34), int(size * 0.32), int(size * 0.32))
-
-        def draw_error(painter: QPainter, size: int):
-            pen = QPen(QColor("#ffffff"), 6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-            painter.setPen(pen)
-            painter.drawLine(int(size * 0.50), int(size * 0.28), int(size * 0.50), int(size * 0.60))
-            painter.drawEllipse(int(size * 0.46), int(size * 0.65), int(size * 0.08), int(size * 0.08))
-
-        return {
-            "ready": make_icon("#2ecc71", draw_ready),
-            "connecting": make_icon("#3498db", draw_connecting),
-            "recording": make_icon("#e74c3c", draw_recording),
-            "error": make_icon("#7f8c8d", draw_error),
-        }
+        return {state: make_icon(color) for state, color in TRAY_STATE_COLORS.items()}
 
     def _set_tray_icon_state(self, state: str):
         icon = self.state_icons.get(state, self.state_icons.get("error"))
