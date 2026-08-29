@@ -1,11 +1,11 @@
 import copy
+import ctypes
 import sys
 import json
 import os
 import logging
 import time
 from datetime import datetime
-from pynput.keyboard import Controller, Key
 from PySide6.QtGui import (
     QIcon, QAction, QPixmap, QPainter, QColor, QFont, QPainterPath, QTransform,
 )
@@ -16,9 +16,28 @@ from hotkey_listener import HotkeyListener
 from websocket_client import WebSocketClient
 from audio_capture import AudioCapture
 from capture_box import CaptureBox
-from win_focus import get_foreground_window, focus_window
+import win_input
+from win_focus import (
+    get_foreground_window, focus_window, is_own_window, is_window,
+    get_window_title,
+)
 
 HISTORY_FILE = os.path.join(APP_DATA_DIR, "transcription_history.log")
+
+# Milliseconds between confirming and reading the final transcript. Short: the
+# server's last segments usually arrive before the box finishes hiding, and
+# every millisecond here is felt as lag between pressing Enter and seeing text.
+PASTE_START_DELAY_MS = 60
+
+# Milliseconds to wait after the Capture Box hides before restoring focus to
+# the target window. Windows needs a moment to finish tearing down the overlay
+# and hand the foreground on.
+PASTE_FOCUS_DELAY_MS = 120
+
+# Milliseconds between releasing held modifiers and injecting Ctrl+V. The
+# target processes the keyups in order, but a chord arriving in the same
+# instant as its own activation is dropped by some apps (Chromium especially).
+PASTE_KEY_DELAY_MS = 40
 
 # Tray icon wordmark. "W" reads cleanly at the ~16px Windows renders the tray
 # at; "WL" is legible from about 24px up and turns to mush below it.
@@ -50,6 +69,40 @@ def _is_hallucination(text: str) -> bool:
     normalized = text.strip().lower().strip(".,!?\"' ")
     return normalized in HALLUCINATION_PHRASES
 
+
+# Held for the lifetime of the process; releasing it would let a second
+# instance start. Module-level so it is never garbage collected.
+_instance_mutex = None
+
+
+def acquire_single_instance() -> bool:
+    """Claim the one-instance-per-session lock. False if already running.
+
+    Two copies of WhisperBoard are actively broken, not merely wasteful: both
+    listen for the same global hotkey, so both open a Capture Box stacked on
+    the same spot, both stream the microphone to the server, and both fight
+    over the foreground. The paste then lands in the *other* instance's box --
+    a read-only text area that silently absorbs it -- so dictation appears to
+    do nothing at all while the transcript is logged as confirmed.
+
+    A named mutex is used rather than a lock file because Windows releases it
+    when the process dies however it dies, leaving nothing to clean up after a
+    crash. The "Local\\" prefix scopes it to the logon session, so a second
+    user on the same machine still gets their own instance.
+    """
+    global _instance_mutex
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\WhisperBoard-SingleInstance")
+        ERROR_ALREADY_EXISTS = 183
+        return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+    except (OSError, AttributeError):
+        # Not Windows, or the API is unavailable: allow the app to run rather
+        # than blocking startup over a guard.
+        return True
+
 class WhisperBoardApp:
     def __init__(self):
         self.logger = logging.getLogger("whisperboard.app")
@@ -60,7 +113,6 @@ class WhisperBoardApp:
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = 0.0
         self.connection_status = "Disconnected"
-        self.keyboard = Controller()
         # Win32 handle of the window that had focus before the Capture Box
         # appeared, so paste can be routed back to it (e.g. Notepad).
         self._prev_foreground_hwnd = None
@@ -348,7 +400,7 @@ class WhisperBoardApp:
             self.is_capturing = True
             self._capture_waiting_for_connection = False
             # Record the target window now, before the Capture Box steals focus.
-            self._prev_foreground_hwnd = get_foreground_window()
+            self._record_paste_target()
             self.capture_box.show_at_cursor()
             if self.connection_status == "Connected":
                 self._begin_streaming()
@@ -366,6 +418,25 @@ class WhisperBoardApp:
                 self.on_capture_cancelled()
             else:
                 self.on_capture_confirmed(self.capture_box.text_area.toPlainText())
+
+    def _record_paste_target(self):
+        """Remember the window the transcript should be pasted into.
+
+        Anything belonging to WhisperBoard itself is refused: a leftover
+        Capture Box or the Settings window can hold the foreground when the
+        hotkey fires, and routing the paste there throws the text away. In that
+        case the previous target is kept, which is nearly always the window the
+        user is actually working in.
+        """
+        hwnd = get_foreground_window()
+        if hwnd and is_own_window(hwnd):
+            self.logger.debug(
+                "Foreground window 0x%X is ours; keeping previous paste target.",
+                hwnd)
+            return
+        self._prev_foreground_hwnd = hwnd
+        if hwnd:
+            self.logger.debug("Paste target: 0x%X '%s'", hwnd, get_window_title(hwnd))
 
     def _begin_streaming(self):
         """Start audio streaming for a capture on a connected session."""
@@ -389,10 +460,10 @@ class WhisperBoardApp:
         self._sync_icon_state()
         self.logger.debug("Capture confirmed.")
         # processEvents() flushes the hide/focus-change events so the OS can
-        # restore focus to the target window before the paste fires. _do_paste
-        # reads the final box text, capturing any last-moment transcript.
+        # start handing the foreground back. _do_paste reads the final box text,
+        # capturing any last-moment transcript, then paces the rest itself.
         QApplication.processEvents()
-        QTimer.singleShot(220, self._do_paste)
+        QTimer.singleShot(PASTE_START_DELAY_MS, self._do_paste)
 
     def on_capture_cancelled(self):
         if not self.is_capturing:
@@ -466,34 +537,109 @@ class WhisperBoardApp:
         self._sync_icon_state()
 
     def _do_paste(self):
-        # Read the final transcription now (the box may have updated since
-        # confirm), log it, and put it on the clipboard.
+        """Put the transcript on the clipboard and paste it into the target.
+
+        Split across timer hops rather than run straight through: each stage
+        gives Windows and the target application a chance to process the one
+        before it, and returning to the event loop in between keeps the app
+        responsive while the foreground changes hands.
+        """
+        # Read the final transcription now -- the box may have updated between
+        # confirm and here -- and log it before anything else can fail.
         text = self.capture_box.text_area.toPlainText().strip()
         self.write_to_history(text, status="CONFIRMED")
         if not text:
             self.logger.debug("Nothing transcribed; skipping paste.")
             return
-        QApplication.clipboard().setText(text)
-        QApplication.processEvents()
 
-        # Restore focus to the window that was active before the Capture Box
-        # opened, then simulate Ctrl+V so the text lands at its caret.
+        # The clipboard is written first and left alone from here on. Whatever
+        # happens to the keystroke afterwards, the transcript is recoverable
+        # with a manual Ctrl+V.
+        if not win_input.set_clipboard_text(text):
+            self.logger.warning("Clipboard write failed; falling back to typing.")
+            self._paste_by_typing(text)
+            return
+
+        QTimer.singleShot(PASTE_FOCUS_DELAY_MS, lambda: self._restore_focus_and_paste(text))
+
+    def _restore_focus_and_paste(self, text):
         hwnd = self._prev_foreground_hwnd
-        if hwnd:
-            if focus_window(hwnd):
-                # Let Windows settle the foreground/focus change before keys.
-                QApplication.processEvents()
-            else:
-                self.logger.warning(
-                    "Could not restore focus to target window 0x%X; "
-                    "paste may land in the wrong place.", hwnd)
-        else:
-            self.logger.warning("No target window recorded; cannot route paste.")
+        if not hwnd or not is_window(hwnd):
+            self._paste_unavailable(
+                "the window you were in is gone", text)
+            return
+        if is_own_window(hwnd):
+            # Should be unreachable now that _record_paste_target filters our
+            # own windows, but pasting into our read-only box loses the text
+            # silently, so it is worth refusing twice.
+            self._paste_unavailable("the target window belongs to WhisperBoard", text)
+            return
 
-        with self.keyboard.pressed(Key.ctrl):
-            self.keyboard.press('v')
-            self.keyboard.release('v')
-        self.logger.debug("Pasted %d chars via Ctrl+V.", len(text))
+        if not focus_window(hwnd):
+            self._paste_unavailable(
+                f"could not focus '{get_window_title(hwnd)}'", text)
+            return
+
+        # Clear anything the user is still holding. Confirming with the hotkey
+        # means Ctrl is usually down; a held Shift or Alt would turn the
+        # injected Ctrl+V into a different shortcut entirely.
+        released = win_input.release_modifiers()
+        if released:
+            self.logger.debug("Released held modifiers before paste: %s",
+                              ", ".join(sorted(set(released))))
+
+        QTimer.singleShot(PASTE_KEY_DELAY_MS, lambda: self._send_paste(text, hwnd))
+
+    def _send_paste(self, text, hwnd):
+        # The foreground can change again in the gap above -- a notification
+        # toast, or the user clicking elsewhere -- so it is rechecked rather
+        # than assumed.
+        foreground = get_foreground_window()
+        if foreground != hwnd:
+            self.logger.debug("Foreground drifted to 0x%X before paste; retrying focus.",
+                              foreground or 0)
+            if not focus_window(hwnd):
+                self._paste_unavailable("focus moved to another window", text)
+                return
+
+        if not win_input.send_ctrl_v():
+            self._paste_unavailable(
+                "Windows blocked the keystroke, which usually means the target "
+                "app is running as administrator", text)
+            return
+
+        self.logger.info("Pasted %d chars into 0x%X '%s'.",
+                         len(text), hwnd, get_window_title(hwnd))
+
+    def _paste_by_typing(self, text):
+        """Last resort when the clipboard is unusable: type the text out."""
+        hwnd = self._prev_foreground_hwnd
+        if hwnd and is_window(hwnd) and not is_own_window(hwnd) and focus_window(hwnd):
+            win_input.release_modifiers()
+            if win_input.type_text(text):
+                self.logger.info("Typed %d chars into 0x%X.", len(text), hwnd)
+                return
+        self.logger.error("Could not deliver the transcript by typing either.")
+        self._notify("Transcript could not be pasted",
+                     "It is in your transcription history.")
+
+    def _paste_unavailable(self, reason, text):
+        """Report a paste that could not be delivered, without losing the text.
+
+        The transcript is already on the clipboard by the time this is called,
+        so the recovery is one keystroke -- but only if the user is told, which
+        is what made the previous silent failures so confusing.
+        """
+        self.logger.warning("Paste not delivered: %s.", reason)
+        preview = text if len(text) <= 60 else text[:57] + "..."
+        self._notify("Transcript copied to clipboard",
+                     f"Press Ctrl+V to paste it — {reason}.\n{preview}")
+
+    def _notify(self, title, message):
+        try:
+            self.tray_icon.showMessage(title, message, self.tray_icon.icon(), 6000)
+        except Exception:
+            self.logger.exception("Failed to show tray notification.")
 
     def _shutdown(self):
         self.audio_capture.shutdown()
@@ -509,6 +655,21 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logging.getLogger("websockets").setLevel(logging.INFO)
+
+    if not acquire_single_instance():
+        logging.getLogger("whisperboard.app").error(
+            "Another WhisperBoard instance is already running; exiting.")
+        # A QApplication is needed for the message box, and it must be created
+        # before any widget. This one is discarded with the process.
+        QApplication(sys.argv)
+        QMessageBox.warning(
+            None, "WhisperBoard",
+            "WhisperBoard is already running.\n\n"
+            "Look for the tray icon near the clock. Running two copies breaks "
+            "dictation: both open a capture box on the same hotkey and the "
+            "paste lands in the wrong one.")
+        sys.exit(0)
+
     app = WhisperBoardApp()
     app.run()
 

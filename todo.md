@@ -21,6 +21,9 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 - [x] **Focus routing for paste** — foreground window recorded at capture start, restored via `AttachThreadInput` before `Ctrl+V`
 - [x] **Fix: confirm was routed to cancel** — screen-vs-local coordinate mismatch in the click-away hit test, plus the app filter seeing the `QWindow` press before the widget's and eating the click
 - [x] **Fix: capture box never held keyboard focus** — `activateWindow()` is denied to a background process, so `Enter`/`Esc` went to the app underneath
+- [x] **Single-instance guard** — named mutex (`Local\WhisperBoard-SingleInstance`); a second launch explains itself and exits. This was not hypothetical: two copies were running, so both opened a box on the same hotkey and the paste landed in the *other* instance's read-only text area, which swallowed it silently
+- [x] **Fix: paste did not reach the target app** — rewritten as a paced sequence in `win_input.py`: native `CF_UNICODETEXT` clipboard (Qt's delayed-rendering data object made the paste depend on our event loop), foreground restore verified by polling rather than assumed, held modifiers released so a stray Shift/Alt cannot turn the injected `Ctrl+V` into another shortcut, and `SendInput` return values checked so a refused injection is visible
+- [x] **Notify on paste failure** — tray balloon naming the reason, with the transcript left on the clipboard so `Ctrl+V` still recovers it
 - [x] **Click-away to cancel, properly** — driven by window activation loss; a Qt event filter cannot observe clicks in other applications, so the previous implementation never actually worked
 
 ---
@@ -32,7 +35,6 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 - [ ] **Microphone device picker** in settings — the user cannot currently see or choose which mic was opened
 - [ ] **Expose the VAD threshold** as a setting instead of the hardcoded `0.012`
 - [ ] **Log to a file** at `%APPDATA%\WhisperBoard\whisperboard.log` — the packaged build is `console=False` and currently produces no diagnostics at all
-- [ ] **Notify on paste failure** — if focus restore fails, tray balloon saying the text is on the clipboard, so it is never silently lost
 - [ ] **Tray left-click opens a status panel** — no `activated` handler is connected today, so left-click does nothing
 - [ ] **Report server status, not just socket status** — reachable, model loaded, latency
 - [ ] **Skip empty history entries** — cancelled captures with no text currently write blank lines
@@ -54,7 +56,7 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 - [ ] **Tabbed settings window** — Connection / Audio / Text & Paste / Behavior / History / System
 - [ ] **Model as a dropdown** — free-text entry fails silently on a typo
 - [ ] **Restore the clipboard after pasting** — dictation currently destroys clipboard contents
-- [ ] **Paste method option** — clipboard+`Ctrl+V` or direct keystroke typing for apps that block clipboard paste
+- [ ] **Paste method option** — clipboard+`Ctrl+V` or direct keystroke typing for apps that block clipboard paste. `win_input.type_text()` already implements the typing path as an automatic fallback when the clipboard is unwritable; this item is now just exposing it as a choice
 - [ ] **Custom vocabulary / replacement rules** for names and jargon
 - [ ] **User-editable hallucination phrase list**
 - [ ] **"Test connection" button** reporting reachability, loaded model, and latency
@@ -62,7 +64,6 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 
 ## Phase 4 — Shareable
 
-- [ ] **Single-instance guard** — two copies means two hotkey listeners fighting, likely once launch-on-startup is enabled
 - [ ] **Regression tests for the capture loop** — confirm/cancel routing has broken three times; a harness driving the box directly catches it
 - [ ] **Pin `requirements.txt`** — PySide6 and websockets have both made breaking API changes
 - [ ] **Refresh the README** — the "restart for settings to take effect" instruction is stale, and the documented default model does not match the shipped one

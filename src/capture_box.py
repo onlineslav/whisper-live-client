@@ -43,6 +43,9 @@ class CaptureBox(QWidget):
         self._fade_duration_ms = 140
         self._shown_at = 0.0
 
+        # Never shown (the window is frameless), but it makes the box
+        # identifiable in window lists and in logs when tracing a stray paste.
+        self.setWindowTitle("WhisperBoard Capture")
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
@@ -198,7 +201,11 @@ class CaptureBox(QWidget):
         with the AttachThreadInput workaround.
         """
         try:
-            focus_window(int(self.winId()))
+            # Fewer retries than the paste path uses: this runs while the user
+            # is waiting for the box to appear, so a long retry loop would read
+            # as lag. Losing focus here is recoverable (the box is still
+            # visible and clickable); a slow box is not.
+            focus_window(int(self.winId()), attempts=2)
         except Exception:
             pass
 
