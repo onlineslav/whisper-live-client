@@ -1,4 +1,6 @@
 import sys
+import time
+
 from PySide6.QtWidgets import (
     QWidget,
     QPushButton,
@@ -24,6 +26,8 @@ from PySide6.QtGui import (
     QTextCursor,
 )
 
+from win_focus import focus_window
+
 
 class CaptureBox(QWidget):
     """
@@ -37,6 +41,7 @@ class CaptureBox(QWidget):
         super().__init__()
         self._closing = False
         self._fade_duration_ms = 140
+        self._shown_at = 0.0
 
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -150,6 +155,7 @@ class CaptureBox(QWidget):
 
     def show_at_cursor(self):
         self._closing = False
+        self._shown_at = time.monotonic()
         self.adjustSize()
 
         app = QApplication.instance()
@@ -176,9 +182,25 @@ class CaptureBox(QWidget):
         self.move(x, y)
         self._opacity.setOpacity(0.0)
         self.show()
+        self.raise_()
         self.activateWindow()
         self.setFocus()
+        self._take_foreground()
         self._animate_opacity(0.0, 1.0)
+
+    def _take_foreground(self):
+        """Give the box real keyboard focus.
+
+        The box is shown from a global hotkey while another app owns the
+        foreground, and Windows denies SetForegroundWindow to a background
+        process — so activateWindow() leaves the box visible but unfocused and
+        Enter/Esc go to the app underneath. focus_window() forces it through
+        with the AttachThreadInput workaround.
+        """
+        try:
+            focus_window(int(self.winId()))
+        except Exception:
+            pass
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
@@ -193,20 +215,50 @@ class CaptureBox(QWidget):
     def focusOutEvent(self, event: QFocusEvent):
         super().focusOutEvent(event)
 
+    def changeEvent(self, event):
+        """Cancel when the user clicks away to another window.
+
+        A QApplication event filter only sees events delivered to our own
+        process, so it can never observe a click in Notepad or the browser —
+        losing window activation is the only reliable signal that the user
+        switched away. Deactivations in the first moments after show() are
+        ignored: taking the foreground is itself a burst of activation changes.
+        """
+        if (
+            event.type() == QEvent.ActivationChange
+            and not self._closing
+            and self.isVisible()
+            and not self.isActiveWindow()
+            and time.monotonic() - self._shown_at > 0.35
+        ):
+            self.on_cancel()
+        super().changeEvent(event)
+
     def eventFilter(self, obj, event):
         if event.type() == QEvent.MouseButtonPress and not self._closing:
-            # Ignore clicks inside this widget or its children
-            if hasattr(obj, "isWidgetType") and obj.isWidgetType():
-                if obj is self or self.isAncestorOf(obj):
-                    return super().eventFilter(obj, event)
+            # An app-wide filter sees every press twice: first on the receiving
+            # QWindow, then on the QWidget under it. The QWindow is not a
+            # widget, so an isWidgetType()-only check misses our own window and
+            # cancels the capture before the Confirm button ever sees the click.
+            if obj is self.windowHandle():
+                return super().eventFilter(obj, event)
+            if obj.isWidgetType() and (obj is self or self.isAncestorOf(obj)):
+                return super().eventFilter(obj, event)
 
-            pos = event.globalPosition().toPoint()
-            if not self.geometry().contains(self.mapFromGlobal(pos)):
+            # geometry() is in screen coordinates for a top-level window, so it
+            # must be tested against the global click position. Mapping the
+            # point to widget-local coords first made every click read as
+            # "outside", cancelling the capture wherever the user clicked.
+            if not self.geometry().contains(event.globalPosition().toPoint()):
                 self.on_cancel()
                 return True
         return super().eventFilter(obj, event)
 
     def hideEvent(self, event):
+        # Any hide ends this capture — including one driven from main.py (the
+        # hotkey-to-confirm path). Marking it closing here stops the
+        # deactivation that follows from being read as a click-away cancel.
+        self._closing = True
         app = QApplication.instance()
         if app:
             app.removeEventFilter(self)
