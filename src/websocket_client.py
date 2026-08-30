@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import json
 import logging
 import threading
@@ -7,12 +8,32 @@ import websockets
 import payload_log
 from PySide6.QtCore import QObject, Signal
 
+# Audio held while the server loads its model, in bytes. WhisperLive accepts
+# the socket, *then* loads the model, and only then starts reading -- so the
+# first seconds of a capture would otherwise sit in the OS socket buffer, or
+# be dropped outright.
+#
+# Measured against the GPU container on a cold start: SERVER_READY arrived
+# 17.4s after the socket opened, for `tiny.en`. A larger model is slower, so
+# this allows 60s at 16 kHz float32 mono (under 4 MB) -- generous enough to
+# cover a cold load, bounded so a wedged server cannot grow it forever.
+MAX_PENDING_AUDIO_BYTES = 16000 * 4 * 60
+
+
 class WebSocketClient(QObject):
     """
 
     Manages the WebSocket connection to the transcription server in a separate thread.
     """
-    connection_status_changed = Signal(str)  # Emits "Connecting", "Connected", "Disconnected", "Error"
+    # (status, detail). Status is one of "Connecting", "Loading", "Waiting",
+    # "Ready", "Disconnected", "Error"; detail is shown to the user verbatim.
+    #
+    # "Loading" exists because an accepted TCP connection says nothing about
+    # whether the server can transcribe: WhisperLive sends SERVER_READY only
+    # once the model is in memory, which on a cold container is tens of
+    # seconds after the socket opens. Treating connect as ready is what made
+    # the tray claim it was ready while dictation quietly went nowhere.
+    connection_status_changed = Signal(str, str)
     message_received = Signal(str)           # Emits the raw JSON string from the server
     
     def __init__(self, server_address, model="distil-small.en", sample_rate=16000, channels=1, audio_format="pcm_s16le"):
@@ -30,6 +51,11 @@ class WebSocketClient(QObject):
         self.uid = "whisperboard-client"
         self._eos_sent = False
         self._stop_event: asyncio.Event | None = None
+        self._server_ready = False
+        # Audio recorded before SERVER_READY arrives, flushed in order once it
+        # does. A deque so the oldest is what gets dropped if the cap is hit.
+        self._pending_audio = collections.deque()
+        self._pending_bytes = 0
 
     def connect(self):
         if self.thread is None or not self.thread.is_alive():
@@ -63,7 +89,7 @@ class WebSocketClient(QObject):
             self._stop_event = asyncio.Event()
             self.loop.run_until_complete(self._main_loop())
         except Exception:
-            self.connection_status_changed.emit("Error")
+            self._emit_status("Error", "The connection thread failed — see the log")
             self.logger.exception("WebSocket client error.")
         finally:
             self._stop_event = None
@@ -72,7 +98,10 @@ class WebSocketClient(QObject):
             # The client thread has fully stopped — make sure the app knows the
             # connection is gone. Without this, connection_status stays stale at
             # "Connected" and the next capture streams into a dead socket.
-            self.connection_status_changed.emit("Disconnected")
+            self._emit_status("Disconnected", "")
+
+    def _emit_status(self, status: str, detail: str = ""):
+        self.connection_status_changed.emit(status, detail)
 
     async def _interruptible_sleep(self, seconds: float):
         """Sleep up to `seconds`, waking early if disconnect() sets _stop_event."""
@@ -87,12 +116,13 @@ class WebSocketClient(QObject):
     async def _main_loop(self):
         while self.is_running:
             try:
-                self.connection_status_changed.emit("Connecting")
+                self._emit_status("Connecting", f"Connecting to {self.server_address}")
                 self.logger.info("Connecting to WebSocket server %s", self.server_address)
                 async with websockets.connect(self.server_address) as websocket:
                     self.websocket = websocket
-                    self.connection_status_changed.emit("Connected")
-                    self.logger.info("WebSocket connected.")
+                    self._server_ready = False
+                    self._emit_status("Loading", f"Loading the {self.model} model")
+                    self.logger.info("WebSocket connected; awaiting SERVER_READY.")
                     self._eos_sent = False
 
                     # Note: sample_rate / format / channels are silently ignored by the
@@ -122,11 +152,14 @@ class WebSocketClient(QObject):
                         else:
                             message = raw_message
                         payload_log.log_raw(message)
+                        if self._handle_control_message(message):
+                            continue
                         self.message_received.emit(message)
                         self.logger.debug("Message received (%d bytes).", len(message))
 
             except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK, OSError) as e:
-                self.connection_status_changed.emit("Disconnected")
+                self._server_ready = False
+                self._emit_status("Disconnected", self._closed_detail(e))
                 if self._eos_sent:
                     # Expected: WhisperLive closes the socket in response to our
                     # END_OF_AUDIO. Reconnect immediately so the next capture
@@ -136,15 +169,100 @@ class WebSocketClient(QObject):
                     self.logger.warning("Connection closed: %s. Reconnecting...", e)
                     await self._interruptible_sleep(1)
             except Exception:
-                self.connection_status_changed.emit("Error")
+                self._server_ready = False
+                self._emit_status("Error", "Unexpected connection error — retrying")
                 self.logger.exception("Unexpected WebSocket error; will retry.")
                 await self._interruptible_sleep(5)
 
+    def _closed_detail(self, error) -> str:
+        """Explain a dropped connection in the terms the user can act on."""
+        if self._eos_sent:
+            return ""
+        text = str(error).lower()
+        if isinstance(error, ConnectionRefusedError) or "refused" in text:
+            return "Nothing is listening — the WhisperLive server is not running"
+        if "timed out" in text or isinstance(error, TimeoutError):
+            return "The server did not respond"
+        return "The connection to the server dropped"
+
+    def _handle_control_message(self, message: str) -> bool:
+        """Consume WhisperLive's status messages. True if this was one.
+
+        These carry the server's real readiness, which is the whole point:
+        SERVER_READY means the model is loaded, WAIT means another client is
+        ahead of us in the queue. Neither is transcript, so neither should
+        reach the capture box.
+        """
+        try:
+            payload = json.loads(message)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+
+        # `message` doubles as the status field in some server versions and as
+        # a free-text detail in others, so both are read.
+        kind = str(payload.get("message", ""))
+        status = str(payload.get("status", ""))
+
+        if kind == "SERVER_READY":
+            backend = payload.get("backend", "")
+            self._server_ready = True
+            self._emit_status("Ready", f"Model loaded ({backend})" if backend else "Model loaded")
+            self._flush_pending_audio()
+            return True
+
+        if status == "WAIT":
+            # WhisperLive reports the estimated wait in minutes.
+            try:
+                minutes = float(kind)
+                detail = f"Server busy — about {max(1, round(minutes))} min until a slot frees up"
+            except (TypeError, ValueError):
+                detail = "Server busy — waiting for a free slot"
+            self._emit_status("Waiting", detail)
+            return True
+
+        if status == "ERROR" or kind == "ERROR":
+            detail = str(payload.get("message") or "The server reported an error")
+            self._emit_status("Error", detail if detail != "ERROR" else "The server reported an error")
+            return True
+
+        if kind == "DISCONNECT":
+            self._server_ready = False
+            self._emit_status("Disconnected", "The server closed the session")
+            return True
+
+        return False
+
+    def _flush_pending_audio(self):
+        """Send everything recorded while the model was still loading."""
+        if not self._pending_audio:
+            return
+        chunks = list(self._pending_audio)
+        self._pending_audio.clear()
+        self._pending_bytes = 0
+        self.logger.info("Flushing %d buffered audio chunks held during model load.", len(chunks))
+        for chunk in chunks:
+            self._dispatch_audio(chunk)
+
     def send_audio(self, audio_chunk):
-        if self.websocket and self.loop and self.is_running and not self._eos_sent:
-            self.logger.debug("Sending audio chunk (%d bytes).", len(audio_chunk))
-            fut = asyncio.run_coroutine_threadsafe(self.websocket.send(audio_chunk), self.loop)
-            fut.add_done_callback(self._on_send_done)
+        if not (self.websocket and self.loop and self.is_running and not self._eos_sent):
+            return
+        if not self._server_ready:
+            # Hold it rather than dropping it. The server is not reading yet,
+            # and the words spoken during a cold model load are exactly the
+            # ones the user will assume were transcribed.
+            self._pending_audio.append(audio_chunk)
+            self._pending_bytes += len(audio_chunk)
+            while self._pending_bytes > MAX_PENDING_AUDIO_BYTES and self._pending_audio:
+                self._pending_bytes -= len(self._pending_audio.popleft())
+            return
+        self._dispatch_audio(audio_chunk)
+
+    def _dispatch_audio(self, audio_chunk):
+        self.logger.debug("Sending audio chunk (%d bytes).", len(audio_chunk))
+        fut = asyncio.run_coroutine_threadsafe(self.websocket.send(audio_chunk), self.loop)
+        fut.add_done_callback(self._on_send_done)
 
     def _on_send_done(self, fut):
         try:
@@ -165,6 +283,15 @@ class WebSocketClient(QObject):
     def reset_eos(self):
         """Allow sending EOS again on the next capture."""
         self._eos_sent = False
+        # Audio held over from a previous capture is stale by now; sending it
+        # would prepend the last utterance to this one.
+        self._pending_audio.clear()
+        self._pending_bytes = 0
+
+    @property
+    def is_ready(self) -> bool:
+        """True when the server has confirmed its model is loaded."""
+        return self._server_ready
 
 if __name__ == '__main__':
     # Example usage for testing
@@ -179,9 +306,9 @@ if __name__ == '__main__':
     
     client = WebSocketClient(SERVER_URL)
     
-    def on_status_change(status):
-        print(f"Connection status: {status}")
-        if status == "Connected":
+    def on_status_change(status, detail=""):
+        print(f"Connection status: {status} ({detail})")
+        if status == "Ready":
             # Simulate sending a blank audio chunk and EOS after 2 seconds
             QTimer.singleShot(2000, lambda: client.send_audio(b'\x00'*1024))
             QTimer.singleShot(2500, client.send_eos)

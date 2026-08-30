@@ -33,6 +33,31 @@ from capture_box import (
 METER_PREVIEW_BACKGROUND = "#2b2b2b"
 METER_PREVIEW_WIDTH = 196
 
+# Models offered in the dropdown, in the order they are shown. A typed model
+# name fails silently -- the server rejects it and the capture box simply never
+# fills in -- so the common cases are picked from a list instead.
+#
+# `None` inserts a separator. The first group is English-only and sized for a
+# CPU or a modest GPU; the second needs a real GPU to be worth choosing.
+#
+# Measured on an RTX 3060 Ti: every one of these transcribes faster than
+# speech, and time-to-first-word varied by under 0.15s across the whole range
+# (it is set by the server's chunk cadence, not the model). What model size
+# actually costs is the per-connection load -- 0.4s for tiny.en up to 3.3s for
+# large-v3-turbo -- so on a GPU there is little reason to pick a small one.
+MODEL_CHOICES = [
+    ("distil-small.en", "fast, trained to suppress hallucination"),
+    ("distil-medium.en", "more accurate, still quick"),
+    ("small.en", "accurate; a little more filler on short clips"),
+    ("medium.en", "accurate, heavier"),
+    ("base.en", "light"),
+    ("tiny.en", "fastest to load, hallucinates on short utterances"),
+    None,
+    ("large-v3-turbo", "best accuracy for the latency — needs an NVIDIA GPU"),
+    ("distil-large-v3", "near-large accuracy, faster"),
+    ("large-v3", "most accurate, slowest"),
+]
+
 APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WhisperBoard")
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
@@ -45,6 +70,16 @@ DEFAULT_SETTINGS = {
     "connect_on_demand": True,
     "capture_font_size": DEFAULT_FONT_SIZE_PX,
     "capture_meter_style": METER_STYLES[0],
+    # Server startup. WhisperBoard launches itself at login but the WhisperLive
+    # server does not, which left the app looking ready with nothing to talk
+    # to. These let it bring the server up itself -- only ever for a server
+    # address on this machine.
+    "auto_start_server": True,
+    "start_docker_desktop": True,
+    "server_use_gpu": False,
+    # Advanced, and deliberately not in the UI: overrides the image chosen by
+    # the GPU checkbox, for a pinned tag or a locally built one.
+    "server_docker_image": "",
 }
 
 
@@ -63,7 +98,18 @@ class SettingsWindow(QWidget):
         # UI Elements
         self.server_address_edit = QLineEdit()
         self.capture_hotkey_edit = QKeySequenceEdit()
-        self.model_edit = QLineEdit()
+        self.model_combo = QComboBox()
+        for choice in MODEL_CHOICES:
+            if choice is None:
+                self.model_combo.insertSeparator(self.model_combo.count())
+                continue
+            name, description = choice
+            # The model id is what the server is actually sent, so it leads;
+            # the description is the part that makes the list choosable.
+            self.model_combo.addItem(f"{name} — {description}", name)
+        self.model_combo.setToolTip(
+            "The transcription model the server loads. The large models need an "
+            "NVIDIA GPU; on a CPU, prefer the distil ones.")
         self.capture_font_size_spin = QSpinBox()
         self.capture_font_size_spin.setRange(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX)
         self.capture_font_size_spin.setSuffix(" px")
@@ -96,6 +142,17 @@ class SettingsWindow(QWidget):
         )
         self.launch_on_startup_checkbox = QCheckBox("Launch WhisperBoard on system startup")
         self.connect_on_demand_checkbox = QCheckBox("Connect to server only when capture starts (on-demand)")
+        self.auto_start_server_checkbox = QCheckBox(
+            "Start the WhisperLive server automatically (Docker)")
+        self.auto_start_server_checkbox.setToolTip(
+            "Runs the WhisperLive container on this machine when WhisperBoard "
+            "starts. Ignored when the server address points at another machine.")
+        self.start_docker_desktop_checkbox = QCheckBox(
+            "Launch Docker Desktop if it is not already running")
+        self.server_use_gpu_checkbox = QCheckBox(
+            "Use the NVIDIA GPU server image")
+        self.server_use_gpu_checkbox.setToolTip(
+            "Requires an NVIDIA GPU with Docker's container toolkit installed.")
 
         self.save_button = QPushButton("Save")
         self.cancel_button = QPushButton("Cancel")
@@ -106,8 +163,14 @@ class SettingsWindow(QWidget):
 
         form_layout.addRow(QLabel("Server Address:"), self.server_address_edit)
         form_layout.addRow(QLabel("Capture Hotkey:"), self.capture_hotkey_edit)
-        form_layout.addRow(QLabel("Model (e.g., distil-small.en):"), self.model_edit)
+        form_layout.addRow(QLabel("Model:"), self.model_combo)
         form_layout.addRow(QLabel("Connection Mode:"), self.connect_on_demand_checkbox)
+        server_start_column = QVBoxLayout()
+        server_start_column.setContentsMargins(0, 0, 0, 0)
+        server_start_column.addWidget(self.auto_start_server_checkbox)
+        server_start_column.addWidget(self.start_docker_desktop_checkbox)
+        server_start_column.addWidget(self.server_use_gpu_checkbox)
+        form_layout.addRow(QLabel("Server Startup:"), server_start_column)
         form_layout.addRow(QLabel("Capture Text Size:"), self.capture_font_size_spin)
         meter_row = QHBoxLayout()
         meter_row.setContentsMargins(0, 0, 0, 0)
@@ -132,10 +195,32 @@ class SettingsWindow(QWidget):
         # so the two never disagree about what is selected.
         self.meter_preview.style_changed.connect(self.capture_meter_style_combo.setCurrentText)
         self.meter_test_button.toggled.connect(self._on_preview_toggled)
+        self.auto_start_server_checkbox.toggled.connect(self._sync_server_startup_enabled)
         self.save_button.clicked.connect(self.save_settings)
         self.cancel_button.clicked.connect(self.close)
 
         self.load_settings()
+
+    def _select_model(self, model: str):
+        """Select `model`, keeping a hand-edited one that is not on the list.
+
+        WhisperLive accepts model names this list does not carry -- a custom or
+        locally converted one, set in config.json by hand. Dropping such a
+        value on the floor the first time the Settings window was opened would
+        silently rewrite the config to something the user did not choose, so it
+        is added to the list instead and marked as what it is.
+        """
+        index = self.model_combo.findData(model)
+        if index < 0 and model:
+            self.model_combo.insertItem(0, f"{model} — custom", model)
+            index = 0
+        self.model_combo.setCurrentIndex(max(index, 0))
+
+    def _sync_server_startup_enabled(self):
+        """The sub-options only mean anything when auto-start is on."""
+        enabled = self.auto_start_server_checkbox.isChecked()
+        self.start_docker_desktop_checkbox.setEnabled(enabled)
+        self.server_use_gpu_checkbox.setEnabled(enabled)
 
     def set_preview_level_db(self, db: float):
         """Feed the preview meter, while the app has the mic open for it."""
@@ -166,9 +251,18 @@ class SettingsWindow(QWidget):
         self.server_address_edit.setText(settings.get("server_address", DEFAULT_SETTINGS["server_address"]))
         capture_hotkey = settings.get("capture_hotkey", DEFAULT_SETTINGS["capture_hotkey"])
         self.capture_hotkey_edit.setKeySequence(QKeySequence(self._display_hotkey(capture_hotkey)))
-        self.model_edit.setText(settings.get("model", DEFAULT_SETTINGS["model"]))
+        self._select_model(settings.get("model", DEFAULT_SETTINGS["model"]))
         self.launch_on_startup_checkbox.setChecked(settings.get("launch_on_startup", DEFAULT_SETTINGS["launch_on_startup"]))
         self.connect_on_demand_checkbox.setChecked(settings.get("connect_on_demand", DEFAULT_SETTINGS["connect_on_demand"]))
+        self.auto_start_server_checkbox.setChecked(
+            settings.get("auto_start_server", DEFAULT_SETTINGS["auto_start_server"]))
+        self.start_docker_desktop_checkbox.setChecked(
+            settings.get("start_docker_desktop", DEFAULT_SETTINGS["start_docker_desktop"]))
+        self.server_use_gpu_checkbox.setChecked(
+            settings.get("server_use_gpu", DEFAULT_SETTINGS["server_use_gpu"]))
+        self._server_docker_image = settings.get(
+            "server_docker_image", DEFAULT_SETTINGS["server_docker_image"])
+        self._sync_server_startup_enabled()
         self.capture_font_size_spin.setValue(
             int(settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"])))
         meter_style = settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"])
@@ -199,8 +293,14 @@ class SettingsWindow(QWidget):
             "server_address": self.server_address_edit.text(),
             "capture_hotkey": hotkey_str,
             "launch_on_startup": self.launch_on_startup_checkbox.isChecked(),
-            "model": self.model_edit.text() or DEFAULT_SETTINGS["model"],
+            "model": self.model_combo.currentData() or DEFAULT_SETTINGS["model"],
             "connect_on_demand": self.connect_on_demand_checkbox.isChecked(),
+            "auto_start_server": self.auto_start_server_checkbox.isChecked(),
+            "start_docker_desktop": self.start_docker_desktop_checkbox.isChecked(),
+            "server_use_gpu": self.server_use_gpu_checkbox.isChecked(),
+            # Round-tripped rather than edited: it has no UI, but a value set
+            # by hand in config.json must survive a visit to this window.
+            "server_docker_image": getattr(self, "_server_docker_image", ""),
             "capture_font_size": self.capture_font_size_spin.value(),
             "capture_meter_style": self.capture_meter_style_combo.currentText(),
         }

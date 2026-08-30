@@ -18,6 +18,8 @@ from audio_capture import AudioCapture
 from capture_box import CaptureBox
 import win_input
 import payload_log
+import server_manager
+from server_manager import ServerManager
 from win_focus import (
     get_foreground_window, focus_window, is_own_window, is_window,
     get_window_title,
@@ -49,12 +51,30 @@ TRAY_LETTER = "W"
 # bitmap keeps the letterform crisp — downscaled type blurs badly.
 TRAY_ICON_SIZES = (16, 20, 24, 32, 48, 64)
 
+# One colour per thing the user can actually do something about. "starting"
+# is distinct from "connecting" because they fail differently: an amber icon
+# means WhisperBoard is bringing the server up and the wait is expected, while
+# grey means nothing is running and nothing is being done about it.
 TRAY_STATE_COLORS = {
     "ready": "#2ecc71",
     "connecting": "#3498db",
+    "starting": "#f39c12",
     "recording": "#e74c3c",
-    "error": "#7f8c8d",
+    "offline": "#7f8c8d",
+    "error": "#c0392b",
 }
+
+# How often the tray re-reads its own status while something is in progress,
+# so the elapsed counter in the tooltip actually moves.
+STATUS_TICK_MS = 1000
+
+# How often to check that the server is still there while no socket is open.
+# In on-demand mode nothing else would notice it going away, and a tray icon
+# that claims "ready" for a server that died an hour ago is worse than none.
+# A minute rather than seconds: this only drives an at-a-glance indicator, and
+# the state is re-checked on the hotkey anyway -- which is the moment it
+# actually has to be right.
+IDLE_PROBE_MS = 60000
 
 # Whisper is known to emit these strings on silence/noise. Drop any segment
 # whose normalized text matches. WhisperLive issue #185 tracks the upstream bug.
@@ -114,6 +134,15 @@ class WhisperBoardApp:
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = 0.0
         self.connection_status = "Disconnected"
+        self.connection_detail = ""
+        # What the tray is currently saying, and since when -- the elapsed
+        # time in the tooltip is measured from the last change of label, not
+        # from process start, so "Loading model (40s)" means this load.
+        self._status_label = ""
+        self._status_since = time.monotonic()
+        # Latches so a server that is down does not produce a tray balloon on
+        # every 15-second probe.
+        self._server_failure_notified = False
         # Win32 handle of the window that had focus before the Capture Box
         # appeared, so paste can be routed back to it (e.g. Notepad).
         self._prev_foreground_hwnd = None
@@ -130,9 +159,13 @@ class WhisperBoardApp:
 
         # Core Components
         self.audio_capture = AudioCapture()
+        self.server_manager = ServerManager(self.settings)
+        self.server_manager.state_changed.connect(self.on_server_state_changed)
         self._init_tray_icon()
         self._init_hotkey_listener()
         self._init_websocket_client()
+        self._init_status_timers()
+        self._start_server_if_needed()
         
         # Connect signals
         self.capture_box.confirmed.connect(self.on_capture_confirmed)
@@ -150,6 +183,7 @@ class WhisperBoardApp:
         self.menu = QMenu()
         self._create_menu()
         self.tray_icon.setContextMenu(self.menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
         self._sync_icon_state()
 
@@ -157,6 +191,22 @@ class WhisperBoardApp:
         self.status_action = QAction("Status: Disconnected")
         self.status_action.setEnabled(False)
         self.menu.addAction(self.status_action)
+        # The second, disabled line is where the diagnosis goes -- "Docker
+        # Desktop is not running", "Port 9090 is already in use". Without it
+        # the menu can only say something is wrong, not what.
+        self.status_detail_action = QAction("")
+        self.status_detail_action.setEnabled(False)
+        self.menu.addAction(self.status_detail_action)
+        self.menu.addSeparator()
+        self.start_server_action = QAction("Start Server")
+        self.start_server_action.triggered.connect(self.on_start_server)
+        self.menu.addAction(self.start_server_action)
+        self.stop_server_action = QAction("Stop Server")
+        self.stop_server_action.triggered.connect(self.on_stop_server)
+        self.menu.addAction(self.stop_server_action)
+        self.reconnect_action = QAction("Reconnect")
+        self.reconnect_action.triggered.connect(self.on_reconnect)
+        self.menu.addAction(self.reconnect_action)
         self.menu.addSeparator()
         self.settings_action = QAction("Settings")
         self.settings_action.triggered.connect(self.open_settings)
@@ -226,20 +276,199 @@ class WhisperBoardApp:
         icon = self.state_icons.get(state, self.state_icons.get("error"))
         if icon:
             self.tray_icon.setIcon(icon)
-            self.tray_icon.setToolTip(f"WhisperBoard ({state.capitalize()})")
+
+    def _status_summary(self):
+        """The one place that decides what state the app is really in.
+
+        Two independent facts have to be reconciled: whether the server exists
+        (the ServerManager) and whether we have a live, model-loaded session on
+        it (the WebSocketClient). The socket wins whenever it has something to
+        say, because a working connection is proof the server is up; otherwise
+        the server manager explains why there is no connection to have.
+
+        Returns (icon_state, label, detail).
+        """
+        if self.is_capturing and self.connection_status == "Ready":
+            return "recording", "Recording", "Listening \u2014 press the hotkey again to paste"
+
+        server_state = self.server_manager.state
+        server_detail = self.server_manager.detail
+
+        if self.connection_status == "Ready":
+            return "ready", "Ready", self.connection_detail or "Connected, model loaded"
+        if self.connection_status == "Waiting":
+            return "connecting", "Server busy", self.connection_detail
+        if self.connection_status == "Loading":
+            return "connecting", "Loading model", self.connection_detail
+        if self.connection_status == "Connecting":
+            return "connecting", "Connecting", self.connection_detail
+
+        # No usable connection. Whatever the server manager is doing is the
+        # more informative answer -- it is the reason there is no connection.
+        if server_state == server_manager.STATE_PULLING:
+            return "starting", "Downloading server", server_detail
+        if server_state == server_manager.STATE_STARTING_DOCKER:
+            return "starting", "Starting Docker", server_detail
+        if server_state in (server_manager.STATE_STARTING, server_manager.STATE_CHECKING):
+            return "starting", "Starting server", server_detail
+        if server_state == server_manager.STATE_FAILED:
+            return "error", "Server unavailable", server_detail
+        if server_state == server_manager.STATE_RUNNING:
+            if self.settings.get("connect_on_demand", False):
+                return "ready", "Ready (on-demand)", "Server is running; connects when you dictate"
+            # "Reconnecting", not "Connecting": the manager last saw a live
+            # server, so the detail here is why the most recent attempt failed
+            # rather than a first dial in progress. Calling both "Connecting"
+            # put the label at odds with its own detail line.
+            return "connecting", "Reconnecting", self.connection_detail or server_detail
+
+        # Nothing is running, and nothing is starting it.
+        if self.connection_status == "Error":
+            return "error", "Connection error", self.connection_detail
+        fallback = self.connection_detail or server_detail
+        if self.settings.get("connect_on_demand", False):
+            return "offline", "Not connected", fallback or "Connects when you dictate"
+        return "offline", "Disconnected", fallback or "No connection to the server"
 
     def _sync_icon_state(self):
-        if self.is_capturing:
-            self._set_tray_icon_state("recording")
-        elif self.connection_status == "Connected":
-            self._set_tray_icon_state("ready")
-        elif self.connection_status == "Connecting":
-            self._set_tray_icon_state("connecting")
+        icon_state, label, detail = self._status_summary()
+        if label != self._status_label:
+            self._status_label = label
+            self._status_since = time.monotonic()
+
+        self._set_tray_icon_state(icon_state)
+        self.status_action.setText(f"Status: {label}")
+        self.status_detail_action.setText(f"   {detail}" if detail else "")
+        self.status_detail_action.setVisible(bool(detail))
+        self.tray_icon.setToolTip(self._tooltip_text(label, detail, icon_state))
+        self._sync_menu_actions()
+        if self._capture_waiting_for_connection:
+            self._update_capture_status_text(label, detail)
+
+    def _tooltip_text(self, label: str, detail: str, icon_state: str) -> str:
+        text = f"WhisperBoard \u2014 {label}"
+        # Elapsed time only while something is in flight, and only once it has
+        # gone on long enough to be worth watching. On a settled state, a
+        # running counter would be noise.
+        if icon_state in ("starting", "connecting"):
+            elapsed = int(time.monotonic() - self._status_since)
+            if elapsed >= 3:
+                text += f" ({elapsed}s)"
+        if detail:
+            text += "\n" + detail
+        return text
+
+    def _sync_menu_actions(self):
+        # Shown whenever a local server *could* be managed, not only when
+        # auto-start is on: someone who turned auto-start off still needs a
+        # way to start the server on the occasions they want it.
+        can_manage = self.server_manager.can_manage_server()
+        running = self.server_manager.state == server_manager.STATE_RUNNING
+        busy = self.server_manager.is_busy()
+        self.start_server_action.setVisible(can_manage)
+        self.stop_server_action.setVisible(can_manage)
+        self.start_server_action.setEnabled(can_manage and not running and not busy)
+        self.stop_server_action.setEnabled(can_manage and running and not busy)
+        self.reconnect_action.setEnabled(self.connection_status != "Ready")
+
+    def _update_capture_status_text(self, label: str, detail: str):
+        """Say what the box is waiting for, instead of a permanent 'Connecting...'.
+
+        A capture opened against a server that is not running used to sit on
+        "Connecting..." indefinitely, with no way to tell a slow model load
+        from a Docker daemon that is never going to come up.
+        """
+        if detail:
+            self.capture_box.set_text(f"{label}\u2026\n{detail}")
         else:
-            if self.settings.get("connect_on_demand", False):
-                self._set_tray_icon_state("ready")
-            else:
-                self._set_tray_icon_state("error")
+            self.capture_box.set_text(f"{label}\u2026")
+
+    def _init_status_timers(self):
+        # Drives the elapsed counter in the tooltip.
+        self._status_timer = QTimer()
+        self._status_timer.setInterval(STATUS_TICK_MS)
+        self._status_timer.timeout.connect(self._on_status_tick)
+        self._status_timer.start()
+
+        # Keeps the icon honest while no socket is open.
+        self._probe_timer = QTimer()
+        self._probe_timer.setInterval(IDLE_PROBE_MS)
+        self._probe_timer.timeout.connect(self._on_idle_probe)
+        self._probe_timer.start()
+
+    def _on_status_tick(self):
+        icon_state, _, _ = self._status_summary()
+        # Only the in-flight states have a moving tooltip; refreshing a settled
+        # one would rewrite the same string once a second forever.
+        if icon_state in ("starting", "connecting"):
+            self._sync_icon_state()
+
+    def _on_idle_probe(self):
+        if self.connection_status in ("Ready", "Loading", "Waiting"):
+            return  # the live socket is the proof; no need to poll
+        if self.server_manager.is_busy():
+            return
+        self.server_manager.probe()
+
+    def _start_server_if_needed(self):
+        """Bring the server up at launch, so it is warm by the first hotkey.
+
+        This runs even in on-demand mode: on-demand is about when to open a
+        socket, not about whether a server should exist. Leaving the container
+        until the first capture would put a cold Docker start in front of the
+        words the user is already speaking.
+        """
+        if self.server_manager.manages_server():
+            self.server_manager.ensure_running()
+        else:
+            self.server_manager.probe()
+
+    def on_server_state_changed(self, state: str, detail: str):
+        if state == server_manager.STATE_RUNNING:
+            self._maybe_autoconnect()
+        elif state == server_manager.STATE_FAILED and not self._server_failure_notified:
+            # Once per failure, not once per retry: the probe re-reports the
+            # same dead server every 15 seconds, and a balloon each time would
+            # be its own problem.
+            self._server_failure_notified = True
+            self._notify("WhisperLive server unavailable",
+                         f"{detail}.\n\nDictation will not work until the server is running.")
+        if state != server_manager.STATE_FAILED:
+            self._server_failure_notified = False
+        self._sync_icon_state()
+
+    def _maybe_autoconnect(self):
+        """Open the socket, unless the user asked us to wait for a capture."""
+        if self.settings.get("connect_on_demand", False):
+            return
+        self.websocket_client.connect()
+
+    def on_tray_activated(self, reason):
+        # Left or double click: report status where it cannot be missed. The
+        # context menu already carries it, but nobody right-clicks a tray icon
+        # to find out whether their dictation is going to work.
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            _, label, detail = self._status_summary()
+            self._notify(f"WhisperBoard \u2014 {label}", detail or "")
+
+    def on_start_server(self):
+        self._server_failure_notified = False
+        # Forced: clicking Start Server is a clearer instruction than the
+        # auto-start checkbox, whichever way that is set.
+        self.server_manager.ensure_running(force=True)
+        self._sync_icon_state()
+
+    def on_stop_server(self):
+        self.server_manager.stop_server()
+        self._sync_icon_state()
+
+    def on_reconnect(self):
+        self._server_failure_notified = False
+        if (self.server_manager.can_manage_server()
+                and self.server_manager.state != server_manager.STATE_RUNNING):
+            self.server_manager.ensure_running(force=True)
+        self.websocket_client.connect()
+        self._sync_icon_state()
 
     def _init_hotkey_listener(self):
         self._start_hotkey_listener(self.settings["capture_hotkey"])
@@ -273,6 +502,16 @@ class WhisperBoardApp:
             except Exception:
                 pass
             try:
+                # Before the shutdown, not after: the retiring client emits a
+                # final "Disconnected" as its thread unwinds, and that arrives
+                # on the GUI thread late enough to overwrite the new client's
+                # status with the old one's last word.
+                previous_client.connection_status_changed.disconnect(
+                    self.on_connection_status_changed)
+                previous_client.message_received.disconnect(self.on_message_received)
+            except Exception:
+                pass
+            try:
                 previous_client.disconnect()
             except Exception:
                 self.logger.exception("Failed to disconnect previous WebSocket client.")
@@ -287,8 +526,15 @@ class WhisperBoardApp:
         self.websocket_client.connection_status_changed.connect(self.on_connection_status_changed)
         self.websocket_client.message_received.connect(self.on_message_received)
         self.audio_capture.audio_chunk_ready.connect(self.websocket_client.send_audio)
+        self.connection_status = "Disconnected"
+        self.connection_detail = ""
         if not self.settings.get("connect_on_demand", False):
-            self.websocket_client.connect()
+            # Only worth dialling if there is something to dial. When we are
+            # starting the server ourselves, the connect happens on the
+            # manager's "running" state instead of against a closed port.
+            if (not self.server_manager.manages_server()
+                    or self.server_manager.state == server_manager.STATE_RUNNING):
+                self.websocket_client.connect()
 
     def load_settings(self):
         try:
@@ -296,13 +542,39 @@ class WhisperBoardApp:
                 self.settings = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             self.settings = copy.deepcopy(DEFAULT_SETTINGS)
+        # Kept before the defaults are backfilled, so first-run detection can
+        # tell "the user has no opinion yet" from "the user chose this".
+        self._settings_from_disk = set(self.settings)
         # Backfill settings added since this config file was written, so a
         # config from an older build does not KeyError on a new setting.
         for key, value in DEFAULT_SETTINGS.items():
             self.settings.setdefault(key, value)
+        self._resolve_gpu_default()
         self.settings["capture_hotkey"] = self._normalize_hotkey_string(
             self.settings.get("capture_hotkey", DEFAULT_SETTINGS["capture_hotkey"])
         )
+
+    def _resolve_gpu_default(self):
+        """Pick the server image from the hardware, once, on first run.
+
+        A flat default is wrong on one machine or the other: the CPU image on
+        an NVIDIA box leaves the GPU idle and dictation noticeably slower,
+        while the GPU image on a machine without one refuses to start. Asked
+        once and written to the config, so the Settings checkbox afterwards
+        shows -- and can override -- a real answer rather than a guess.
+        """
+        if "server_use_gpu" in self._settings_from_disk:
+            return
+        detected = server_manager.detect_nvidia_gpu()
+        self.settings["server_use_gpu"] = detected
+        self.logger.info("First run: %s NVIDIA GPU detected; using the %s server image.",
+                         "an" if detected else "no", "GPU" if detected else "CPU")
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(self.settings, f, indent=4)
+        except OSError:
+            # Not fatal -- it is simply re-detected next launch.
+            self.logger.exception("Could not persist the detected GPU setting.")
 
     def _normalize_hotkey_string(self, hotkey: str) -> str:
         """Ensure modifiers are wrapped for pynput parsing."""
@@ -322,8 +594,12 @@ class WhisperBoardApp:
             elif t in ("<cmd>", "cmd", "win", "windows", "meta", "super"):
                 parts.append("<cmd>")
             else:
+                # Named keys keep their brackets: pynput parses "<f9>" as
+                # Key.f9 but rejects a bare "f9". Stripping them unconditionally
+                # meant any hotkey with a function, space, or enter key saved
+                # correctly and then failed to load on the next launch.
                 t = t.strip("<>")
-                parts.append(t)
+                parts.append(t if len(t) == 1 else f"<{t}>")
         return "+".join(parts)
 
     def _startup_command(self) -> str:
@@ -347,19 +623,31 @@ class WhisperBoardApp:
         except Exception:
             self.logger.exception("Failed to update launch on startup setting.")
 
-    def on_connection_status_changed(self, status):
+    def on_connection_status_changed(self, status, detail=""):
         self.connection_status = status
-        status_label = status
-        if status == "Disconnected" and self.settings.get("connect_on_demand", False):
-            status_label = "Disconnected (on-demand)"
-        self.status_action.setText(f"Status: {status_label}")
+        self.connection_detail = detail
 
-        if status == "Connected" and self.is_capturing and self._capture_waiting_for_connection:
+        # "Ready", not "Loading": the socket being open only means the server
+        # accepted us, and audio streamed before SERVER_READY is audio spoken
+        # into a model that is not in memory yet.
+        if status == "Ready" and self.is_capturing and self._capture_waiting_for_connection:
             self._capture_waiting_for_connection = False
             self._begin_streaming()
 
+        if status in ("Ready", "Loading", "Waiting"):
+            # A live session is the strongest possible evidence the server is
+            # up, and it beats whatever the manager last concluded from a probe.
+            self._server_failure_notified = False
+        elif status in ("Disconnected", "Error"):
+            # A refused connection means the manager's last verdict may be out
+            # of date -- a container can die between probes. Re-check now so
+            # the tray explains the failure rather than showing a hopeful
+            # "Reconnecting" over a server that is gone.
+            if self.server_manager.manages_server() and not self.server_manager.is_busy():
+                self.server_manager.probe()
+
         self._sync_icon_state()
-        self.logger.info("Connection status changed: %s", status)
+        self.logger.info("Connection status changed: %s (%s)", status, detail)
 
     def on_message_received(self, message_str):
         now = time.time()
@@ -411,14 +699,19 @@ class WhisperBoardApp:
             # Record the target window now, before the Capture Box steals focus.
             self._record_paste_target()
             self.capture_box.show_at_cursor()
-            if self.connection_status == "Connected":
+            if self.connection_status == "Ready":
                 self._begin_streaming()
             else:
-                # Not connected yet — only happens before the initial connection
-                # finishes warming up, or in connect-on-demand mode. Wait for it;
+                # Not ready yet: connect-on-demand, a connection still warming
+                # up, or a server that is not running at all. The box now
+                # reports which of those it is, refreshed as the state moves;
                 # on_connection_status_changed() starts streaming once ready.
                 self._capture_waiting_for_connection = True
-                self.capture_box.set_text("Connecting...")
+                if (self.server_manager.manages_server()
+                        and self.server_manager.state != server_manager.STATE_RUNNING
+                        and not self.server_manager.is_busy()):
+                    # Dictating is as clear a request for a server as there is.
+                    self.server_manager.ensure_running()
                 self.websocket_client.connect()
             self._sync_icon_state()
             self.logger.debug("Capture started via hotkey.")
@@ -566,7 +859,13 @@ class WhisperBoardApp:
             self.settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"]))
         self.capture_box.set_meter_style(
             self.settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"]))
+        self.server_manager.update_settings(self.settings)
         self._init_websocket_client()
+        # A server address or image change makes the previous verdict stale,
+        # and turning auto-start on is a request to start it now, not next
+        # launch.
+        self._server_failure_notified = False
+        self._start_server_if_needed()
         self._sync_icon_state()
 
     def on_meter_style_changed(self, style: str):
@@ -702,6 +1001,13 @@ class WhisperBoardApp:
         self.audio_capture.shutdown()
         if getattr(self, "websocket_client", None):
             self.websocket_client.disconnect()
+        if getattr(self, "server_manager", None):
+            # Abandons any in-flight Docker work. The container itself is left
+            # running: it was started with a restart policy so the next launch
+            # finds it warm, and stopping it here would make every quit cost
+            # the next session a cold model load. "Stop Server" in the tray
+            # menu is the deliberate way to shut it down.
+            self.server_manager.shutdown()
 
     def run(self):
         sys.exit(self.app.exec())

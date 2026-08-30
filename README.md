@@ -18,6 +18,20 @@ WhisperBoard is a sleek, hotkey-driven dictation utility for Windows. It capture
 
 ## Run the WhisperLive server (Docker)
 
+**WhisperBoard can do this for you.** By default it starts the server itself at
+launch: it checks whether anything is already listening, starts Docker Desktop
+if the daemon is down, pulls the image if it is missing, and runs the container
+as `whisperboard-server` with `--restart unless-stopped`. The tray icon reports
+each step, so a first run that spends ten minutes downloading a 3 GB image
+looks like progress rather than a hang.
+
+Turn it off in **Settings → Server Startup** if you would rather manage the
+server yourself; **Start Server** and **Stop Server** stay in the tray menu
+either way. It is skipped entirely when the server address points at another
+machine.
+
+To run the server by hand instead:
+
 1. Install **Docker Desktop** if you do not have it already.
 2. Run **ONE** of these commands in a terminal and leave it running:
 
@@ -37,7 +51,20 @@ WhisperBoard is a sleek, hotkey-driven dictation utility for Windows. It capture
 
 WhisperBoard defaults to `distil-small.en`, which gives the best balance of accuracy, speed, and low hallucination rate for English dictation on a typical desktop CPU.
 
-Other good options (set via Settings → Model):
+Pick one from the **Settings → Model** dropdown — it is a list rather than a
+text field, because a mistyped model name fails silently: the server rejects it
+and the capture box simply never fills in. A custom model set by hand in
+`config.json` is kept and shown in the list as "custom".
+
+Measured on an RTX 3060 Ti, streaming 10s of speech at 1x realtime: every model
+below finished transcribing *before the speaker stopped*, and time-to-first-word
+varied by under 0.15s across the whole range — that latency is set by the
+server's chunk cadence, not by the model. What model size actually costs is the
+per-connection load (0.4s for `tiny.en` up to 3.3s for `large-v3-turbo`), which
+WhisperLive pays on every connection. On a GPU there is little reason to choose
+a small model.
+
+Other good options:
 
 | Model | Hardware | Notes |
 |---|---|---|
@@ -84,7 +111,22 @@ Other good options (set via Settings → Model):
     ```bash
     python src/main.py
     ```
-2.  **Check the Status**: Right-click the tray icon. The status should change from "Connecting" to "Connected".
+2.  **Check the Status**: The tray icon's colour is the quickest read —
+
+    | Colour | Meaning |
+    |---|---|
+    | Amber | Starting the server: Docker Desktop, image download, or container start |
+    | Blue | Connecting, or waiting for the server to finish loading its model |
+    | Green | Ready to dictate |
+    | Red (bright) | Recording |
+    | Dark red | Something is wrong; the tooltip says what |
+    | Grey | Not connected, and nothing is starting the server |
+
+    Hover for the detail and elapsed time, left-click for the same as a
+    notification, or right-click for the full status and the server controls.
+    "Ready" means the server has confirmed its model is loaded — not merely
+    that the socket opened, which is why a cold start shows "Loading model"
+    for a while first.
 3.  **Press the Hotkey**: Press the configured hotkey (`Ctrl+\` by default) to make the Capture Box appear.
 4.  **Speak**: The box will show "Listening...". As you speak, the transcribed text will appear.
 5.  **Confirm or Cancel**:

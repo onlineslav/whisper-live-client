@@ -25,6 +25,12 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 - [x] **Fix: paste did not reach the target app** — rewritten as a paced sequence in `win_input.py`: native `CF_UNICODETEXT` clipboard (Qt's delayed-rendering data object made the paste depend on our event loop), foreground restore verified by polling rather than assumed, held modifiers released so a stray Shift/Alt cannot turn the injected `Ctrl+V` into another shortcut, and `SendInput` return values checked so a refused injection is visible
 - [x] **Notify on paste failure** — tray balloon naming the reason, with the transcript left on the clipboard so `Ctrl+V` still recovers it
 - [x] **Input level meter in the capture box** — `signal_meter.py`: one auto-ranging, VU/PPM-ballistic signal chain (median de-spike, tracked noise floor and decaying peak ceiling, dB-domain normalisation) behind four interchangeable styles, in the space left of the Confirm button. Click the meter to cycle styles; the choice persists
+- [x] **Start the server, and report what it is doing** — `server_manager.py` starts Docker Desktop, pulls the image (with a download percentage), and runs the container; the tray shows a distinct state for each step with elapsed time, and the capture box says what it is waiting for instead of a permanent "Connecting...". WhisperBoard launched at login while the server did not, so the app spent its time looking ready with nothing listening on 9090
+- [x] **Report server status, not just socket status** — `SERVER_READY` and `WAIT` are now read, so "Ready" means the model is loaded rather than that the socket opened; audio recorded during a cold model load is held and flushed instead of being streamed at a server that is not reading yet. Latency is still not measured
+- [x] **Fix: a saved hotkey with a named key would not load** — `_normalize_hotkey_string` stripped the angle brackets off every non-modifier key, so `<ctrl>+<alt>+<f9>` came back as `f9` and pynput refused it. Single-character hotkeys like the default `` <ctrl>+` `` hid this
+- [x] **Model as a dropdown** — nine curated models with one-line descriptions, split into CPU- and GPU-sized groups; the stored value is the bare model id, and a custom name set by hand in `config.json` is preserved and labelled rather than silently replaced. Free text failed silently on a typo: the server rejects the name and the capture box just never fills in
+- [x] **Persist the server's model cache** — the container had no volume for `/root/.cache/huggingface`, so every recreate re-downloaded every model (2.4 GB, measured). Now a named volume, so switching models in Settings costs one download ever
+- [x] **Fix: the health probe was flooding the server log** — a bare TCP connect makes WhisperLive log a 27-line traceback, once every probe. The idle poll now asks Docker for containers it manages (zero server-side noise) and only falls back to the network for servers it does not own, where it sends a request line rather than hanging up
 - [x] **Click-away to cancel, properly** — driven by window activation loss; a Qt event filter cannot observe clicks in other applications, so the previous implementation never actually worked
 
 ---
@@ -36,8 +42,7 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 - [ ] **Microphone device picker** in settings — the user cannot currently see or choose which mic was opened
 - [ ] **Expose the VAD threshold** as a setting instead of the hardcoded `0.012`
 - [ ] **Log to a file** at `%APPDATA%\WhisperBoard\whisperboard.log` — the packaged build is `console=False` and currently produces no diagnostics at all
-- [ ] **Tray left-click opens a status panel** — no `activated` handler is connected today, so left-click does nothing
-- [ ] **Report server status, not just socket status** — reachable, model loaded, latency
+- [ ] **Tray left-click opens a status panel** — left-click now shows the current status as a notification balloon, which covers the "is this thing working" question; a real panel is still unbuilt
 - [ ] **Skip empty history entries** — cancelled captures with no text currently write blank lines
 - [ ] **Feedback when the history file is missing** — `open_history` currently `pass`es silently
 - [ ] **Bound the audio thread join** — `stop_streaming()` joins with no timeout on the GUI thread; a blocked PyAudio read freezes the UI
@@ -55,7 +60,6 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 ## Phase 3 — Settings depth
 
 - [ ] **Tabbed settings window** — Connection / Audio / Text & Paste / Behavior / History / System
-- [ ] **Model as a dropdown** — free-text entry fails silently on a typo
 - [ ] **Restore the clipboard after pasting** — dictation currently destroys clipboard contents
 - [ ] **Paste method option** — clipboard+`Ctrl+V` or direct keystroke typing for apps that block clipboard paste. `win_input.type_text()` already implements the typing path as an automatic fallback when the clipboard is unwritable; this item is now just exposing it as a choice
 - [ ] **Custom vocabulary / replacement rules** for names and jargon
