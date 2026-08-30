@@ -126,6 +126,7 @@ class WhisperBoardApp:
         self.settings_window = None
         self.capture_box = CaptureBox()
         self.capture_box.set_font_size(self.settings["capture_font_size"])
+        self.capture_box.set_meter_style(self.settings["capture_meter_style"])
 
         # Core Components
         self.audio_capture = AudioCapture()
@@ -136,6 +137,10 @@ class WhisperBoardApp:
         # Connect signals
         self.capture_box.confirmed.connect(self.on_capture_confirmed)
         self.capture_box.cancelled.connect(self.on_capture_cancelled)
+        self.capture_box.meter_style_changed.connect(self.on_meter_style_changed)
+        # Straight from the audio thread, so the meter moves even while the
+        # speech gate is holding chunks back from the server.
+        self.audio_capture.level_changed.connect(self.capture_box.set_level_db)
         self.app.aboutToQuit.connect(self._shutdown)
 
     def _init_tray_icon(self):
@@ -520,6 +525,9 @@ class WhisperBoardApp:
             self.settings_window = SettingsWindow()
             self.settings_window.settings_saved.connect(self.on_settings_saved)
             self.settings_window.window_closed.connect(self.on_settings_closed)
+            self.settings_window.preview_requested.connect(self.on_meter_preview_requested)
+            self.audio_capture.level_changed.connect(
+                self.settings_window.set_preview_level_db)
         else:
             self.settings_window.load_settings()
             try:
@@ -534,6 +542,20 @@ class WhisperBoardApp:
         """Resume hotkey listener when settings window closes."""
         self._start_hotkey_listener(self.settings["capture_hotkey"])
 
+    def on_meter_preview_requested(self, active: bool):
+        """Open or release the mic for the Settings window's meter preview.
+
+        Safe to run only because the hotkey listener is stopped for as long as
+        the Settings window is open, so a capture cannot start underneath the
+        preview and find the device already streaming in meter-only mode.
+        """
+        if self.is_capturing:
+            return
+        if active:
+            self.audio_capture.start_streaming(meter_only=True)
+        else:
+            self.audio_capture.stop_streaming()
+
     def on_settings_saved(self, updated_settings):
         """Apply updated settings from the Settings window."""
         self.settings = updated_settings
@@ -542,8 +564,25 @@ class WhisperBoardApp:
         self._start_hotkey_listener(self.settings["capture_hotkey"])
         self.capture_box.set_font_size(
             self.settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"]))
+        self.capture_box.set_meter_style(
+            self.settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"]))
         self._init_websocket_client()
         self._sync_icon_state()
+
+    def on_meter_style_changed(self, style: str):
+        """Persist a style picked by clicking the meter itself.
+
+        Written straight to the config file rather than through the Settings
+        window: the window is usually closed while a capture is running, and a
+        style tried out mid-capture is worth nothing if it is forgotten by the
+        next one.
+        """
+        self.settings["capture_meter_style"] = style
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(self.settings, f, indent=4)
+        except Exception:
+            self.logger.exception("Failed to save meter style.")
 
     def _do_paste(self):
         """Put the transcript on the clipboard and paste it into the target.

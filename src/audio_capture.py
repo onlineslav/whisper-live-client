@@ -6,11 +6,29 @@ import pyaudio
 import threading
 from PySide6.QtCore import QObject, Signal
 
+# Level reported for a digitally silent chunk. Real microphones never reach it
+# -- it is the "no signal at all" rail the meter parks on between captures.
+SILENCE_DBFS = -100.0
+
+
+def dbfs_from_rms(rms: float) -> float:
+    """Convert an RMS level (float32 samples in -1..1) to dBFS."""
+    if rms <= 0.0:
+        return SILENCE_DBFS
+    return max(SILENCE_DBFS, 20.0 * math.log10(rms))
+
+
 class AudioCapture(QObject):
     """
     Captures audio from the microphone in a separate thread and emits it.
     """
     audio_chunk_ready = Signal(bytes)
+    # Level of every chunk in dBFS, emitted whether or not the chunk passes the
+    # speech gate below -- the meter is there to show the user that the mic is
+    # live, so it has to move during silence too. Raw dB rather than a 0-1
+    # reading: the meter's own auto-ranging works in the dB domain, and this
+    # side of the wire has no business deciding what "full scale" means.
+    level_changed = Signal(float)
 
     def __init__(self, channels=1, rate=16000, chunk_size=1024):
         super().__init__()
@@ -39,9 +57,19 @@ class AudioCapture(QObject):
         self._stream = None
         self._thread = None
         self._is_running = False
+        self._meter_only = False
 
-    def start_streaming(self):
+    def start_streaming(self, meter_only: bool = False):
+        """Open the mic and stream.
+
+        `meter_only` opens the mic for its level alone and emits no audio
+        chunks -- it drives the Settings window's meter preview. Without it the
+        preview would feed the live WebSocket session, and a persistent
+        connection would quietly transcribe whatever was said while someone was
+        only trying to pick a meter style.
+        """
         if self._thread is None or not self._thread.is_alive():
+            self._meter_only = meter_only
             self._is_running = True
             self._thread = threading.Thread(target=self._run_capture, daemon=True)
             self._thread.start()
@@ -81,7 +109,11 @@ class AudioCapture(QObject):
                     self.logger.warning("Audio capture warning: %s", e)
                     continue
 
-                is_speech = self._chunk_rms(data) >= self._silence_threshold
+                rms = self._chunk_rms(data)
+                self.level_changed.emit(dbfs_from_rms(rms))
+                if self._meter_only:
+                    continue
+                is_speech = rms >= self._silence_threshold
                 if is_speech:
                     silent_run = 0
                     if not speaking:
@@ -108,6 +140,10 @@ class AudioCapture(QObject):
         except Exception:
             self.logger.exception("Audio capture failed to open stream.")
         finally:
+            # Park the meter at silence: the last chunk read is usually
+            # mid-speech, and without this the meter would stay pinned there
+            # until the next capture starts.
+            self.level_changed.emit(SILENCE_DBFS)
             if self._stream:
                 self._stream.stop_stream()
                 self._stream.close()

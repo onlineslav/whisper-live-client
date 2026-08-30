@@ -29,6 +29,7 @@ from PySide6.QtGui import (
     QTextCursor,
 )
 
+from signal_meter import SignalMeter, STYLES as METER_STYLES
 from win_focus import focus_window
 
 # Distance from the anchor point to the box's top-left corner. The box hangs
@@ -55,6 +56,9 @@ class CaptureBox(QWidget):
 
     confirmed = Signal(str)
     cancelled = Signal()
+    # Emitted when the user clicks the meter to try a different style, so the
+    # choice can be written back to the config file.
+    meter_style_changed = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -120,6 +124,11 @@ class CaptureBox(QWidget):
 
         # Buttons
         button_row = QHBoxLayout()
+        # No automatic spacing: the row's only gaps are the two stretches
+        # either side of the meter, and an inter-item spacing would be added
+        # to the right-hand one only -- leaving the meter a few pixels off
+        # centre for no visible reason.
+        button_row.setSpacing(0)
         self.confirm_button = QPushButton("Confirm")
         self.cancel_button = QPushButton("Cancel")
 
@@ -145,8 +154,20 @@ class CaptureBox(QWidget):
         self.cancel_button.setStyleSheet(button_style)
         self.cancel_button.setObjectName("cancel")
 
+        # The meter lives in the otherwise empty stretch to the left of the
+        # buttons: it is in view while the user is speaking and reading the
+        # transcript, without taking any room from either.
+        self.meter = SignalMeter(self)
+        self.meter.style_changed.connect(self.meter_style_changed)
+
+        # A stretch on each side centres the meter in the space left over by
+        # the buttons, rather than pinning it to the left edge with all the
+        # slack pooled on one side of it.
+        button_row.addStretch()
+        button_row.addWidget(self.meter, 0, Qt.AlignVCenter)
         button_row.addStretch()
         button_row.addWidget(self.confirm_button)
+        button_row.addSpacing(8)
         button_row.addWidget(self.cancel_button)
         layout.addLayout(button_row)
 
@@ -166,6 +187,13 @@ class CaptureBox(QWidget):
         self._closing = True
         self.cancelled.emit()
         self._fade_out_and_hide()
+
+    def set_level_db(self, db: float):
+        """Feed the meter a raw chunk level in dBFS."""
+        self.meter.set_level_db(db)
+
+    def set_meter_style(self, style: str):
+        self.meter.set_style(style)
 
     def set_text(self, text):
         self.text_area.setPlainText(text)
@@ -202,6 +230,7 @@ class CaptureBox(QWidget):
 
     def show_at_cursor(self):
         self._closing = False
+        self.meter.reset()
         self._shown_at = time.monotonic()
         self.adjustSize()
 
@@ -335,6 +364,7 @@ class CaptureBox(QWidget):
         # hotkey-to-confirm path). Marking it closing here stops the
         # deactivation that follows from being read as a click-away cancel.
         self._closing = True
+        self.meter.reset()
         app = QApplication.instance()
         if app:
             app.removeEventFilter(self)
@@ -379,5 +409,30 @@ if __name__ == "__main__":
 
     QTimer.singleShot(1000, lambda: capture_box.set_text("This is a test transcription."))
     QTimer.singleShot(2000, lambda: capture_box.set_text("This is a test transcription that is getting longer."))
+
+    # Fake speech in dBFS so the meters can be judged without a mic: a room
+    # tone floor with phrases riding on top of it, syllable-rate detail inside
+    # each phrase, and one deliberately quieter phrase to show the auto-range
+    # re-scaling to it.
+    import math as _math
+    import random as _random
+
+    _tick = {"n": 0}
+
+    def _drive_meter():
+        _tick["n"] += 1
+        t = _tick["n"] * 0.064
+        phrase = _math.sin(t * 0.8)
+        loud = -14.0 if (t % 24.0) < 12.0 else -26.0
+        if phrase > 0.1:
+            syllables = 0.5 + 0.5 * _math.sin(t * 11.0)
+            db = loud - 16.0 * (1.0 - phrase * syllables)
+        else:
+            db = -58.0
+        capture_box.set_level_db(db + _random.uniform(-1.5, 1.5))
+
+    meter_timer = QTimer()
+    meter_timer.timeout.connect(_drive_meter)
+    meter_timer.start(64)
 
     sys.exit(app.exec())

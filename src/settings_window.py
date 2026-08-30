@@ -13,15 +13,25 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QKeySequenceEdit,
     QSpinBox,
+    QComboBox,
 )
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence
+
+from signal_meter import SignalMeter
 
 from capture_box import (
     DEFAULT_FONT_SIZE_PX,
     MIN_FONT_SIZE_PX,
     MAX_FONT_SIZE_PX,
+    METER_STYLES,
 )
+
+# The preview sits on a dark panel matching the Capture Box, because that is
+# where the meter really lives; the same blue on the settings window's own
+# background would misrepresent every style.
+METER_PREVIEW_BACKGROUND = "#2b2b2b"
+METER_PREVIEW_WIDTH = 196
 
 APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WhisperBoard")
 os.makedirs(APP_DATA_DIR, exist_ok=True)
@@ -34,12 +44,17 @@ DEFAULT_SETTINGS = {
     "model": "distil-small.en",
     "connect_on_demand": True,
     "capture_font_size": DEFAULT_FONT_SIZE_PX,
+    "capture_meter_style": METER_STYLES[0],
 }
 
 
 class SettingsWindow(QWidget):
     settings_saved = Signal(dict)
     window_closed = Signal()
+    # Asks the application to open (True) or release (False) the microphone
+    # for the meter preview. The window has no audio source of its own -- and
+    # should not grow one, since the app already owns the only capture device.
+    preview_requested = Signal(bool)
 
     def __init__(self):
         super().__init__()
@@ -52,6 +67,33 @@ class SettingsWindow(QWidget):
         self.capture_font_size_spin = QSpinBox()
         self.capture_font_size_spin.setRange(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX)
         self.capture_font_size_spin.setSuffix(" px")
+        self.capture_meter_style_combo = QComboBox()
+        self.capture_meter_style_combo.addItems(METER_STYLES)
+        # A live preview, on the dark ground it will actually be seen against.
+        # A meter can only be judged moving, so the alternative -- save, close,
+        # start a capture, decide you dislike it, reopen settings -- is not a
+        # way anyone would willingly compare four of them.
+        self.meter_preview = SignalMeter()
+        self.meter_preview_panel = QWidget()
+        self.meter_preview_panel.setObjectName("meterPreview")
+        # Fixed width: the styles are different sizes, and without this the
+        # Test button would jump sideways every time the dropdown changed.
+        self.meter_preview_panel.setFixedWidth(METER_PREVIEW_WIDTH)
+        self.meter_preview_panel.setStyleSheet(
+            "QWidget#meterPreview { background-color: %s; border-radius: 8px; }"
+            % METER_PREVIEW_BACKGROUND
+        )
+        preview_layout = QHBoxLayout(self.meter_preview_panel)
+        preview_layout.setContentsMargins(8, 6, 8, 6)
+        preview_layout.addStretch()
+        preview_layout.addWidget(self.meter_preview, 0, Qt.AlignCenter)
+        preview_layout.addStretch()
+
+        self.meter_test_button = QPushButton("Test mic")
+        self.meter_test_button.setCheckable(True)
+        self.meter_test_button.setToolTip(
+            "Open the microphone to preview the meter. Nothing is sent to the server."
+        )
         self.launch_on_startup_checkbox = QCheckBox("Launch WhisperBoard on system startup")
         self.connect_on_demand_checkbox = QCheckBox("Connect to server only when capture starts (on-demand)")
 
@@ -67,6 +109,13 @@ class SettingsWindow(QWidget):
         form_layout.addRow(QLabel("Model (e.g., distil-small.en):"), self.model_edit)
         form_layout.addRow(QLabel("Connection Mode:"), self.connect_on_demand_checkbox)
         form_layout.addRow(QLabel("Capture Text Size:"), self.capture_font_size_spin)
+        meter_row = QHBoxLayout()
+        meter_row.setContentsMargins(0, 0, 0, 0)
+        meter_row.addWidget(self.capture_meter_style_combo)
+        meter_row.addWidget(self.meter_preview_panel)
+        meter_row.addWidget(self.meter_test_button)
+        meter_row.addStretch()
+        form_layout.addRow(QLabel("Level Meter:"), meter_row)
 
         layout.addLayout(form_layout)
         layout.addWidget(self.launch_on_startup_checkbox)
@@ -78,10 +127,30 @@ class SettingsWindow(QWidget):
         layout.addLayout(button_layout)
 
         # Connections
+        self.capture_meter_style_combo.currentTextChanged.connect(self.meter_preview.set_style)
+        # The preview is clickable like the real one; keep the dropdown in step
+        # so the two never disagree about what is selected.
+        self.meter_preview.style_changed.connect(self.capture_meter_style_combo.setCurrentText)
+        self.meter_test_button.toggled.connect(self._on_preview_toggled)
         self.save_button.clicked.connect(self.save_settings)
         self.cancel_button.clicked.connect(self.close)
 
         self.load_settings()
+
+    def set_preview_level_db(self, db: float):
+        """Feed the preview meter, while the app has the mic open for it."""
+        self.meter_preview.set_level_db(db)
+
+    def _on_preview_toggled(self, active: bool):
+        self.meter_test_button.setText("Stop test" if active else "Test mic")
+        if not active:
+            self.meter_preview.reset()
+        self.preview_requested.emit(active)
+
+    def stop_preview(self):
+        """Release the microphone. Safe to call when it was never opened."""
+        if self.meter_test_button.isChecked():
+            self.meter_test_button.setChecked(False)
 
     def get_config_path(self):
         return CONFIG_FILE
@@ -102,6 +171,10 @@ class SettingsWindow(QWidget):
         self.connect_on_demand_checkbox.setChecked(settings.get("connect_on_demand", DEFAULT_SETTINGS["connect_on_demand"]))
         self.capture_font_size_spin.setValue(
             int(settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"])))
+        meter_style = settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"])
+        if meter_style not in METER_STYLES:
+            meter_style = DEFAULT_SETTINGS["capture_meter_style"]
+        self.capture_meter_style_combo.setCurrentText(meter_style)
 
     def save_settings(self):
         sequence = self.capture_hotkey_edit.keySequence()
@@ -129,6 +202,7 @@ class SettingsWindow(QWidget):
             "model": self.model_edit.text() or DEFAULT_SETTINGS["model"],
             "connect_on_demand": self.connect_on_demand_checkbox.isChecked(),
             "capture_font_size": self.capture_font_size_spin.value(),
+            "capture_meter_style": self.capture_meter_style_combo.currentText(),
         }
 
         try:
@@ -194,6 +268,9 @@ class SettingsWindow(QWidget):
         return "+".join(parts)
 
     def closeEvent(self, event):
+        # Before the close is announced: leaving the mic open behind a closed
+        # settings window would be both a leak and a genuine privacy surprise.
+        self.stop_preview()
         self.window_closed.emit()
         super().closeEvent(event)
 

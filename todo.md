@@ -24,6 +24,7 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 - [x] **Single-instance guard** — named mutex (`Local\WhisperBoard-SingleInstance`); a second launch explains itself and exits. This was not hypothetical: two copies were running, so both opened a box on the same hotkey and the paste landed in the *other* instance's read-only text area, which swallowed it silently
 - [x] **Fix: paste did not reach the target app** — rewritten as a paced sequence in `win_input.py`: native `CF_UNICODETEXT` clipboard (Qt's delayed-rendering data object made the paste depend on our event loop), foreground restore verified by polling rather than assumed, held modifiers released so a stray Shift/Alt cannot turn the injected `Ctrl+V` into another shortcut, and `SendInput` return values checked so a refused injection is visible
 - [x] **Notify on paste failure** — tray balloon naming the reason, with the transcript left on the clipboard so `Ctrl+V` still recovers it
+- [x] **Input level meter in the capture box** — `signal_meter.py`: one auto-ranging, VU/PPM-ballistic signal chain (median de-spike, tracked noise floor and decaying peak ceiling, dB-domain normalisation) behind four interchangeable styles, in the space left of the Confirm button. Click the meter to cycle styles; the choice persists
 - [x] **Click-away to cancel, properly** — driven by window activation loss; a Qt event filter cannot observe clicks in other applications, so the previous implementation never actually worked
 
 ---
@@ -31,7 +32,7 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 ## Phase 1 — Trustworthy core (no silent failures)
 
 - [ ] **Set the default model to `distil-small.en` and fix the live config** — currently running `tiny.en`, which the README explicitly warns against; it is the source of most observed hallucination
-- [ ] **Input level meter in the capture box**, with the VAD threshold drawn on it — a quiet mic currently streams nothing and shows an empty box with no explanation
+- [ ] **Draw the VAD threshold on the level meter** — the meter itself is built (below), but the gate's cut-off is not marked on it, so a mic quiet enough to stream nothing still looks the same as one that is working
 - [ ] **Microphone device picker** in settings — the user cannot currently see or choose which mic was opened
 - [ ] **Expose the VAD threshold** as a setting instead of the hardcoded `0.012`
 - [ ] **Log to a file** at `%APPDATA%\WhisperBoard\whisperboard.log` — the packaged build is `console=False` and currently produces no diagnostics at all

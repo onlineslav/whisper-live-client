@@ -115,7 +115,7 @@ Stored at `%APPDATA%\WhisperBoard\config.json`. Settings apply live on save; no 
 | Setting | Default | Notes |
 |---|---|---|
 | Input device | System default | Currently unselectable; user cannot see which mic was grabbed |
-| Input level meter | — | Live meter **with the VAD threshold drawn on it** |
+| Input level meter | `waveform` | Built. Auto-ranging scale: the room's noise floor reads 0, your loudest recent speech reads 1, so it works at any mic gain. Styles: `waveform`, `mirror`, `bars`, `arc`, `circle` — click the meter to cycle, or preview them live in Settings against your own voice ("Test mic"; opens the mic for the meter only, streams nothing). Still owes **the VAD threshold drawn on it** |
 | VAD threshold | `0.012` RMS | Hardcoded today. Below it, *nothing streams* — a silent, invisible failure |
 | Hangover window | 8 chunks (~0.5 s) | Protects word tails; the lever for clipped endings (§3.1) |
 | Pre-roll | 3 chunks (~0.2 s) | Prevents clipped first syllables |
