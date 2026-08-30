@@ -321,6 +321,9 @@ class WhisperBoardApp:
             return "starting", "Starting Docker", server_detail
         if server_state in (server_manager.STATE_STARTING, server_manager.STATE_CHECKING):
             return "starting", "Starting server", server_detail
+        if server_state == server_manager.STATE_PAUSED:
+            # Grey, not red: this is a thing we chose to do, not a fault.
+            return "offline", "GPU released", server_detail
         if server_state == server_manager.STATE_FAILED:
             return "error", "Server unavailable", server_detail
         if server_state == server_manager.STATE_RUNNING:
@@ -428,6 +431,9 @@ class WhisperBoardApp:
         until the first capture would put a cold Docker start in front of the
         words the user is already speaking.
         """
+        # Started regardless of auto-start: standing down for a game is worth
+        # doing even for a server the user starts by hand.
+        self.server_manager.start_app_watch()
         if self.server_manager.manages_server():
             self.server_manager.ensure_running()
         else:
@@ -532,6 +538,7 @@ class WhisperBoardApp:
             sample_rate=self.audio_capture.rate,
             channels=self.audio_capture.channels,
             audio_format=self.audio_capture.audio_format,
+            reconnect_after_capture=self.settings.get("reconnect_after_capture", True),
         )
         self.websocket_client.connection_status_changed.connect(self.on_connection_status_changed)
         self.websocket_client.message_received.connect(self.on_message_received)
@@ -1026,6 +1033,7 @@ class WhisperBoardApp:
         if getattr(self, "websocket_client", None):
             self.websocket_client.disconnect()
         if getattr(self, "server_manager", None):
+            self.server_manager.stop_app_watch()
             # Abandons any in-flight Docker work. The container itself is left
             # running: it was started with a restart policy so the next launch
             # finds it warm, and stopping it here would make every quit cost

@@ -25,6 +25,22 @@ as `whisperboard-server` with `--restart unless-stopped`. The tray icon reports
 each step, so a first run that spends ten minutes downloading a 3 GB image
 looks like progress rather than a hang.
 
+By default it also passes the chosen model to the server as a local path,
+which switches WhisperLive into **single model mode**: one model, loaded once
+and shared by every connection. Left to itself the server loads a *separate*
+model for each connection and closes the socket after every dictation, so one
+capture is one model instance — measured at 7.1 GB of resident models on an
+8 GB card, at which point the GPU fills up and everything slows down (`tiny.en`
+went from 1.27s to 5.03s to first word). Sharing one model removes both that
+and the per-connection load. The cost is that the model is fixed for the life
+of the container, so changing it in Settings rebuilds the container — a few
+seconds, with the weights already cached.
+
+**Release GPU for** takes a list of programs — your games, say. While any of
+them is running, WhisperBoard stops the server so it is not holding GPU memory,
+and starts it again when they exit. Starting the server from the tray menu
+overrides this until that program closes.
+
 Turn it off in **Settings → Server Startup** if you would rather manage the
 server yourself; **Start Server** and **Stop Server** stay in the tray menu
 either way. It is skipped entirely when the server address points at another

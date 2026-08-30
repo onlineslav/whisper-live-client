@@ -39,6 +39,7 @@ STATE_PULLING = "pulling"            # downloading the server image
 STATE_STARTING = "starting"          # docker run / docker start
 STATE_RUNNING = "running"            # something is listening on the port
 STATE_FAILED = "failed"              # gave up; detail says why
+STATE_PAUSED = "paused"              # stopped on purpose, to free the GPU
 
 CONTAINER_NAME = "whisperboard-server"
 
@@ -50,6 +51,32 @@ CONTAINER_NAME = "whisperboard-server"
 # download instead of one per container lifetime.
 MODEL_CACHE_VOLUME = "whisperboard-models"
 MODEL_CACHE_PATH = "/root/.cache/huggingface"
+
+# WhisperLive loads a *separate* model for every client connection, and it
+# closes the socket after each END_OF_AUDIO -- so one dictation is one model
+# instance. Cleanup is only `self.exit = True` and the reclaim lags behind the
+# next connection's load, which measured 7.1 GB of resident models on an 8 GB
+# card after normal use with distil-large-v3. At that point the GPU is full,
+# clocks drop, and every model gets slower: tiny.en went from 1.27s to 5.03s
+# to first word.
+#
+# The server has a single-model mode that loads one model and shares it across
+# connections, but it is gated behind a custom model *path* -- naming a model
+# in the handshake never reaches it. A downloaded model's snapshot directory
+# is exactly such a path, so resolving it and passing -fw unlocks the mode,
+# which removes both the per-connection load and the accumulation.
+#
+# Because -fw fixes the model for the life of the container, the model is part
+# of the container's identity: changing it in Settings recreates the container.
+# How often to look for an app we should get out of the way of. Slow on
+# purpose: this decides whether to stop a container, and reacting a few seconds
+# later than a game's splash screen costs nothing.
+APP_POLL_S = 20.0
+
+MODEL_FETCH_CONTAINER = "whisperboard-modelfetch"
+SERVER_BASE_COMMAND = ["python", "run_server.py"]
+# Model names we will interpolate into a python -c inside the container.
+_SAFE_MODEL = re.compile(r"^[A-Za-z0-9._/-]+$")
 IMAGE_CPU = "ghcr.io/collabora/whisperlive-cpu:latest"
 IMAGE_GPU = "ghcr.io/collabora/whisperlive-gpu:latest"
 
@@ -128,6 +155,46 @@ def is_local_address(address: str) -> bool:
     return host.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "[::1]")
 
 
+def running_processes() -> set:
+    """Lower-cased names of the processes running right now.
+
+    `tasklist` rather than psutil, which is not a dependency of this project,
+    and rather than EnumProcesses, which would need a ctypes dance to get the
+    same strings. One call every twenty seconds is not worth either.
+    """
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=20, creationflags=_NO_WINDOW)
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    if completed.returncode != 0:
+        return set()
+    names = set()
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith('"'):
+            continue
+        # "name.exe","1234","Console","1","12,345 K"
+        names.add(line.split('","', 1)[0].lstrip('"').lower())
+    return names
+
+
+def parse_app_list(raw: str) -> list:
+    """Split the user's comma/newline separated app list into process names."""
+    parts = []
+    for chunk in str(raw or "").replace("\n", ",").split(","):
+        name = chunk.strip().lower()
+        if not name:
+            continue
+        # Accept "Game" as readily as "Game.exe" -- nobody thinks of their
+        # games by their file extension.
+        if not name.endswith(".exe"):
+            name += ".exe"
+        parts.append(name)
+    return parts
+
+
 def detect_nvidia_gpu() -> bool:
     """True if this machine has an NVIDIA GPU the GPU image could use.
 
@@ -166,9 +233,21 @@ def is_port_open(host: str, port: int, timeout: float = PROBE_TIMEOUT_S) -> bool
             try:
                 request = CRLF.join(["GET / HTTP/1.1", "Host: " + host, "", ""])
                 sock.sendall(request.encode("ascii", "ignore"))
+                # The reply is what makes this a readiness check rather than a
+                # liveness one. A freshly started container binds the port
+                # before its Python process is serving, so a bare connect
+                # succeeds against a server that will refuse the next
+                # WebSocket handshake -- which is exactly the race a caller
+                # hits right after the container is recreated.
+                sock.settimeout(timeout)
+                sock.recv(64)
+            except socket.timeout:
+                # Accepted, but nothing is answering yet.
+                return False
             except OSError:
-                # It accepted the connection, which is the question asked.
-                pass
+                # Closed on us without a reply: something is there and
+                # handling connections, which is the question asked.
+                return True
             return True
     except OSError:
         return False
@@ -210,6 +289,14 @@ class ServerManager(QObject):
         # shared worker, so watching progress can never block a start or stop.
         self._watch_thread = None
         self._watch_stop = threading.Event()
+        # Name of the app we have stood down for, if any, and a flag set when
+        # the user starts the server by hand anyway -- an explicit instruction
+        # outranks the heuristic, and without it the watcher would simply undo
+        # the user's click on the next poll.
+        self._paused_for = None
+        self._yield_override = False
+        self._app_thread = None
+        self._app_stop = threading.Event()
 
     # -- configuration -----------------------------------------------------
 
@@ -256,6 +343,15 @@ class ServerManager(QObject):
         if not force and not self.manages_server():
             self._emit(STATE_DISABLED, "Automatic server startup is off")
             return
+        if force:
+            # The user asked directly; stop standing down until whatever we
+            # stood down for has gone away.
+            self._yield_override = True
+            self._paused_for = None
+        elif self._paused_for:
+            self._emit(STATE_PAUSED,
+                       f"GPU released while {self._paused_for} is running")
+            return
         self._run_async(self._ensure_running_blocking, "server-start")
 
     def probe(self):
@@ -293,7 +389,72 @@ class ServerManager(QObject):
     def stop_download_watch(self):
         self._watch_stop.set()
 
-    def _download_bytes(self):
+    # -- standing down for other GPU work ---------------------------------
+
+    def yield_apps(self) -> list:
+        return parse_app_list(self.settings.get("vram_yield_apps", ""))
+
+    def start_app_watch(self):
+        """Watch for apps we should free the GPU for."""
+        with self._lock:
+            if self._app_thread and self._app_thread.is_alive():
+                return
+            self._app_stop.clear()
+            self._app_thread = threading.Thread(
+                target=self._watch_apps, name="vram-yield-watch", daemon=True)
+            self._app_thread.start()
+
+    def stop_app_watch(self):
+        self._app_stop.set()
+
+    def _find_yield_app(self):
+        """The first configured app that is running, or None."""
+        wanted = self.yield_apps()
+        if not wanted:
+            return None
+        running = running_processes()
+        for name in wanted:
+            if name in running:
+                return name
+        return None
+
+    def _watch_apps(self):
+        while not self._app_stop.is_set():
+            try:
+                self._apply_yield_state()
+            except Exception:
+                self.logger.exception("VRAM yield check failed.")
+            self._app_stop.wait(APP_POLL_S)
+
+    def _apply_yield_state(self):
+        found = self._find_yield_app()
+
+        if found is None:
+            # Nothing to defer to. A manual override only lasts as long as the
+            # app that provoked it, so it is cleared here rather than left to
+            # suppress the next game too.
+            self._yield_override = False
+            if self._paused_for:
+                released, self._paused_for = self._paused_for, None
+                self.logger.info("%s exited; bringing the server back.", released)
+                if self.manages_server():
+                    self._run_async(self._ensure_running_blocking, "server-resume")
+            return
+
+        if self._yield_override or not self.can_manage_server():
+            return
+        if self._paused_for == found:
+            return  # already stood down for this one
+
+        self._paused_for = found
+        self.logger.info("%s is running; stopping the server to free the GPU.", found)
+        self._run_async(lambda: self._pause_blocking(found), "server-pause")
+
+    def _pause_blocking(self, app: str):
+        self._docker("stop", CONTAINER_NAME, timeout=60)
+        self._emit(STATE_PAUSED, f"GPU released while {app} is running")
+
+    def _download_bytes(self, container: str = CONTAINER_NAME):
         """(downloaded, total) across in-progress model downloads, or None."""
         # %s is the apparent size -- preallocated to the finished length -- and
         # %b counts the 512-byte blocks actually committed to disk.
@@ -302,7 +463,7 @@ class ServerManager(QObject):
         # "missing argument to -exec".
         script = ('find /root/.cache/huggingface -name "*.incomplete" '
                   '-exec stat -c "%s %b" {} ";"')
-        ok, out, _ = self._docker("exec", CONTAINER_NAME, "sh", "-c", script, timeout=15)
+        ok, out, _ = self._docker("exec", container, "sh", "-c", script, timeout=15)
         if not ok or not out:
             return None
         done = total = 0
@@ -354,6 +515,7 @@ class ServerManager(QObject):
         """Abandon any in-flight Docker work; called on app exit."""
         self._stop_event.set()
         self._watch_stop.set()
+        self._app_stop.set()
         process = self._pull_process
         if process and process.poll() is None:
             try:
@@ -445,6 +607,8 @@ class ServerManager(QObject):
         return running == "true"
 
     def _probe_blocking(self):
+        if self._paused_for:
+            return  # stopped on purpose; not a fault to report
         host, port = parse_address(self.address)
 
         # For a container we own, Docker is the quieter authority: the idle
@@ -470,7 +634,14 @@ class ServerManager(QObject):
         host, port = parse_address(self.address)
 
         self._emit(STATE_CHECKING, "Checking for a running server")
-        if is_port_open(host, port):
+
+        # A listening port is only proof enough when the server is not ours to
+        # configure. When it is, the container still has to be checked against
+        # what the settings now ask for -- a model change alters the command it
+        # must run, and short-circuiting here on "something answered" is how a
+        # configuration change silently never takes effect.
+        ours = self._docker_exe() and self._container_field("{{.State.Running}}") is not None
+        if is_port_open(host, port) and not ours:
             # Worded identically to the probe's and _await_port's success, so
             # the idle poll does not keep rewriting a settled tooltip with a
             # synonym of what it already says.
@@ -534,6 +705,14 @@ class ServerManager(QObject):
         return out if ok else None
 
     def _ensure_container(self, host_port: int) -> bool:
+        # Resolved before anything is torn down, so a model that still has to
+        # be downloaded is fetched while the old container is up and its
+        # progress is visible.
+        model_path = None
+        if self.settings.get("share_one_model", True):
+            model_path = self._resolve_model_path(self.settings.get("model", ""))
+        desired_command = self._server_command(model_path)
+
         running = self._container_field("{{.State.Running}}")
         if running is not None:
             # A container by our name exists. Reuse it only if it still matches
@@ -543,7 +722,12 @@ class ServerManager(QObject):
             ports = self._container_field(
                 "{{range $p, $conf := .NetworkSettings.Ports}}"
                 "{{if $conf}}{{(index $conf 0).HostPort}} {{end}}{{end}}") or ""
-            matches = image in self._acceptable_images() and str(host_port) in ports.split()
+            command = self._container_field('{{join .Config.Cmd " "}}') or ""
+            # The command carries the model, so a model change shows up here as
+            # a mismatch and the container is rebuilt around the new one.
+            matches = (image in self._acceptable_images()
+                       and str(host_port) in ports.split()
+                       and command.split() == desired_command)
             if matches and running == "true":
                 return True
             if matches:
@@ -559,7 +743,72 @@ class ServerManager(QObject):
             return False
         if self._cancelled():
             return False
-        return self._run_container(host_port)
+        return self._run_container(host_port, command=desired_command)
+
+    def _server_command(self, model_path=None) -> list:
+        """The command the container should run.
+
+        Stated in full because Docker replaces the image's CMD outright when
+        arguments follow the image name rather than appending to it.
+        """
+        command = SERVER_BASE_COMMAND + ["--port", str(CONTAINER_PORT)]
+        if model_path:
+            command += ["-fw", model_path]
+        return command
+
+    def _resolve_model_path(self, model: str):
+        """Local path of `model` inside the cache volume, downloading it first.
+
+        Runs faster-whisper's own downloader in a throwaway container against
+        the shared cache volume, so the model-name to repository mapping is
+        the server's rather than a guess of ours. Returns None if it cannot be
+        resolved, which leaves the server in its ordinary per-connection mode
+        instead of failing to start.
+        """
+        if not model or not _SAFE_MODEL.match(model):
+            self.logger.warning("Model name %r is not one we will pass to the container.", model)
+            return None
+
+        self._docker("rm", "-f", MODEL_FETCH_CONTAINER, timeout=60)
+        snippet = ("from faster_whisper.utils import download_model; "
+                   "print(download_model('%s'))" % model)
+        self._emit(STATE_PULLING, f"Preparing the {model} model")
+        ok, _, err = self._docker(
+            "run", "-d", "--name", MODEL_FETCH_CONTAINER,
+            "-v", f"{MODEL_CACHE_VOLUME}:{MODEL_CACHE_PATH}",
+            self.image, "python", "-c", snippet, timeout=120)
+        if not ok:
+            self.logger.warning("Could not start the model fetch container: %s", err)
+            return None
+
+        try:
+            # Report download progress off the same sparse-file trick used for
+            # a load, but against the fetch container.
+            while not self._cancelled():
+                running = self._docker(
+                    "inspect", "-f", "{{.State.Running}}", MODEL_FETCH_CONTAINER,
+                    timeout=20)[1]
+                sample = self._download_bytes(MODEL_FETCH_CONTAINER)
+                if sample:
+                    done, total = sample
+                    self._emit(STATE_PULLING,
+                               f"Downloading {model} — {_format_bytes(done)} of "
+                               f"{_format_bytes(total)} ({done / total:.0%})")
+                if running != "true":
+                    break
+                self._stop_event.wait(DOWNLOAD_POLL_S)
+
+            ok, out, _ = self._docker("logs", MODEL_FETCH_CONTAINER, timeout=30)
+            path = None
+            for line in (out or "").splitlines():
+                line = line.strip()
+                if line.startswith("/"):
+                    path = line
+            if not path:
+                self.logger.warning("Model fetch produced no path for %r.", model)
+            return path
+        finally:
+            self._docker("rm", "-f", MODEL_FETCH_CONTAINER, timeout=60)
 
     def _acceptable_images(self) -> set:
         """Images a existing container may be running and still be reused.
@@ -632,9 +881,10 @@ class ServerManager(QObject):
             return False
         return True
 
-    def _run_container(self, host_port: int, use_gpu=None, image=None) -> bool:
+    def _run_container(self, host_port: int, use_gpu=None, image=None, command=None) -> bool:
         use_gpu = self.settings.get("server_use_gpu", False) if use_gpu is None else use_gpu
         image = image or self.image
+        command = command or self._server_command()
         self._emit(STATE_STARTING, "Starting the WhisperLive container"
                    + (" (GPU)" if use_gpu else ""))
         args = ["run", "-d", "--name", CONTAINER_NAME,
@@ -646,6 +896,7 @@ class ServerManager(QObject):
         if use_gpu:
             args += ["--gpus", "all"]
         args.append(image)
+        args += command
 
         ok, _, err = self._docker(*args, timeout=120)
         if ok:
@@ -665,7 +916,8 @@ class ServerManager(QObject):
             self._emit(STATE_STARTING, "GPU unavailable to Docker — falling back to the CPU image")
             if not self._ensure_image_named(IMAGE_CPU):
                 return False
-            return self._run_container(host_port, use_gpu=False, image=IMAGE_CPU)
+            return self._run_container(host_port, use_gpu=False, image=IMAGE_CPU,
+                                       command=command)
         if "no matching manifest" in lowered or "not found" in lowered:
             self._emit(STATE_FAILED, f"The image {image} could not be found")
             return False

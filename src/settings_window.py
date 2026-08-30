@@ -77,6 +77,14 @@ DEFAULT_SETTINGS = {
     "auto_start_server": True,
     "start_docker_desktop": True,
     "server_use_gpu": False,
+    # Load the model once on the server and share it across connections,
+    # instead of a fresh one per connection.
+    "share_one_model": True,
+    # Dial straight back after each capture, rather than waiting for the next
+    # one. Cheap when the server shares one model; costly when it does not.
+    "reconnect_after_capture": True,
+    # Apps to free the GPU for. Empty means never stand down.
+    "vram_yield_apps": "",
     # Advanced, and deliberately not in the UI: overrides the image chosen by
     # the GPU checkbox, for a pinned tag or a locally built one.
     "server_docker_image": "",
@@ -153,6 +161,27 @@ class SettingsWindow(QWidget):
             "Use the NVIDIA GPU server image")
         self.server_use_gpu_checkbox.setToolTip(
             "Requires an NVIDIA GPU with Docker's container toolkit installed.")
+        self.share_one_model_checkbox = QCheckBox(
+            "Load the model once and share it between connections")
+        self.share_one_model_checkbox.setToolTip(
+            "Without this the server loads a separate copy of the model for every "
+            "connection, which accumulates in GPU memory and slows transcription "
+            "down. Changing the model rebuilds the server container.")
+        self.reconnect_after_capture_checkbox = QCheckBox(
+            "Reconnect immediately after each capture")
+        self.reconnect_after_capture_checkbox.setToolTip(
+            "Keeps a connection warm so the next dictation starts instantly. Turn "
+            "off to connect only when you dictate, which avoids loading a model "
+            "per capture on a server that does not share one.")
+
+        self.vram_yield_apps_edit = QLineEdit()
+        self.vram_yield_apps_edit.setPlaceholderText(
+            "e.g. eldenring.exe, cs2.exe  —  leave empty to never stand down")
+        self.vram_yield_apps_edit.setToolTip(
+            "While any of these are running, WhisperBoard stops the server so it "
+            "is not holding GPU memory, and starts it again when they exit.\n"
+            "The .exe is optional. Starting the server from the tray overrides "
+            "this until the app closes.")
 
         self.save_button = QPushButton("Save")
         self.cancel_button = QPushButton("Cancel")
@@ -164,12 +193,17 @@ class SettingsWindow(QWidget):
         form_layout.addRow(QLabel("Server Address:"), self.server_address_edit)
         form_layout.addRow(QLabel("Capture Hotkey:"), self.capture_hotkey_edit)
         form_layout.addRow(QLabel("Model:"), self.model_combo)
-        form_layout.addRow(QLabel("Connection Mode:"), self.connect_on_demand_checkbox)
+        connection_column = QVBoxLayout()
+        connection_column.setContentsMargins(0, 0, 0, 0)
+        connection_column.addWidget(self.connect_on_demand_checkbox)
+        connection_column.addWidget(self.reconnect_after_capture_checkbox)
+        form_layout.addRow(QLabel("Connection Mode:"), connection_column)
         server_start_column = QVBoxLayout()
         server_start_column.setContentsMargins(0, 0, 0, 0)
         server_start_column.addWidget(self.auto_start_server_checkbox)
         server_start_column.addWidget(self.start_docker_desktop_checkbox)
         server_start_column.addWidget(self.server_use_gpu_checkbox)
+        server_start_column.addWidget(self.share_one_model_checkbox)
         form_layout.addRow(QLabel("Server Startup:"), server_start_column)
         form_layout.addRow(QLabel("Capture Text Size:"), self.capture_font_size_spin)
         meter_row = QHBoxLayout()
@@ -179,6 +213,8 @@ class SettingsWindow(QWidget):
         meter_row.addWidget(self.meter_test_button)
         meter_row.addStretch()
         form_layout.addRow(QLabel("Level Meter:"), meter_row)
+
+        form_layout.addRow(QLabel("Release GPU for:"), self.vram_yield_apps_edit)
 
         layout.addLayout(form_layout)
         layout.addWidget(self.launch_on_startup_checkbox)
@@ -221,6 +257,9 @@ class SettingsWindow(QWidget):
         enabled = self.auto_start_server_checkbox.isChecked()
         self.start_docker_desktop_checkbox.setEnabled(enabled)
         self.server_use_gpu_checkbox.setEnabled(enabled)
+        # Sharing one model is done by how the container is launched, so it is
+        # only ours to arrange when we launch it.
+        self.share_one_model_checkbox.setEnabled(enabled)
 
     def set_preview_level_db(self, db: float):
         """Feed the preview meter, while the app has the mic open for it."""
@@ -260,6 +299,12 @@ class SettingsWindow(QWidget):
             settings.get("start_docker_desktop", DEFAULT_SETTINGS["start_docker_desktop"]))
         self.server_use_gpu_checkbox.setChecked(
             settings.get("server_use_gpu", DEFAULT_SETTINGS["server_use_gpu"]))
+        self.share_one_model_checkbox.setChecked(
+            settings.get("share_one_model", DEFAULT_SETTINGS["share_one_model"]))
+        self.reconnect_after_capture_checkbox.setChecked(
+            settings.get("reconnect_after_capture", DEFAULT_SETTINGS["reconnect_after_capture"]))
+        self.vram_yield_apps_edit.setText(
+            settings.get("vram_yield_apps", DEFAULT_SETTINGS["vram_yield_apps"]))
         self._server_docker_image = settings.get(
             "server_docker_image", DEFAULT_SETTINGS["server_docker_image"])
         self._sync_server_startup_enabled()
@@ -298,6 +343,9 @@ class SettingsWindow(QWidget):
             "auto_start_server": self.auto_start_server_checkbox.isChecked(),
             "start_docker_desktop": self.start_docker_desktop_checkbox.isChecked(),
             "server_use_gpu": self.server_use_gpu_checkbox.isChecked(),
+            "share_one_model": self.share_one_model_checkbox.isChecked(),
+            "reconnect_after_capture": self.reconnect_after_capture_checkbox.isChecked(),
+            "vram_yield_apps": self.vram_yield_apps_edit.text(),
             # Round-tripped rather than edited: it has no UI, but a value set
             # by hand in config.json must survive a visit to this window.
             "server_docker_image": getattr(self, "_server_docker_image", ""),

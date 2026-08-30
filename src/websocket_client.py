@@ -36,8 +36,15 @@ class WebSocketClient(QObject):
     connection_status_changed = Signal(str, str)
     message_received = Signal(str)           # Emits the raw JSON string from the server
     
-    def __init__(self, server_address, model="distil-small.en", sample_rate=16000, channels=1, audio_format="pcm_s16le"):
+    def __init__(self, server_address, model="distil-small.en", sample_rate=16000, channels=1,
+                 audio_format="pcm_s16le", reconnect_after_capture=True):
         super().__init__()
+        # Whether to dial straight back after the server hangs up on our
+        # END_OF_AUDIO. Warm and free when the server shares one model across
+        # connections; when it does not, every reconnect loads another copy of
+        # the model server-side, so holding off until the next capture keeps
+        # at most one alive.
+        self.reconnect_after_capture = reconnect_after_capture
         self.server_address = server_address
         self.model = model
         self.sample_rate = sample_rate
@@ -160,7 +167,12 @@ class WebSocketClient(QObject):
             except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK, OSError) as e:
                 self._server_ready = False
                 self._emit_status("Disconnected", self._closed_detail(e))
-                if self._eos_sent:
+                if self._eos_sent and not self.reconnect_after_capture:
+                    # Leave the socket closed until the next capture asks for
+                    # it. connect() starts a fresh thread from on_hotkey_activated.
+                    self.logger.info("Connection closed after EOS; staying closed until the next capture.")
+                    self.is_running = False
+                elif self._eos_sent:
                     # Expected: WhisperLive closes the socket in response to our
                     # END_OF_AUDIO. Reconnect immediately so the next capture
                     # has a fresh, live connection ready with minimal delay.
