@@ -143,6 +143,9 @@ class WhisperBoardApp:
         # Latches so a server that is down does not produce a tray balloon on
         # every 15-second probe.
         self._server_failure_notified = False
+        # How far the server has got downloading a model it did not already
+        # have; empty when nothing is being fetched.
+        self._model_progress = ""
         # Win32 handle of the window that had focus before the Capture Box
         # appeared, so paste can be routed back to it (e.g. Notepad).
         self._prev_foreground_hwnd = None
@@ -161,6 +164,7 @@ class WhisperBoardApp:
         self.audio_capture = AudioCapture()
         self.server_manager = ServerManager(self.settings)
         self.server_manager.state_changed.connect(self.on_server_state_changed)
+        self.server_manager.model_progress.connect(self.on_model_progress)
         self._init_tray_icon()
         self._init_hotkey_listener()
         self._init_websocket_client()
@@ -299,6 +303,12 @@ class WhisperBoardApp:
         if self.connection_status == "Waiting":
             return "connecting", "Server busy", self.connection_detail
         if self.connection_status == "Loading":
+            if self._model_progress:
+                # A first use of a large model is a multi-minute download, not
+                # a load. Amber and a different word, because the wait is a
+                # different order of magnitude and the user should not read it
+                # as the app being stuck.
+                return "starting", "Downloading model", self._model_progress
             return "connecting", "Loading model", self.connection_detail
         if self.connection_status == "Connecting":
             return "connecting", "Connecting", self.connection_detail
@@ -634,6 +644,14 @@ class WhisperBoardApp:
             self._capture_waiting_for_connection = False
             self._begin_streaming()
 
+        # Only a model load can be waiting on a download; anything else means
+        # there is nothing to watch and the poller should not be running.
+        if status == "Loading":
+            self.server_manager.start_download_watch()
+        else:
+            self.server_manager.stop_download_watch()
+            self._model_progress = ""
+
         if status in ("Ready", "Loading", "Waiting"):
             # A live session is the strongest possible evidence the server is
             # up, and it beats whatever the manager last concluded from a probe.
@@ -648,6 +666,12 @@ class WhisperBoardApp:
 
         self._sync_icon_state()
         self.logger.info("Connection status changed: %s (%s)", status, detail)
+
+    def on_model_progress(self, detail: str):
+        if detail == self._model_progress:
+            return
+        self._model_progress = detail
+        self._sync_icon_state()
 
     def on_message_received(self, message_str):
         now = time.time()

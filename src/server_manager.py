@@ -76,6 +76,12 @@ DOCKER_DAEMON_TIMEOUT_S = 150
 PORT_BIND_TIMEOUT_S = 90
 PROBE_TIMEOUT_S = 0.6
 
+# How often to ask the container how far a model download has got. Each check
+# is a `docker exec`, so this is deliberately not once a second -- but a model
+# download is minutes long, and a progress figure that only moves every couple
+# of seconds is still the difference between "working" and "hung".
+DOWNLOAD_POLL_S = 2.0
+
 # HTTP line ending, spelled by code point to keep it unambiguous.
 CRLF = chr(13) + chr(10)
 
@@ -168,6 +174,12 @@ def is_port_open(host: str, port: int, timeout: float = PROBE_TIMEOUT_S) -> bool
         return False
 
 
+def _format_bytes(n: float) -> str:
+    if n >= 1e9:
+        return f"{n / 1e9:.1f} GB"
+    return f"{n / 1e6:.0f} MB"
+
+
 class ServerManager(QObject):
     """Starts and reports on the local WhisperLive container.
 
@@ -180,6 +192,9 @@ class ServerManager(QObject):
 
     # (state, detail). `detail` is written to be shown to the user verbatim.
     state_changed = Signal(str, str)
+    # Progress of the model the server is currently fetching, ready to show as
+    # it is; empty string when there is nothing being downloaded.
+    model_progress = Signal(str)
 
     def __init__(self, settings: dict):
         super().__init__()
@@ -191,6 +206,10 @@ class ServerManager(QObject):
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._pull_process = None
+        # The model-download watcher runs on its own thread rather than the
+        # shared worker, so watching progress can never block a start or stop.
+        self._watch_thread = None
+        self._watch_stop = threading.Event()
 
     # -- configuration -----------------------------------------------------
 
@@ -250,6 +269,83 @@ class ServerManager(QObject):
             return
         self._run_async(self._probe_blocking, "server-probe")
 
+    def start_download_watch(self):
+        """Begin reporting how far the server has got fetching its model.
+
+        WhisperLive downloads the model inside the container on first use of
+        each one and says nothing about it over the WebSocket -- so a switch to
+        a large model looks identical to a hang for as long as ten minutes.
+        The bytes are visible from outside, though: huggingface_hub writes to a
+        sparse `.incomplete` blob preallocated to the finished size, so the
+        file's apparent size is the total and its allocated blocks are what has
+        actually arrived.
+        """
+        if not self.can_manage_server():
+            return  # a remote server's filesystem is not ours to inspect
+        with self._lock:
+            if self._watch_thread and self._watch_thread.is_alive():
+                return
+            self._watch_stop.clear()
+            self._watch_thread = threading.Thread(
+                target=self._watch_download, name="model-download-watch", daemon=True)
+            self._watch_thread.start()
+
+    def stop_download_watch(self):
+        self._watch_stop.set()
+
+    def _download_bytes(self):
+        """(downloaded, total) across in-progress model downloads, or None."""
+        # %s is the apparent size -- preallocated to the finished length -- and
+        # %b counts the 512-byte blocks actually committed to disk.
+        # The -exec terminator is quoted: passed through `sh -c` unquoted, the
+        # shell eats the bare `;` as a command separator and find fails with
+        # "missing argument to -exec".
+        script = ('find /root/.cache/huggingface -name "*.incomplete" '
+                  '-exec stat -c "%s %b" {} ";"')
+        ok, out, _ = self._docker("exec", CONTAINER_NAME, "sh", "-c", script, timeout=15)
+        if not ok or not out:
+            return None
+        done = total = 0
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            try:
+                total += int(parts[0])
+                done += int(parts[1]) * 512
+            except ValueError:
+                continue
+        if total <= 0:
+            return None
+        # Allocated blocks can nudge past the apparent size on the final write.
+        return min(done, total), total
+
+    def _watch_download(self):
+        last = None
+        while not self._watch_stop.is_set():
+            sample = self._download_bytes()
+            if sample is None:
+                # Either nothing is downloading (the model was already cached
+                # and this is a plain load) or the file has just been renamed
+                # into place. Either way there is no progress to report.
+                self.model_progress.emit("")
+                last = None
+            else:
+                done, total = sample
+                now = time.monotonic()
+                text = f"{_format_bytes(done)} of {_format_bytes(total)} ({done / total:.0%})"
+                if last and now > last[0] and done > last[1]:
+                    rate = (done - last[1]) / (now - last[0])
+                    remaining = (total - done) / rate if rate > 0 else 0
+                    if remaining >= 90:
+                        text += f" — about {remaining / 60:.0f} min left"
+                    elif remaining > 0:
+                        text += f" — about {remaining:.0f}s left"
+                last = (now, done)
+                self.model_progress.emit(text)
+            self._watch_stop.wait(DOWNLOAD_POLL_S)
+        self.model_progress.emit("")
+
     def stop_server(self):
         """Stop the container WhisperBoard started. Non-blocking."""
         self._run_async(self._stop_blocking, "server-stop")
@@ -257,6 +353,7 @@ class ServerManager(QObject):
     def shutdown(self):
         """Abandon any in-flight Docker work; called on app exit."""
         self._stop_event.set()
+        self._watch_stop.set()
         process = self._pull_process
         if process and process.poll() is None:
             try:
