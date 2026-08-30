@@ -125,6 +125,7 @@ class WhisperBoardApp:
         # UI Windows
         self.settings_window = None
         self.capture_box = CaptureBox()
+        self.capture_box.set_font_size(self.settings["capture_font_size"])
 
         # Core Components
         self.audio_capture = AudioCapture()
@@ -290,9 +291,10 @@ class WhisperBoardApp:
                 self.settings = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             self.settings = copy.deepcopy(DEFAULT_SETTINGS)
-        # Ensure new defaults exist
-        if "connect_on_demand" not in self.settings:
-            self.settings["connect_on_demand"] = DEFAULT_SETTINGS.get("connect_on_demand", False)
+        # Backfill settings added since this config file was written, so a
+        # config from an older build does not KeyError on a new setting.
+        for key, value in DEFAULT_SETTINGS.items():
+            self.settings.setdefault(key, value)
         self.settings["capture_hotkey"] = self._normalize_hotkey_string(
             self.settings.get("capture_hotkey", DEFAULT_SETTINGS["capture_hotkey"])
         )
@@ -538,6 +540,8 @@ class WhisperBoardApp:
         self.settings["capture_hotkey"] = self._normalize_hotkey_string(self.settings.get("capture_hotkey", ""))
         self._apply_launch_on_startup(self.settings.get("launch_on_startup", False))
         self._start_hotkey_listener(self.settings["capture_hotkey"])
+        self.capture_box.set_font_size(
+            self.settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"]))
         self._init_websocket_client()
         self._sync_icon_state()
 

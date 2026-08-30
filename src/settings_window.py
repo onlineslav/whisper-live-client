@@ -12,9 +12,16 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QMessageBox,
     QKeySequenceEdit,
+    QSpinBox,
 )
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QKeySequence
+
+from capture_box import (
+    DEFAULT_FONT_SIZE_PX,
+    MIN_FONT_SIZE_PX,
+    MAX_FONT_SIZE_PX,
+)
 
 APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WhisperBoard")
 os.makedirs(APP_DATA_DIR, exist_ok=True)
@@ -26,6 +33,7 @@ DEFAULT_SETTINGS = {
     "launch_on_startup": False,
     "model": "distil-small.en",
     "connect_on_demand": True,
+    "capture_font_size": DEFAULT_FONT_SIZE_PX,
 }
 
 
@@ -41,6 +49,9 @@ class SettingsWindow(QWidget):
         self.server_address_edit = QLineEdit()
         self.capture_hotkey_edit = QKeySequenceEdit()
         self.model_edit = QLineEdit()
+        self.capture_font_size_spin = QSpinBox()
+        self.capture_font_size_spin.setRange(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX)
+        self.capture_font_size_spin.setSuffix(" px")
         self.launch_on_startup_checkbox = QCheckBox("Launch WhisperBoard on system startup")
         self.connect_on_demand_checkbox = QCheckBox("Connect to server only when capture starts (on-demand)")
 
@@ -55,6 +66,7 @@ class SettingsWindow(QWidget):
         form_layout.addRow(QLabel("Capture Hotkey:"), self.capture_hotkey_edit)
         form_layout.addRow(QLabel("Model (e.g., distil-small.en):"), self.model_edit)
         form_layout.addRow(QLabel("Connection Mode:"), self.connect_on_demand_checkbox)
+        form_layout.addRow(QLabel("Capture Text Size:"), self.capture_font_size_spin)
 
         layout.addLayout(form_layout)
         layout.addWidget(self.launch_on_startup_checkbox)
@@ -88,6 +100,8 @@ class SettingsWindow(QWidget):
         self.model_edit.setText(settings.get("model", DEFAULT_SETTINGS["model"]))
         self.launch_on_startup_checkbox.setChecked(settings.get("launch_on_startup", DEFAULT_SETTINGS["launch_on_startup"]))
         self.connect_on_demand_checkbox.setChecked(settings.get("connect_on_demand", DEFAULT_SETTINGS["connect_on_demand"]))
+        self.capture_font_size_spin.setValue(
+            int(settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"])))
 
     def save_settings(self):
         sequence = self.capture_hotkey_edit.keySequence()
@@ -114,6 +128,7 @@ class SettingsWindow(QWidget):
             "launch_on_startup": self.launch_on_startup_checkbox.isChecked(),
             "model": self.model_edit.text() or DEFAULT_SETTINGS["model"],
             "connect_on_demand": self.connect_on_demand_checkbox.isChecked(),
+            "capture_font_size": self.capture_font_size_spin.value(),
         }
 
         try:

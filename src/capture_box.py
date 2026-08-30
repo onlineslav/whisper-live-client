@@ -14,11 +14,14 @@ from PySide6.QtCore import (
     Qt,
     Signal,
     QEvent,
+    QPoint,
     QPropertyAnimation,
     QAbstractAnimation,
 )
 from PySide6.QtGui import (
     QCursor,
+    QFont,
+    QFontMetrics,
     QKeyEvent,
     QFocusEvent,
     QTextOption,
@@ -27,6 +30,22 @@ from PySide6.QtGui import (
 )
 
 from win_focus import focus_window
+
+# Distance from the anchor point to the box's top-left corner. The box hangs
+# down and to the right, like a tooltip; the offset is enough to clear the
+# mouse pointer's own bitmap so the box never opens underneath it.
+ANCHOR_OFFSET_X = 16
+ANCHOR_OFFSET_Y = 18
+
+DEFAULT_FONT_SIZE_PX = 14
+MIN_FONT_SIZE_PX = 9
+MAX_FONT_SIZE_PX = 48
+
+# Lines of transcription shown before the text area starts scrolling, and the
+# ceiling it may grow to. Both scale with the font so the box shows the same
+# amount of text at any size.
+VISIBLE_LINES = 5
+MAX_LINES = 10
 
 
 class CaptureBox(QWidget):
@@ -78,29 +97,25 @@ class CaptureBox(QWidget):
         self.text_area.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
         self.text_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.text_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.text_area.setStyleSheet(
-            """
+        # The type size is user-configurable and also drives the box's height,
+        # so the stylesheet is a template and both are applied together in
+        # set_font_size().
+        self._text_style = """
             QTextEdit {
                 background-color: rgba(255, 255, 255, 0.08);
                 border: 1px solid rgba(255, 255, 255, 0.25);
                 border-radius: 8px;
                 color: white;
                 padding: 10px;
+                font-size: %dpx;
             }
             QTextEdit:focus {
                 border: 1px solid rgba(255, 255, 255, 0.45);
                 outline: none;
             }
-            """
-        )
-        # Size constraints: ~5 lines visible, scroll after that
-        fm = self.text_area.fontMetrics()
-        line_height = fm.lineSpacing()
-        target_lines = 5
-        min_height = int(line_height * target_lines + 24)
-        max_height = int(line_height * 10 + 32)
-        self.text_area.setMinimumHeight(min_height)
-        self.text_area.setMaximumHeight(max_height)
+        """
+        self._font_size = 0
+        self.set_font_size(DEFAULT_FONT_SIZE_PX)
         layout.addWidget(self.text_area)
 
         # Buttons
@@ -156,6 +171,35 @@ class CaptureBox(QWidget):
         self.text_area.setPlainText(text)
         self.text_area.moveCursor(QTextCursor.End)
 
+    def set_font_size(self, size_px: int):
+        """Set the transcription type size and resize the box to match.
+
+        The height limits are derived from the line height rather than fixed,
+        so the box shows about the same number of lines at any size -- a fixed
+        height would show two lines of large type, or waste half a screen on
+        small.
+        """
+        try:
+            size_px = int(size_px)
+        except (TypeError, ValueError):
+            size_px = DEFAULT_FONT_SIZE_PX
+        size_px = max(MIN_FONT_SIZE_PX, min(size_px, MAX_FONT_SIZE_PX))
+        if size_px == self._font_size:
+            return
+        self._font_size = size_px
+        self.text_area.setStyleSheet(self._text_style % size_px)
+
+        # Measured from an explicit QFont rather than the widget's own metrics:
+        # a stylesheet font is not applied until the widget is next polished,
+        # so fontMetrics() here would still report the previous size.
+        font = QFont(self.text_area.font())
+        font.setPixelSize(size_px)
+        line_height = QFontMetrics(font).lineSpacing()
+        self.text_area.setMinimumHeight(int(line_height * VISIBLE_LINES + 24))
+        self.text_area.setMaximumHeight(int(line_height * MAX_LINES + 32))
+        # The box was sized for the old type; let it shrink as well as grow.
+        self.resize(self.sizeHint())
+
     def show_at_cursor(self):
         self._closing = False
         self._shown_at = time.monotonic()
@@ -165,24 +209,7 @@ class CaptureBox(QWidget):
         if app:
             app.installEventFilter(self)
 
-        width = self.width()
-        height = self.height()
-
-        anchor_rect = QGuiApplication.inputMethod().cursorRectangle()
-        if anchor_rect.width() > 0 and anchor_rect.height() > 0:
-            anchor_center = anchor_rect.center().toPoint()
-            x = anchor_center.x() - width // 2
-            y = int(anchor_rect.top()) - height - 12
-        else:
-            cursor_pos = QCursor.pos()
-            x = cursor_pos.x() - width // 2
-            y = cursor_pos.y() - height - 12
-
-        screen = QApplication.primaryScreen().availableGeometry()
-        x = max(screen.left() + 10, min(x, screen.right() - width - 10))
-        y = max(screen.top() + 10, min(y, screen.bottom() - height - 10))
-
-        self.move(x, y)
+        self._move_near(self._anchor_point())
         self._opacity.setOpacity(0.0)
         self.show()
         self.raise_()
@@ -190,6 +217,48 @@ class CaptureBox(QWidget):
         self.setFocus()
         self._take_foreground()
         self._animate_opacity(0.0, 1.0)
+
+    def _anchor_point(self) -> QPoint:
+        """The point the box hangs from: the text caret if visible, else the mouse.
+
+        cursorRectangle() only reports carets inside our own process, so in
+        practice this is the mouse position almost every time; the caret branch
+        is kept for when real caret tracking lands.
+        """
+        caret = QGuiApplication.inputMethod().cursorRectangle()
+        if caret.width() > 0 and caret.height() > 0:
+            # Bottom-left of the caret, so the box hangs below the line being
+            # typed rather than covering it.
+            return QPoint(int(caret.left()), int(caret.bottom()))
+        return QCursor.pos()
+
+    def _move_near(self, anchor: QPoint):
+        """Place the box below and to the right of `anchor`, flipping at edges."""
+        width = self.width()
+        height = self.height()
+
+        # The screen under the anchor, not the primary one: on a multi-monitor
+        # desktop the primary screen's geometry would push the box onto the
+        # wrong display whenever the pointer is on a secondary one.
+        screen = QGuiApplication.screenAt(anchor) or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+
+        x = anchor.x() + ANCHOR_OFFSET_X
+        y = anchor.y() + ANCHOR_OFFSET_Y
+
+        # Flip to the other side rather than sliding along the edge. Sliding
+        # would drag the box back underneath the pointer, which is the one
+        # thing the offset exists to prevent.
+        if x + width > available.right():
+            x = anchor.x() - ANCHOR_OFFSET_X - width
+        if y + height > available.bottom():
+            y = anchor.y() - ANCHOR_OFFSET_Y - height
+
+        # A box with room on neither side still has to land somewhere visible.
+        x = max(available.left(), min(x, available.right() - width))
+        y = max(available.top(), min(y, available.bottom() - height))
+
+        self.move(x, y)
 
     def _take_foreground(self):
         """Give the box real keyboard focus.
