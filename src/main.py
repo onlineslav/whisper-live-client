@@ -600,6 +600,15 @@ class WhisperBoardApp:
             self.logger.debug("Nothing transcribed; skipping paste.")
             return
 
+        # Dictation happens a phrase at a time, and the next paste lands right
+        # where this one left the caret, so without this the last word of one
+        # capture and the first of the next run together. Trailing rather than
+        # leading: a leading space would be wrong at the start of a line, and
+        # would put the caret one character further from where the user is
+        # about to keep typing. The history keeps the clean text -- the space
+        # is a paste-time affordance, not part of what was said.
+        text += " "
+
         # The clipboard is written first and left alone from here on. Whatever
         # happens to the keystroke afterwards, the transcript is recoverable
         # with a manual Ctrl+V.
