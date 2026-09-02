@@ -143,7 +143,16 @@ class WebSocketClient(QObject):
                         "model": self.model,
                         "use_vad": True,
                         "same_output_threshold": 4,
-                        "send_last_n_segments": 3,
+                        # How much of the transcript each message repeats. The
+                        # client reassembles the whole thing from these windows
+                        # (transcript.py), so this only has to be wide enough
+                        # that no segment slips past unseen: one pass of the
+                        # server's update_segments can append several completed
+                        # segments before it sends anything, and a segment that
+                        # never lands in a single window is gone for good.
+                        # Repeating 30 short strings ~20x/second is nothing
+                        # over a local socket.
+                        "send_last_n_segments": 30,
                         "clip_audio": True,
                     }))
                     self.logger.debug("Handshake sent.")

@@ -20,6 +20,7 @@ import win_input
 import payload_log
 import server_manager
 from server_manager import ServerManager
+from transcript import Transcript
 from win_focus import (
     get_foreground_window, focus_window, is_own_window, is_window,
     get_window_title,
@@ -76,21 +77,6 @@ STATUS_TICK_MS = 1000
 # actually has to be right.
 IDLE_PROBE_MS = 60000
 
-# Whisper is known to emit these strings on silence/noise. Drop any segment
-# whose normalized text matches. WhisperLive issue #185 tracks the upstream bug.
-HALLUCINATION_PHRASES = {
-    "", ".", "you", "thank you", "thanks for watching",
-    "thank you for watching", "thanks", "okay", "ok", "bye",
-    "the end", "subscribe", "please subscribe",
-    "thanks for watching the video", "thank you very much",
-}
-
-
-def _is_hallucination(text: str) -> bool:
-    normalized = text.strip().lower().strip(".,!?\"' ")
-    return normalized in HALLUCINATION_PHRASES
-
-
 # Held for the lifetime of the process; releasing it would let a second
 # instance start. Module-level so it is never garbage collected.
 _instance_mutex = None
@@ -133,6 +119,9 @@ class WhisperBoardApp:
         self.is_capturing = False
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = 0.0
+        # The capture's text so far. The server only ever sends the tail
+        # of it -- see transcript.py -- so it is assembled here.
+        self._transcript = Transcript()
         self.connection_status = "Disconnected"
         self.connection_detail = ""
         # What the tray is currently saying, and since when -- the elapsed
@@ -694,24 +683,14 @@ class WhisperBoardApp:
                     self.logger.warning("Failed to decode binary message of len %d", len(message_str))
                     return
             message = json.loads(message_str)
-            full_text = ""
-            if isinstance(message, dict):
-                if message.get("segments"):
-                    kept = [
-                        seg.get("text", "")
-                        for seg in message["segments"]
-                        if isinstance(seg, dict) and not _is_hallucination(seg.get("text", ""))
-                    ]
-                    full_text = "".join(kept)
-                elif "text" in message:
-                    text = str(message.get("text", ""))
-                    full_text = "" if _is_hallucination(text) else text
-                if not full_text and isinstance(message.get("segment"), dict):
-                    seg_text = str(message["segment"].get("text", ""))
-                    full_text = "" if _is_hallucination(seg_text) else seg_text
+            self._transcript.update(message)
+            full_text = self._transcript.text()
 
+            # An empty transcript leaves the box on its "Listening..."
+            # placeholder rather than blanking it, and leaves toPlainText()
+            # empty so confirming without speaking pastes nothing.
             if full_text:
-                self.capture_box.set_text(full_text.strip())
+                self.capture_box.set_text(full_text)
                 self.logger.debug("Updated capture text (%d chars).", len(full_text))
             else:
                 self.logger.debug("Message received but no text found: %s", message)
@@ -776,6 +755,8 @@ class WhisperBoardApp:
         # Empty text => the box shows its "Listening..." placeholder, while
         # toPlainText() stays "" so confirming without speaking pastes nothing.
         self.capture_box.set_text("")
+        # Drop the last capture's words before any of this one arrive.
+        self._transcript.reset()
         payload_log.log_event("streaming_start")
         self.websocket_client.reset_eos()
         self.audio_capture.start_streaming()
