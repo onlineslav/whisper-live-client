@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QColorDialog,
 )
-from PySide6.QtCore import Qt, Signal, QPoint
+from PySide6.QtCore import Qt, Signal, QPoint, QTimer
 from PySide6.QtGui import QKeySequence, QColor
 
 from signal_meter import SignalMeter
@@ -217,6 +217,9 @@ class SettingsWindow(QWidget):
         self.capture_field_color_button.setToolTip("The transcript inset's colour.")
         self.capture_field_color_button.clicked.connect(self._pick_field_color)
         self._field_color = DEFAULT_FIELD_COLOR
+        # What is currently on disk and in the app, to compare the form
+        # against on the way out. None until load_settings has run.
+        self._applied_settings = None
         self.capture_preview_button = QPushButton("Preview")
         self.capture_preview_button.setCheckable(True)
         self.capture_preview_button.setToolTip(
@@ -298,8 +301,25 @@ class SettingsWindow(QWidget):
             "The .exe is optional. Starting the server from the tray overrides "
             "this until the app closes.")
 
-        self.save_button = QPushButton("Save")
+        # Apply commits without closing, so a change can be tried against a
+        # real capture and then adjusted again; Save and Exit is the same
+        # commit plus the close. Both write to disk -- an "apply" that the
+        # next launch forgets is a trap, not a convenience.
+        self.apply_button = QPushButton("Apply")
+        self.apply_button.setToolTip(
+            "Save these settings and apply them, leaving this window open.")
+        self.save_button = QPushButton("Save and Exit")
         self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setToolTip(
+            "Close without applying anything changed since the last Apply.")
+        # Success is otherwise silent, and silence after pressing Apply reads
+        # as nothing having happened. A label rather than a dialog: a modal
+        # to dismiss after every Apply is worse than no confirmation at all.
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #7ac47a;")
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(lambda: self.status_label.setText(""))
 
         # Layout
         layout = QVBoxLayout(self)
@@ -384,7 +404,9 @@ class SettingsWindow(QWidget):
         layout.addWidget(self.launch_on_startup_checkbox)
 
         button_layout = QHBoxLayout()
+        button_layout.addWidget(self.status_label)
         button_layout.addStretch()
+        button_layout.addWidget(self.apply_button)
         button_layout.addWidget(self.save_button)
         button_layout.addWidget(self.cancel_button)
         layout.addLayout(button_layout)
@@ -396,6 +418,7 @@ class SettingsWindow(QWidget):
         self.meter_preview.style_changed.connect(self.capture_meter_style_combo.setCurrentText)
         self.meter_test_button.toggled.connect(self._on_preview_toggled)
         self.auto_start_server_checkbox.toggled.connect(self._sync_server_startup_enabled)
+        self.apply_button.clicked.connect(self.apply_settings)
         self.save_button.clicked.connect(self.save_settings)
         self.cancel_button.clicked.connect(self.close)
 
@@ -615,25 +638,37 @@ class SettingsWindow(QWidget):
             meter_style = DEFAULT_SETTINGS["capture_meter_style"]
         self.capture_meter_style_combo.setCurrentText(meter_style)
 
-    def save_settings(self):
+        # The clean state to measure edits against. Read back off the form
+        # rather than kept from the file: a config missing a key, or holding
+        # one this window does not edit, would otherwise read as dirty the
+        # moment it opened.
+        self._applied_settings = self._collect_settings(validate=False)
+
+    def _collect_settings(self, validate: bool = True):
+        """Everything the form is currently saying, as a settings dict.
+
+        `validate` off skips the hotkey complaints, for the dirty check --
+        which runs on every close and must not put a dialog in front of
+        someone who is only trying to leave.
+        """
         sequence = self.capture_hotkey_edit.keySequence()
         hotkey_str = self._normalize_hotkey(sequence)
 
-        modifier_keys = {'ctrl', 'alt', 'shift', 'cmd'}
-        keys = set(part.strip('<>').strip().lower() for part in hotkey_str.split('+') if part.strip())
-        if not hotkey_str or not keys or keys.issubset(modifier_keys):
-            QMessageBox.warning(self, "Invalid Hotkey", "Please press a hotkey that includes at least one non-modifier key (e.g., Ctrl+Shift+` or Alt+F1).")
-            return
+        if validate:
+            modifier_keys = {'ctrl', 'alt', 'shift', 'cmd'}
+            keys = set(part.strip('<>').strip().lower() for part in hotkey_str.split('+') if part.strip())
+            if not hotkey_str or not keys or keys.issubset(modifier_keys):
+                QMessageBox.warning(self, "Invalid Hotkey", "Please press a hotkey that includes at least one non-modifier key (e.g., Ctrl+Shift+` or Alt+F1).")
+                return None
 
-        # Check if pynput can parse it
-        try:
-            from pynput import keyboard
-            keyboard.HotKey.parse(hotkey_str)
-        except Exception as e:
-            QMessageBox.warning(self, "Invalid Hotkey", f"The hotkey '{hotkey_str}' could not be parsed. Please check the format.\n\nError: {e}")
-            return
+            # Check if pynput can parse it
+            try:
+                from pynput import keyboard
+                keyboard.HotKey.parse(hotkey_str)
+            except Exception as e:
+                QMessageBox.warning(self, "Invalid Hotkey", f"The hotkey '{hotkey_str}' could not be parsed. Please check the format.\n\nError: {e}")
+                return None
 
-        path = self.get_config_path()
         settings = {
             "server_address": self.server_address_edit.text(),
             "capture_hotkey": hotkey_str,
@@ -663,15 +698,42 @@ class SettingsWindow(QWidget):
             "capture_field_color": self._field_color,
             "capture_meter_style": self.capture_meter_style_combo.currentText(),
         }
+        return settings
 
+    def _commit(self) -> bool:
+        """Write the form to disk and hand it to the app. False if it did not."""
+        settings = self._collect_settings()
+        if settings is None:
+            return False
         try:
-            with open(path, "w") as f:
+            with open(self.get_config_path(), "w") as f:
                 json.dump(settings, f, indent=4)
-            QMessageBox.information(self, "Settings Saved", "Your settings have been saved and applied.")
-            self.settings_saved.emit(settings)
-            self.close()
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to save settings: {e}")
+            return False
+        # Only now: a dict that failed to reach the disk is not what the
+        # window should be treating as its clean state.
+        self._applied_settings = copy.deepcopy(settings)
+        self.settings_saved.emit(settings)
+        return True
+
+    def apply_settings(self):
+        """Save and apply, without closing."""
+        if not self._commit():
+            return
+        self.status_label.setText("Saved.")
+        self._status_timer.start(2500)
+
+    def save_settings(self):
+        """Save, apply, and close."""
+        if self._commit():
+            self.close()
+
+    def _is_dirty(self) -> bool:
+        """Whether the form says something other than what was last applied."""
+        if self._applied_settings is None:
+            return False
+        return self._collect_settings(validate=False) != self._applied_settings
 
     def _normalize_hotkey(self, sequence: QKeySequence) -> str:
         """
@@ -727,6 +789,21 @@ class SettingsWindow(QWidget):
         return "+".join(parts)
 
     def closeEvent(self, event):
+        if self._is_dirty():
+            choice = QMessageBox.warning(
+                self, "Unsaved changes",
+                "There are changes here that have not been applied.\n\n"
+                "Save them before closing?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if choice == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if choice == QMessageBox.Save and not self._commit():
+                # Saving failed, or the hotkey was refused. Staying open is
+                # the only outcome that does not throw the edits away.
+                event.ignore()
+                return
         # Before the close is announced: leaving the mic open behind a closed
         # settings window would be both a leak and a genuine privacy surprise.
         self.stop_preview()
