@@ -36,9 +36,9 @@ from capture_box import (
     DEFAULT_FIELD_COLOR,
     DEFAULT_PANEL_FROST,
     DEFAULT_FIELD_FROST,
-    DEFAULT_BLUR,
-    MIN_BLUR,
-    MAX_BLUR,
+    DEFAULT_BLUR_RADIUS,
+    MIN_BLUR_RADIUS,
+    MAX_BLUR_RADIUS,
     DEFAULT_SATURATION,
     DEFAULT_BRIGHTNESS,
     DEFAULT_LEVELLING,
@@ -121,7 +121,11 @@ DEFAULT_SETTINGS = {
     # at 0% opacity still looks grey, which is the levelling below.
     "capture_panel_frost": DEFAULT_PANEL_FROST,
     "capture_field_frost": DEFAULT_FIELD_FROST,
-    "capture_blur": DEFAULT_BLUR,
+    # Renamed from capture_blur, which held a downscale percentage. A
+    # radius in pixels is not the same number, and there is no telling one
+    # scale's 60 from the other's, so an old value is left behind rather than
+    # reinterpreted into something nobody asked for.
+    "capture_blur_radius": DEFAULT_BLUR_RADIUS,
     "capture_frost_saturation": DEFAULT_SATURATION,
     "capture_frost_brightness": DEFAULT_BRIGHTNESS,
     "capture_frost_levelling": DEFAULT_LEVELLING,
@@ -205,8 +209,9 @@ class SettingsWindow(QWidget):
             "over the panel. Drawn over the panel tint rather than under it, "
             "so the field reads as its own surface.")
         self.capture_blur_spin = self._frost_spin(
-            "Blur ", " %", MIN_BLUR, MAX_BLUR,
-            "How far the blur goes. Higher is blurrier.")
+            "Blur ", " px", MIN_BLUR_RADIUS, MAX_BLUR_RADIUS,
+            "Gaussian blur radius. Higher is blurrier, and costs a little "
+            "more each time the box opens.")
         self.capture_saturation_spin = self._frost_spin(
             "Sat ", " %", 0, 400,
             "Colour in the blurred snapshot. 100% is what was actually on "
@@ -773,7 +778,7 @@ class SettingsWindow(QWidget):
         self.capture_panel_frost_checkbox.setChecked(bool(panel_frost))
         self.capture_field_frost_checkbox.setChecked(bool(settings.get(
             "capture_field_frost", DEFAULT_SETTINGS["capture_field_frost"])))
-        for key, spin in (("capture_blur", self.capture_blur_spin),
+        for key, spin in (("capture_blur_radius", self.capture_blur_spin),
                           ("capture_frost_saturation", self.capture_saturation_spin),
                           ("capture_frost_brightness", self.capture_brightness_spin),
                           ("capture_frost_levelling", self.capture_levelling_spin)):
@@ -836,7 +841,7 @@ class SettingsWindow(QWidget):
             "capture_bg_color": self._bg_color,
             "capture_panel_frost": self.capture_panel_frost_checkbox.isChecked(),
             "capture_field_frost": self.capture_field_frost_checkbox.isChecked(),
-            "capture_blur": self.capture_blur_spin.value(),
+            "capture_blur_radius": self.capture_blur_spin.value(),
             "capture_frost_saturation": self.capture_saturation_spin.value(),
             "capture_frost_brightness": self.capture_brightness_spin.value(),
             "capture_frost_levelling": self.capture_levelling_spin.value(),

@@ -1014,7 +1014,8 @@ class WhisperBoardApp:
             self.settings.get("capture_field_opacity", DEFAULT_SETTINGS["capture_field_opacity"]),
             self.settings.get("capture_field_frost", DEFAULT_SETTINGS["capture_field_frost"]))
         self.capture_box.set_frost(
-            self.settings.get("capture_blur", DEFAULT_SETTINGS["capture_blur"]),
+            self.settings.get("capture_blur_radius",
+                              DEFAULT_SETTINGS["capture_blur_radius"]),
             self.settings.get("capture_frost_saturation",
                               DEFAULT_SETTINGS["capture_frost_saturation"]),
             self.settings.get("capture_frost_brightness",

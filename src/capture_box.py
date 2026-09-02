@@ -3,6 +3,9 @@ import time
 
 from PySide6.QtWidgets import (
     QWidget,
+    QGraphicsScene,
+    QGraphicsPixmapItem,
+    QGraphicsBlurEffect,
     QPushButton,
     QVBoxLayout,
     QApplication,
@@ -12,6 +15,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt,
+    QRect,
+    QRectF,
     Signal,
     QEvent,
     QPoint,
@@ -104,14 +109,22 @@ FIELD_RADIUS = 8
 DEFAULT_PANEL_FROST = True
 DEFAULT_FIELD_FROST = False
 
-# How far the blur goes, as a percentage. It is the fraction the snapshot is
-# scaled down to before being scaled back up, inverted so that a bigger
-# number is a blurrier picture, which is the only direction a control called
-# "blur" can sensibly run in.
-DEFAULT_BLUR = 91
-MIN_BLUR = 50
-MAX_BLUR = 99
-FROST_PASSES = 2
+# Blur radius, in pixels -- a real gaussian one. The blur used to be a
+# downscale to a few per cent followed by a smooth upscale, which is fast but
+# looks it: scaling 460px down to 41 and back throws away every gradient in
+# the picture and returns banding and blocky edges in their place. A gaussian
+# at this size costs single-digit milliseconds, which is not worth saving.
+DEFAULT_BLUR_RADIUS = 24
+MIN_BLUR_RADIUS = 2
+MAX_BLUR_RADIUS = 80
+
+# How far outside the box to grab before blurring, as a multiple of the
+# radius. A gaussian samples past the edges of the picture it is given, and
+# past the edge there is nothing -- so blurring exactly the box's rectangle
+# pulls transparency inwards and leaves a dark vignette all the way round.
+# Grabbing wider and cropping back afterwards removes it, and is what the
+# glass would do anyway: what is just outside the box bleeds into it.
+FROST_PAD_FACTOR = 2
 
 # Blur alone is not enough to look like glass. A blurred dark window is just
 # a dark smear, and under any tint at all it is indistinguishable from a flat
@@ -136,36 +149,73 @@ DEFAULT_BRIGHTNESS = 108
 DEFAULT_LEVELLING = 42
 
 
-def _blurred(pixmap: QPixmap, blur: int, saturation: int,
+def _gaussian(pixmap: QPixmap, radius: int) -> QPixmap:
+    """A real gaussian blur of `pixmap`, at full resolution.
+
+    Through a one-item QGraphicsScene because QGraphicsBlurEffect is the only
+    gaussian Qt exposes, and an effect can only be applied to an item in a
+    scene -- not to a pixmap directly.
+    """
+    scene = QGraphicsScene()
+    item = QGraphicsPixmapItem(pixmap)
+    effect = QGraphicsBlurEffect()
+    effect.setBlurRadius(radius)
+    effect.setBlurHints(QGraphicsBlurEffect.QualityHint)
+    item.setGraphicsEffect(effect)
+    scene.addItem(item)
+    canvas = QImage(pixmap.size(), QImage.Format_ARGB32_Premultiplied)
+    canvas.fill(Qt.transparent)
+    painter = QPainter(canvas)
+    scene.render(painter, QRectF(canvas.rect()), QRectF(pixmap.rect()))
+    painter.end()
+    return QPixmap.fromImage(canvas)
+
+
+def _blurred(pixmap: QPixmap, radius: int, saturation: int,
              brightness: int, levelling: int) -> QPixmap:
-    """A blurred, saturated, brightness-levelled copy at the original size."""
-    scale = max(0.001, (100 - _clamp_int(blur, MIN_BLUR, MAX_BLUR)) / 100.0)
-    saturation = _clamp_int(saturation, 0, 400) / 100.0
-    brightness = _clamp_int(brightness, 0, 255)
+    """A blurred, saturated, brightness-levelled copy at the original size.
+
+    The colour work is done with the painter rather than pixel by pixel. At
+    full resolution a Python loop over a hundred thousand pixels takes about
+    a second, and the whole point of the gaussian is to stop working at the
+    postage-stamp size where such a loop was affordable.
+    """
+    out = _gaussian(pixmap, _clamp_int(radius, MIN_BLUR_RADIUS, MAX_BLUR_RADIUS))
     mix = _clamp_int(levelling, 0, 100) / 100.0
-    width = max(1, int(pixmap.width() * scale))
-    height = max(1, int(pixmap.height() * scale))
-    small = pixmap.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-    for _ in range(FROST_PASSES - 1):
-        small = small.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-    # Per-pixel, but on the downscaled image -- a few hundred pixels rather
-    # than the hundred thousand of the full-size one, and it is about to be
-    # smoothly upscaled anyway, so the detail would be thrown away regardless.
-    if saturation == 1.0 and mix == 0.0:
-        # Nothing to do per pixel, and the loop is the expensive part.
-        return small.scaled(pixmap.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-    image = small.toImage().convertToFormat(QImage.Format_ARGB32)
-    for y in range(image.height()):
-        for x in range(image.width()):
-            color = image.pixelColor(x, y)
-            hue, sat, lightness, alpha = color.getHsl()
-            sat = min(255, int(sat * saturation))
-            lightness = int(lightness * (1.0 - mix) + brightness * mix)
-            # A fully desaturated pixel reports hue -1, which QColor rejects.
-            image.setPixelColor(x, y, QColor.fromHsl(
-                max(0, hue), sat, max(0, min(255, lightness)), alpha))
-    return QPixmap.fromImage(image).scaled(
-        pixmap.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    saturation = _clamp_int(saturation, 0, 400) / 100.0
+
+    if mix:
+        # Pulling every pixel a fraction of the way towards one brightness is
+        # the same operation as compositing that brightness over the lot at
+        # that alpha. Exactly the same arithmetic, done by the rasteriser.
+        # First, so the saturation pass below works on lifted midtones
+        # instead of crushing what it finds on the floor.
+        brightness = _clamp_int(brightness, 0, 255)
+        painter = QPainter(out)
+        painter.fillRect(out.rect(),
+                         QColor(brightness, brightness, brightness, int(mix * 255)))
+        painter.end()
+
+    if saturation > 1.0:
+        # Overlay against itself deepens what has colour and leaves neutrals
+        # about where they were, which is the part of a saturation boost that
+        # matters here. Repeated for amounts past one layer's worth.
+        remaining = saturation - 1.0
+        while remaining > 0.001:
+            layer = QPixmap(out)
+            painter = QPainter(out)
+            painter.setCompositionMode(QPainter.CompositionMode_Overlay)
+            painter.setOpacity(min(1.0, remaining))
+            painter.drawPixmap(0, 0, layer)
+            painter.end()
+            remaining -= 1.0
+    elif saturation < 1.0:
+        grey = out.toImage().convertToFormat(QImage.Format_Grayscale8)
+        painter = QPainter(out)
+        painter.setOpacity(1.0 - saturation)
+        painter.drawImage(0, 0, grey)
+        painter.end()
+    return out
 
 
 def _clamp_int(value, low: int, high: int) -> int:
@@ -239,7 +289,7 @@ class CaptureBox(QWidget):
         self._opacity_level = DEFAULT_OPACITY
         self._panel_frost = DEFAULT_PANEL_FROST
         self._field_frost = DEFAULT_FIELD_FROST
-        self._blur = DEFAULT_BLUR
+        self._blur = DEFAULT_BLUR_RADIUS
         self._saturation = DEFAULT_SATURATION
         self._brightness = DEFAULT_BRIGHTNESS
         self._levelling = DEFAULT_LEVELLING
@@ -393,7 +443,7 @@ class CaptureBox(QWidget):
         surface: the field's frost is a crop of the same picture.
         """
         if blur is not None:
-            self._blur = _clamp_int(blur, MIN_BLUR, MAX_BLUR)
+            self._blur = _clamp_int(blur, MIN_BLUR_RADIUS, MAX_BLUR_RADIUS)
         if saturation is not None:
             self._saturation = _clamp_int(saturation, 0, 400)
         if brightness is not None:
@@ -420,9 +470,16 @@ class CaptureBox(QWidget):
                   or QApplication.primaryScreen())
         if screen is None:
             return
+        # Wider than the box, so the blur has real pixels to reach for at the
+        # edges rather than the transparency outside the picture. Clamped to
+        # the screen, since a box near an edge cannot grab past it.
+        pad = self._blur * FROST_PAD_FACTOR
+        padded = geometry.adjusted(-pad, -pad, pad, pad).intersected(screen.geometry())
+        if padded.isEmpty():
+            return
         try:
             shot = screen.grabWindow(
-                0, geometry.x(), geometry.y(), geometry.width(), geometry.height())
+                0, padded.x(), padded.y(), padded.width(), padded.height())
         except Exception:
             return
         if shot.isNull():
@@ -430,8 +487,13 @@ class CaptureBox(QWidget):
         # Drawn into a rect measured in logical pixels, so a ratio inherited
         # from a scaled display would halve the image inside it.
         shot.setDevicePixelRatio(1.0)
-        self._frost = _blurred(shot, self._blur, self._saturation,
-                               self._brightness, self._levelling)
+        blurred = _blurred(shot, self._blur, self._saturation,
+                           self._brightness, self._levelling)
+        # Back to the box, so everything downstream can treat the frost as
+        # being exactly the box's size.
+        self._frost = blurred.copy(QRect(
+            geometry.x() - padded.x(), geometry.y() - padded.y(),
+            geometry.width(), geometry.height()))
 
     def set_field(self, color: str = None, opacity=None, frosted=None):
         """Set the colour and fill of the inset the transcript sits in.
