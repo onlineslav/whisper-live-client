@@ -30,6 +30,8 @@ from capture_box import (
     MIN_OPACITY,
     MAX_OPACITY,
     DEFAULT_BG_COLOR,
+    DEFAULT_BACKDROP,
+    BACKDROPS,
 )
 
 # The preview sits on a dark panel matching the Capture Box, because that is
@@ -81,6 +83,9 @@ DEFAULT_SETTINGS = {
     # rather than a percentage so it goes straight into the stylesheet.
     "capture_opacity": DEFAULT_OPACITY,
     "capture_bg_color": DEFAULT_BG_COLOR,
+    # "frost" blurs whatever is behind the box; "none" leaves it sharp under
+    # the tint. With frost on, a lower opacity is readable than without.
+    "capture_backdrop": DEFAULT_BACKDROP,
     "capture_meter_style": METER_STYLES[0],
     # Server startup. WhisperBoard launches itself at login but the WhisperLive
     # server does not, which left the app looking ready with nothing to talk
@@ -145,6 +150,14 @@ class SettingsWindow(QWidget):
         self.capture_bg_color_button.setToolTip("The Capture Box's background colour.")
         self.capture_bg_color_button.clicked.connect(self._pick_bg_color)
         self._bg_color = DEFAULT_BG_COLOR
+        self.capture_backdrop_combo = QComboBox()
+        for value, label in (("frost", "Frosted"), ("none", "Plain")):
+            self.capture_backdrop_combo.addItem(label, value)
+        self.capture_backdrop_combo.setToolTip(
+            "Frosted blurs whatever is behind the Capture Box, so a page of "
+            "text underneath reads as texture rather than competing with the "
+            "transcript. The blur is of the screen as it was when the box "
+            "opened, so it does not follow anything moving behind it.")
         self.capture_meter_style_combo = QComboBox()
         self.capture_meter_style_combo.addItems(METER_STYLES)
         # A live preview, on the dark ground it will actually be seen against.
@@ -244,6 +257,8 @@ class SettingsWindow(QWidget):
         appearance_row.addWidget(self.capture_opacity_spin)
         appearance_row.addSpacing(8)
         appearance_row.addWidget(self.capture_bg_color_button)
+        appearance_row.addSpacing(8)
+        appearance_row.addWidget(self.capture_backdrop_combo)
         appearance_row.addStretch()
         form_layout.addRow(QLabel("Capture Box:"), appearance_row)
         meter_row = QHBoxLayout()
@@ -378,6 +393,9 @@ class SettingsWindow(QWidget):
         self.capture_opacity_spin.setValue(int(round(float(
             settings.get("capture_opacity", DEFAULT_SETTINGS["capture_opacity"])) * 100)))
         self._set_bg_color(settings.get("capture_bg_color", DEFAULT_SETTINGS["capture_bg_color"]))
+        backdrop = settings.get("capture_backdrop", DEFAULT_SETTINGS["capture_backdrop"])
+        index = self.capture_backdrop_combo.findData(backdrop)
+        self.capture_backdrop_combo.setCurrentIndex(index if index >= 0 else 0)
         meter_style = settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"])
         if meter_style not in METER_STYLES:
             meter_style = DEFAULT_SETTINGS["capture_meter_style"]
@@ -421,6 +439,8 @@ class SettingsWindow(QWidget):
             "capture_font_size": self.capture_font_size_spin.value(),
             "capture_opacity": self.capture_opacity_spin.value() / 100.0,
             "capture_bg_color": self._bg_color,
+            "capture_backdrop": (self.capture_backdrop_combo.currentData()
+                                 or DEFAULT_SETTINGS["capture_backdrop"]),
             "capture_meter_style": self.capture_meter_style_combo.currentText(),
         }
 

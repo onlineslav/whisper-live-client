@@ -1007,7 +1007,8 @@ class WhisperBoardApp:
         """Push the Capture Box's look from settings onto the box."""
         self.capture_box.set_surface(
             self.settings.get("capture_bg_color", DEFAULT_SETTINGS["capture_bg_color"]),
-            self.settings.get("capture_opacity", DEFAULT_SETTINGS["capture_opacity"]))
+            self.settings.get("capture_opacity", DEFAULT_SETTINGS["capture_opacity"]),
+            self.settings.get("capture_backdrop", DEFAULT_SETTINGS["capture_backdrop"]))
 
     def on_meter_style_changed(self, style: str):
         """Persist a style picked by clicking the meter itself.

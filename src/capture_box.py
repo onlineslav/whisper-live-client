@@ -30,6 +30,7 @@ from PySide6.QtGui import (
     QPainter,
     QColor,
     QPainterPath,
+    QPixmap,
 )
 
 from signal_meter import SignalMeter, STYLES as METER_STYLES
@@ -55,7 +56,7 @@ MAX_LINES = 10
 # text being dictated into, so this is a readability control before it is a
 # decorative one: too far down and the passage underneath shows through the
 # transcript and neither can be read.
-DEFAULT_OPACITY = 0.92
+DEFAULT_OPACITY = 0.80
 MIN_OPACITY = 0.30
 MAX_OPACITY = 1.0
 
@@ -65,6 +66,40 @@ DEFAULT_BG_COLOR = "#12141a"
 
 # Corner radius of the box, in px.
 CORNER_RADIUS = 10
+
+# Frosted glass: what is behind the box, blurred, so a page of text
+# underneath reads as texture instead of competing with the transcript.
+#
+# Done by snapshotting the screen under the box and blurring that, rather
+# than by asking the compositor. Windows has two APIs for it and neither
+# works here: SetWindowCompositionAttribute's acrylic ignores the tint's
+# alpha on Windows 11 26xxx (any alpha, down to 1, renders as an opaque
+# tint, so there is nothing to see the blur through), and DWM's
+# SYSTEMBACKDROP_TYPE returns S_OK on a frameless tool window and then draws
+# flat grey. A snapshot is not live -- it is the screen as it was when the
+# box opened -- but the box is up for a few seconds over a page that is not
+# moving, which is exactly the case it has to look right in.
+BACKDROP_NONE = "none"
+BACKDROP_FROST = "frost"
+BACKDROPS = (BACKDROP_NONE, BACKDROP_FROST)
+DEFAULT_BACKDROP = BACKDROP_FROST
+
+# The blur is a downscale followed by a smooth upscale, repeated. Cheap, and
+# at this scale indistinguishable from a real gaussian: the point is to
+# destroy legibility, not to be a nice kernel. Two passes, because one leaves
+# large type still readable as shapes.
+FROST_SCALE = 0.09
+FROST_PASSES = 2
+
+
+def _blurred(pixmap: QPixmap) -> QPixmap:
+    """A heavily blurred copy of `pixmap`, at its original size."""
+    width = max(1, int(pixmap.width() * FROST_SCALE))
+    height = max(1, int(pixmap.height() * FROST_SCALE))
+    small = pixmap.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    for _ in range(FROST_PASSES - 1):
+        small = small.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    return small.scaled(pixmap.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
 
 def _clamp_opacity(value) -> float:
@@ -122,6 +157,10 @@ class CaptureBox(QWidget):
         self.setStyleSheet("color: white; font-size: 14px;")
         self._bg_color = DEFAULT_BG_COLOR
         self._opacity_level = DEFAULT_OPACITY
+        self._backdrop = DEFAULT_BACKDROP
+        # The blurred snapshot of whatever was behind the box when it opened,
+        # or None when the backdrop is off or the grab failed.
+        self._frost = None
 
         # Subtle fade effect
         self._opacity = QGraphicsOpacityEffect(self)
@@ -234,19 +273,52 @@ class CaptureBox(QWidget):
     def set_meter_style(self, style: str):
         self.meter.set_style(style)
 
-    def set_surface(self, color: str = None, opacity=None):
-        """Set the box's background colour and how solid it is.
+    def set_surface(self, color: str = None, opacity=None, backdrop: str = None):
+        """Set the box's background colour, how solid it is, and its backdrop.
 
         Only the background takes the opacity -- the text, the buttons and the
         meter stay fully opaque on top of it. Fading the whole window instead
         (setWindowOpacity, or the fade effect below) would take the transcript
         down with it, which is the opposite of what this control is for.
+
+        `backdrop` asks the compositor to blur what is behind the box. Where
+        it obliges, the tint goes with it and paintEvent draws nothing; the
+        opacity then reads as how much of the blurred content comes through.
         """
         if color is not None:
             self._bg_color = color
         if opacity is not None:
             self._opacity_level = _clamp_opacity(opacity)
+        if backdrop is not None:
+            self._backdrop = backdrop if backdrop in BACKDROPS else BACKDROP_NONE
         self.update()
+
+    def _grab_frost(self):
+        """Snapshot and blur what is behind the box, before it is shown.
+
+        Called with the box positioned but still hidden, which is the only
+        moment the screen underneath is both in its final place and not
+        covered by the box itself.
+        """
+        self._frost = None
+        if self._backdrop != BACKDROP_FROST:
+            return
+        geometry = self.geometry()
+        screen = (QGuiApplication.screenAt(geometry.center())
+                  or QApplication.primaryScreen())
+        if screen is None:
+            return
+        try:
+            shot = screen.grabWindow(
+                0, geometry.x(), geometry.y(), geometry.width(), geometry.height())
+        except Exception:
+            return
+        if shot.isNull():
+            return
+        # Drawn into a rect measured in logical pixels, so a ratio inherited
+        # from a scaled display would halve the image inside it.
+        shot.setDevicePixelRatio(1.0)
+        self._frost = _blurred(shot)
 
     def _surface_color(self) -> QColor:
         r, g, b = _rgb(self._bg_color)
@@ -268,6 +340,13 @@ class CaptureBox(QWidget):
         # goes hard-edged again.
         path.addRoundedRect(
             self.rect().adjusted(0, 0, -1, -1), CORNER_RADIUS, CORNER_RADIUS)
+        if self._frost is not None:
+            # Clipped to the same path as the tint, so the frost stops at the
+            # rounded corners instead of squaring them off.
+            painter.save()
+            painter.setClipPath(path)
+            painter.drawPixmap(self.rect(), self._frost)
+            painter.restore()
         painter.fillPath(path, self._surface_color())
 
     def set_text(self, text):
@@ -314,6 +393,8 @@ class CaptureBox(QWidget):
             app.installEventFilter(self)
 
         self._move_near(self._anchor_point())
+        # Before show(), so the box does not photograph itself.
+        self._grab_frost()
         self._opacity.setOpacity(0.0)
         self.show()
         self.raise_()
