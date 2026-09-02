@@ -53,17 +53,32 @@ MAX_FONT_SIZE_PX = 48
 VISIBLE_LINES = 5
 MAX_LINES = 10
 
-# How solid the box is over whatever is behind it. The box opens on top of the
-# text being dictated into, so this is a readability control before it is a
-# decorative one: too far down and the passage underneath shows through the
-# transcript and neither can be read.
+# The box has two surfaces, and they are set separately because they are
+# doing different jobs. The PANEL is the whole window -- what separates the
+# box from the desktop behind it. The FIELD is the inset the transcript sits
+# in, which is there to mark the text off from the buttons and the meter, and
+# reads as a light lift over the panel rather than as a colour of its own.
+#
+# The floor is 0: with the backdrop frosted, a panel with no tint at all is a
+# legitimate setting -- the blur is doing the work -- and there is no reason
+# to stop someone trying it.
 DEFAULT_OPACITY = 0.55
-MIN_OPACITY = 0.30
+MIN_OPACITY = 0.0
 MAX_OPACITY = 1.0
 
 # Near-black rather than black: a slight blue lift reads as a deliberate
 # surface at high opacity, where flat #000 reads as a hole in the screen.
 DEFAULT_BG_COLOR = "#12141a"
+
+# The field, over the panel. White at a few per cent: a lift, not a fill.
+DEFAULT_FIELD_OPACITY = 0.08
+DEFAULT_FIELD_COLOR = "#ffffff"
+
+# The field's border, relative to its fill. Derived rather than set: an edge
+# that always sits a little above the fill it surrounds is what makes the
+# inset read as an inset, at any fill.
+FIELD_BORDER_LIFT = 0.17
+FIELD_FOCUS_LIFT = 0.37
 
 # Corner radius of the box, in px.
 CORNER_RADIUS = 10
@@ -216,18 +231,20 @@ class CaptureBox(QWidget):
         # set_font_size().
         self._text_style = """
             QTextEdit {
-                background-color: rgba(255, 255, 255, 0.08);
-                border: 1px solid rgba(255, 255, 255, 0.25);
+                background-color: rgba(%(r)d, %(g)d, %(b)d, %(fill).3f);
+                border: 1px solid rgba(%(r)d, %(g)d, %(b)d, %(edge).3f);
                 border-radius: 8px;
                 color: white;
                 padding: 10px;
-                font-size: %dpx;
+                font-size: %(size)dpx;
             }
             QTextEdit:focus {
-                border: 1px solid rgba(255, 255, 255, 0.45);
+                border: 1px solid rgba(%(r)d, %(g)d, %(b)d, %(focus).3f);
                 outline: none;
             }
         """
+        self._field_color = DEFAULT_FIELD_COLOR
+        self._field_opacity = DEFAULT_FIELD_OPACITY
         self._font_size = 0
         self.set_font_size(DEFAULT_FONT_SIZE_PX)
         layout.addWidget(self.text_area)
@@ -352,6 +369,31 @@ class CaptureBox(QWidget):
         shot.setDevicePixelRatio(1.0)
         self._frost = _blurred(shot)
 
+    def set_field(self, color: str = None, opacity=None):
+        """Set the colour and fill of the inset the transcript sits in.
+
+        Separate from set_surface() because the two are answering different
+        questions: the panel's opacity is about the desktop behind the box,
+        the field's is about telling the transcript apart from the rest of
+        the box. Turning one up is rarely a reason to touch the other.
+        """
+        if color is not None:
+            self._field_color = color
+        if opacity is not None:
+            self._field_opacity = _clamp_opacity(opacity)
+        self._apply_field_style()
+
+    def _apply_field_style(self):
+        r, g, b = _rgb(self._field_color)
+        fill = self._field_opacity
+        self.text_area.setStyleSheet(self._text_style % {
+            "r": r, "g": g, "b": b,
+            "fill": fill,
+            "edge": min(1.0, fill + FIELD_BORDER_LIFT),
+            "focus": min(1.0, fill + FIELD_FOCUS_LIFT),
+            "size": self._font_size or DEFAULT_FONT_SIZE_PX,
+        })
+
     def _surface_color(self) -> QColor:
         r, g, b = _rgb(self._bg_color)
         return QColor(r, g, b, int(round(self._opacity_level * 255)))
@@ -401,7 +443,7 @@ class CaptureBox(QWidget):
         if size_px == self._font_size:
             return
         self._font_size = size_px
-        self.text_area.setStyleSheet(self._text_style % size_px)
+        self._apply_field_style()
 
         # Measured from an explicit QFont rather than the widget's own metrics:
         # a stylesheet font is not applied until the widget is next polished,

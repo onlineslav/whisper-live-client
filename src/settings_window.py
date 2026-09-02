@@ -32,6 +32,8 @@ from capture_box import (
     DEFAULT_BG_COLOR,
     DEFAULT_BACKDROP,
     BACKDROPS,
+    DEFAULT_FIELD_OPACITY,
+    DEFAULT_FIELD_COLOR,
 )
 
 # The preview sits on a dark panel matching the Capture Box, because that is
@@ -86,6 +88,10 @@ DEFAULT_SETTINGS = {
     # "frost" blurs whatever is behind the box; "none" leaves it sharp under
     # the tint. With frost on, a lower opacity is readable than without.
     "capture_backdrop": DEFAULT_BACKDROP,
+    # The inset the transcript sits in, set separately from the panel around
+    # it -- see capture_box.py for why the two are not one control.
+    "capture_field_opacity": DEFAULT_FIELD_OPACITY,
+    "capture_field_color": DEFAULT_FIELD_COLOR,
     "capture_meter_style": METER_STYLES[0],
     # Server startup. WhisperBoard launches itself at login but the WhisperLive
     # server does not, which left the app looking ready with nothing to talk
@@ -158,6 +164,18 @@ class SettingsWindow(QWidget):
             "text underneath reads as texture rather than competing with the "
             "transcript. The blur is of the screen as it was when the box "
             "opened, so it does not follow anything moving behind it.")
+        self.capture_field_opacity_spin = QSpinBox()
+        self.capture_field_opacity_spin.setRange(int(MIN_OPACITY * 100), int(MAX_OPACITY * 100))
+        self.capture_field_opacity_spin.setSuffix(" %")
+        self.capture_field_opacity_spin.setToolTip(
+            "How strongly the transcript's inset is filled over the panel "
+            "behind it. This is what separates the text from the buttons and "
+            "the meter; a few per cent is usually enough.")
+        self.capture_field_color_button = QPushButton()
+        self.capture_field_color_button.setFixedWidth(90)
+        self.capture_field_color_button.setToolTip("The transcript inset's colour.")
+        self.capture_field_color_button.clicked.connect(self._pick_field_color)
+        self._field_color = DEFAULT_FIELD_COLOR
         self.capture_meter_style_combo = QComboBox()
         self.capture_meter_style_combo.addItems(METER_STYLES)
         # A live preview, on the dark ground it will actually be seen against.
@@ -260,7 +278,14 @@ class SettingsWindow(QWidget):
         appearance_row.addSpacing(8)
         appearance_row.addWidget(self.capture_backdrop_combo)
         appearance_row.addStretch()
-        form_layout.addRow(QLabel("Capture Box:"), appearance_row)
+        form_layout.addRow(QLabel("Panel:"), appearance_row)
+        field_row = QHBoxLayout()
+        field_row.setContentsMargins(0, 0, 0, 0)
+        field_row.addWidget(self.capture_field_opacity_spin)
+        field_row.addSpacing(8)
+        field_row.addWidget(self.capture_field_color_button)
+        field_row.addStretch()
+        form_layout.addRow(QLabel("Transcript Field:"), field_row)
         meter_row = QHBoxLayout()
         meter_row.setContentsMargins(0, 0, 0, 0)
         meter_row.addWidget(self.capture_meter_style_combo)
@@ -308,13 +333,27 @@ class SettingsWindow(QWidget):
         self.model_combo.setCurrentIndex(max(index, 0))
 
     def _pick_bg_color(self):
-        chosen = QColorDialog.getColor(
-            QColor(self._bg_color), self, "Capture Box background")
+        chosen = QColorDialog.getColor(QColor(self._bg_color), self, "Panel colour")
         if chosen.isValid():
             self._set_bg_color(chosen.name())
 
+    def _pick_field_color(self):
+        chosen = QColorDialog.getColor(
+            QColor(self._field_color), self, "Transcript field colour")
+        if chosen.isValid():
+            self._set_field_color(chosen.name())
+
     def _set_bg_color(self, color: str):
-        """Remember the colour and show it on the button that picks it.
+        self._bg_color = self._paint_swatch(
+            self.capture_bg_color_button, color, DEFAULT_BG_COLOR)
+
+    def _set_field_color(self, color: str):
+        self._field_color = self._paint_swatch(
+            self.capture_field_color_button, color, DEFAULT_FIELD_COLOR)
+
+    @staticmethod
+    def _paint_swatch(button, color: str, fallback: str) -> str:
+        """Show `color` on the button that picks it. Returns what was set.
 
         The swatch is the button itself rather than a label beside it: the
         colour is the only thing the button has to say, and a hex code means
@@ -322,14 +361,15 @@ class SettingsWindow(QWidget):
         """
         value = QColor(color)
         if not value.isValid():
-            value = QColor(DEFAULT_BG_COLOR)
-        self._bg_color = value.name()
+            value = QColor(fallback)
+        name = value.name()
         # Readable caption whichever end of the range the colour is from.
         ink = "#000000" if value.lightness() > 127 else "#ffffff"
-        self.capture_bg_color_button.setText(self._bg_color)
-        self.capture_bg_color_button.setStyleSheet(
-            f"background-color: {self._bg_color}; color: {ink};"
+        button.setText(name)
+        button.setStyleSheet(
+            f"background-color: {name}; color: {ink};"
             " border: 1px solid #888; padding: 4px;")
+        return name
 
     def _sync_server_startup_enabled(self):
         """The sub-options only mean anything when auto-start is on."""
@@ -393,6 +433,11 @@ class SettingsWindow(QWidget):
         self.capture_opacity_spin.setValue(int(round(float(
             settings.get("capture_opacity", DEFAULT_SETTINGS["capture_opacity"])) * 100)))
         self._set_bg_color(settings.get("capture_bg_color", DEFAULT_SETTINGS["capture_bg_color"]))
+        self.capture_field_opacity_spin.setValue(int(round(float(
+            settings.get("capture_field_opacity",
+                         DEFAULT_SETTINGS["capture_field_opacity"])) * 100)))
+        self._set_field_color(
+            settings.get("capture_field_color", DEFAULT_SETTINGS["capture_field_color"]))
         backdrop = settings.get("capture_backdrop", DEFAULT_SETTINGS["capture_backdrop"])
         index = self.capture_backdrop_combo.findData(backdrop)
         self.capture_backdrop_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -441,6 +486,8 @@ class SettingsWindow(QWidget):
             "capture_bg_color": self._bg_color,
             "capture_backdrop": (self.capture_backdrop_combo.currentData()
                                  or DEFAULT_SETTINGS["capture_backdrop"]),
+            "capture_field_opacity": self.capture_field_opacity_spin.value() / 100.0,
+            "capture_field_color": self._field_color,
             "capture_meter_style": self.capture_meter_style_combo.currentText(),
         }
 
