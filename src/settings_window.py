@@ -31,10 +31,16 @@ from capture_box import (
     MIN_OPACITY,
     MAX_OPACITY,
     DEFAULT_BG_COLOR,
-    DEFAULT_BACKDROP,
-    BACKDROPS,
     DEFAULT_FIELD_OPACITY,
     DEFAULT_FIELD_COLOR,
+    DEFAULT_PANEL_FROST,
+    DEFAULT_FIELD_FROST,
+    DEFAULT_BLUR,
+    MIN_BLUR,
+    MAX_BLUR,
+    DEFAULT_SATURATION,
+    DEFAULT_BRIGHTNESS,
+    DEFAULT_LEVELLING,
 )
 
 # What the preview box says. Long enough to wrap onto a second line, so the
@@ -92,9 +98,15 @@ DEFAULT_SETTINGS = {
     # rather than a percentage so it goes straight into the stylesheet.
     "capture_opacity": DEFAULT_OPACITY,
     "capture_bg_color": DEFAULT_BG_COLOR,
-    # "frost" blurs whatever is behind the box; "none" leaves it sharp under
-    # the tint. With frost on, a lower opacity is readable than without.
-    "capture_backdrop": DEFAULT_BACKDROP,
+    # Which surfaces are frosted, and how the one shared snapshot behind
+    # them is processed. See capture_box.py -- in particular for why a panel
+    # at 0% opacity still looks grey, which is the levelling below.
+    "capture_panel_frost": DEFAULT_PANEL_FROST,
+    "capture_field_frost": DEFAULT_FIELD_FROST,
+    "capture_blur": DEFAULT_BLUR,
+    "capture_frost_saturation": DEFAULT_SATURATION,
+    "capture_frost_brightness": DEFAULT_BRIGHTNESS,
+    "capture_frost_levelling": DEFAULT_LEVELLING,
     # The inset the transcript sits in, set separately from the panel around
     # it -- see capture_box.py for why the two are not one control.
     "capture_field_opacity": DEFAULT_FIELD_OPACITY,
@@ -163,14 +175,36 @@ class SettingsWindow(QWidget):
         self.capture_bg_color_button.setToolTip("The Capture Box's background colour.")
         self.capture_bg_color_button.clicked.connect(self._pick_bg_color)
         self._bg_color = DEFAULT_BG_COLOR
-        self.capture_backdrop_combo = QComboBox()
-        for value, label in (("frost", "Frosted"), ("none", "Plain")):
-            self.capture_backdrop_combo.addItem(label, value)
-        self.capture_backdrop_combo.setToolTip(
-            "Frosted blurs whatever is behind the Capture Box, so a page of "
-            "text underneath reads as texture rather than competing with the "
-            "transcript. The blur is of the screen as it was when the box "
-            "opened, so it does not follow anything moving behind it.")
+        self.capture_panel_frost_checkbox = QCheckBox("Frosted")
+        self.capture_panel_frost_checkbox.setToolTip(
+            "Blur whatever is behind the panel, so a page of text underneath "
+            "reads as texture rather than competing with the transcript. The "
+            "blur is of the screen as it was when the box opened, so it does "
+            "not follow anything moving behind it.")
+        self.capture_field_frost_checkbox = QCheckBox("Frosted")
+        self.capture_field_frost_checkbox.setToolTip(
+            "Frost the transcript inset as well, as a second sheet of glass "
+            "over the panel. Drawn over the panel tint rather than under it, "
+            "so the field reads as its own surface.")
+        self.capture_blur_spin = self._frost_spin(
+            "Blur ", " %", MIN_BLUR, MAX_BLUR,
+            "How far the blur goes. Higher is blurrier.")
+        self.capture_saturation_spin = self._frost_spin(
+            "Sat ", " %", 0, 400,
+            "Colour in the blurred snapshot. 100% is what was actually on "
+            "screen; above that is what makes frost read as glass rather "
+            "than as a grey smear on a dark desktop.")
+        self.capture_brightness_spin = self._frost_spin(
+            "Bright ", "", 0, 255,
+            "The brightness the frost is pulled towards, 0 black to 255 "
+            "white. Only has an effect to the extent Level is above zero.")
+        self.capture_levelling_spin = self._frost_spin(
+            "Level ", " %", 0, 100,
+            "How hard the frost is pulled towards Bright. This is why a "
+            "panel at 0% opacity still looks grey rather than clear: at 0% "
+            "there is no tint left, so what shows is the levelled snapshot. "
+            "Set this to 0 and the frost keeps the real colours of whatever "
+            "is behind it.")
         self.capture_field_opacity_spin = QSpinBox()
         self.capture_field_opacity_spin.setRange(int(MIN_OPACITY * 100), int(MAX_OPACITY * 100))
         self.capture_field_opacity_spin.setSuffix(" %")
@@ -294,7 +328,7 @@ class SettingsWindow(QWidget):
         appearance_row.addSpacing(8)
         appearance_row.addWidget(self.capture_bg_color_button)
         appearance_row.addSpacing(8)
-        appearance_row.addWidget(self.capture_backdrop_combo)
+        appearance_row.addWidget(self.capture_panel_frost_checkbox)
         appearance_row.addStretch()
         appearance_row.addWidget(self.capture_preview_button)
         form_layout.addRow(QLabel("Panel:"), appearance_row)
@@ -303,8 +337,18 @@ class SettingsWindow(QWidget):
         field_row.addWidget(self.capture_field_opacity_spin)
         field_row.addSpacing(8)
         field_row.addWidget(self.capture_field_color_button)
+        field_row.addSpacing(8)
+        field_row.addWidget(self.capture_field_frost_checkbox)
         field_row.addStretch()
         form_layout.addRow(QLabel("Transcript Field:"), field_row)
+        frost_row = QHBoxLayout()
+        frost_row.setContentsMargins(0, 0, 0, 0)
+        for spin in (self.capture_blur_spin, self.capture_saturation_spin,
+                     self.capture_brightness_spin, self.capture_levelling_spin):
+            frost_row.addWidget(spin)
+            frost_row.addSpacing(4)
+        frost_row.addStretch()
+        form_layout.addRow(QLabel("Frost:"), frost_row)
         # Anything the box's appearance is made of, pushed straight at it.
         # The backdrop is the one that needs a new snapshot rather than a
         # repaint -- see _sync_preview.
@@ -317,8 +361,15 @@ class SettingsWindow(QWidget):
                        self.capture_font_size_spin.valueChanged,
                        self.capture_meter_style_combo.currentIndexChanged):
             signal.connect(lambda *_: self._sync_preview())
-        self.capture_backdrop_combo.currentIndexChanged.connect(
-            lambda *_: self._sync_preview(regrab=True))
+        # These change the snapshot itself rather than what is painted over
+        # it, so they need it taken again.
+        for signal in (self.capture_panel_frost_checkbox.toggled,
+                       self.capture_field_frost_checkbox.toggled,
+                       self.capture_blur_spin.valueChanged,
+                       self.capture_saturation_spin.valueChanged,
+                       self.capture_brightness_spin.valueChanged,
+                       self.capture_levelling_spin.valueChanged):
+            signal.connect(lambda *_: self._sync_preview(regrab=True))
         meter_row = QHBoxLayout()
         meter_row.setContentsMargins(0, 0, 0, 0)
         meter_row.addWidget(self.capture_meter_style_combo)
@@ -364,6 +415,20 @@ class SettingsWindow(QWidget):
             self.model_combo.insertItem(0, f"{model} — custom", model)
             index = 0
         self.model_combo.setCurrentIndex(max(index, 0))
+
+    @staticmethod
+    def _frost_spin(prefix: str, suffix: str, low: int, high: int, tip: str) -> QSpinBox:
+        """One of the frost numeric controls.
+
+        Prefixed rather than labelled: four of these share a row, and four
+        separate labels would not fit beside them.
+        """
+        spin = QSpinBox()
+        spin.setRange(low, high)
+        spin.setPrefix(prefix)
+        spin.setSuffix(suffix)
+        spin.setToolTip(tip)
+        return spin
 
     def _pick_bg_color(self):
         chosen = QColorDialog.getColor(QColor(self._bg_color), self, "Panel colour")
@@ -456,10 +521,14 @@ class SettingsWindow(QWidget):
         box.set_meter_style(self.capture_meter_style_combo.currentText())
         box.set_surface(self._bg_color,
                         self.capture_opacity_spin.value() / 100.0,
-                        self.capture_backdrop_combo.currentData()
-                        or DEFAULT_SETTINGS["capture_backdrop"])
+                        self.capture_panel_frost_checkbox.isChecked())
         box.set_field(self._field_color,
-                      self.capture_field_opacity_spin.value() / 100.0)
+                      self.capture_field_opacity_spin.value() / 100.0,
+                      self.capture_field_frost_checkbox.isChecked())
+        box.set_frost(self.capture_blur_spin.value(),
+                      self.capture_saturation_spin.value(),
+                      self.capture_brightness_spin.value(),
+                      self.capture_levelling_spin.value())
         if regrab:
             box.refresh_backdrop()
 
@@ -525,9 +594,22 @@ class SettingsWindow(QWidget):
                          DEFAULT_SETTINGS["capture_field_opacity"])) * 100)))
         self._set_field_color(
             settings.get("capture_field_color", DEFAULT_SETTINGS["capture_field_color"]))
-        backdrop = settings.get("capture_backdrop", DEFAULT_SETTINGS["capture_backdrop"])
-        index = self.capture_backdrop_combo.findData(backdrop)
-        self.capture_backdrop_combo.setCurrentIndex(index if index >= 0 else 0)
+        # capture_backdrop was one setting for the whole box, before the two
+        # surfaces were frosted separately. Carry it onto the panel, which is
+        # what it used to mean.
+        legacy = settings.get("capture_backdrop")
+        panel_frost = settings.get(
+            "capture_panel_frost",
+            legacy == "frost" if legacy is not None
+            else DEFAULT_SETTINGS["capture_panel_frost"])
+        self.capture_panel_frost_checkbox.setChecked(bool(panel_frost))
+        self.capture_field_frost_checkbox.setChecked(bool(settings.get(
+            "capture_field_frost", DEFAULT_SETTINGS["capture_field_frost"])))
+        for key, spin in (("capture_blur", self.capture_blur_spin),
+                          ("capture_frost_saturation", self.capture_saturation_spin),
+                          ("capture_frost_brightness", self.capture_brightness_spin),
+                          ("capture_frost_levelling", self.capture_levelling_spin)):
+            spin.setValue(int(settings.get(key, DEFAULT_SETTINGS[key])))
         meter_style = settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"])
         if meter_style not in METER_STYLES:
             meter_style = DEFAULT_SETTINGS["capture_meter_style"]
@@ -571,8 +653,12 @@ class SettingsWindow(QWidget):
             "capture_font_size": self.capture_font_size_spin.value(),
             "capture_opacity": self.capture_opacity_spin.value() / 100.0,
             "capture_bg_color": self._bg_color,
-            "capture_backdrop": (self.capture_backdrop_combo.currentData()
-                                 or DEFAULT_SETTINGS["capture_backdrop"]),
+            "capture_panel_frost": self.capture_panel_frost_checkbox.isChecked(),
+            "capture_field_frost": self.capture_field_frost_checkbox.isChecked(),
+            "capture_blur": self.capture_blur_spin.value(),
+            "capture_frost_saturation": self.capture_saturation_spin.value(),
+            "capture_frost_brightness": self.capture_brightness_spin.value(),
+            "capture_frost_levelling": self.capture_levelling_spin.value(),
             "capture_field_opacity": self.capture_field_opacity_spin.value() / 100.0,
             "capture_field_color": self._field_color,
             "capture_meter_style": self.capture_meter_style_combo.currentText(),

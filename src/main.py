@@ -1008,10 +1008,19 @@ class WhisperBoardApp:
         self.capture_box.set_surface(
             self.settings.get("capture_bg_color", DEFAULT_SETTINGS["capture_bg_color"]),
             self.settings.get("capture_opacity", DEFAULT_SETTINGS["capture_opacity"]),
-            self.settings.get("capture_backdrop", DEFAULT_SETTINGS["capture_backdrop"]))
+            self.settings.get("capture_panel_frost", DEFAULT_SETTINGS["capture_panel_frost"]))
         self.capture_box.set_field(
             self.settings.get("capture_field_color", DEFAULT_SETTINGS["capture_field_color"]),
-            self.settings.get("capture_field_opacity", DEFAULT_SETTINGS["capture_field_opacity"]))
+            self.settings.get("capture_field_opacity", DEFAULT_SETTINGS["capture_field_opacity"]),
+            self.settings.get("capture_field_frost", DEFAULT_SETTINGS["capture_field_frost"]))
+        self.capture_box.set_frost(
+            self.settings.get("capture_blur", DEFAULT_SETTINGS["capture_blur"]),
+            self.settings.get("capture_frost_saturation",
+                              DEFAULT_SETTINGS["capture_frost_saturation"]),
+            self.settings.get("capture_frost_brightness",
+                              DEFAULT_SETTINGS["capture_frost_brightness"]),
+            self.settings.get("capture_frost_levelling",
+                              DEFAULT_SETTINGS["capture_frost_levelling"]))
 
     def on_meter_style_changed(self, style: str):
         """Persist a style picked by clicking the meter itself.

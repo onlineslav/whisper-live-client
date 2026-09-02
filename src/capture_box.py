@@ -80,8 +80,11 @@ DEFAULT_FIELD_COLOR = "#ffffff"
 FIELD_BORDER_LIFT = 0.17
 FIELD_FOCUS_LIFT = 0.37
 
-# Corner radius of the box, in px.
+# Corner radius of the box, in px, and of the transcript field inside it.
+# The field's has to match the border-radius its stylesheet sets, or the
+# frost drawn behind it will not line up with the edge drawn over it.
 CORNER_RADIUS = 10
+FIELD_RADIUS = 8
 
 # Frosted glass: what is behind the box, blurred, so a page of text
 # underneath reads as texture instead of competing with the transcript.
@@ -95,16 +98,19 @@ CORNER_RADIUS = 10
 # flat grey. A snapshot is not live -- it is the screen as it was when the
 # box opened -- but the box is up for a few seconds over a page that is not
 # moving, which is exactly the case it has to look right in.
-BACKDROP_NONE = "none"
-BACKDROP_FROST = "frost"
-BACKDROPS = (BACKDROP_NONE, BACKDROP_FROST)
-DEFAULT_BACKDROP = BACKDROP_FROST
+# The panel and the field are frosted separately: the panel's frost is what
+# hides the desktop, the field's is a second sheet of glass over it, and
+# wanting one is not wanting the other.
+DEFAULT_PANEL_FROST = True
+DEFAULT_FIELD_FROST = False
 
-# The blur is a downscale followed by a smooth upscale, repeated. Cheap, and
-# at this scale indistinguishable from a real gaussian: the point is to
-# destroy legibility, not to be a nice kernel. Two passes, because one leaves
-# large type still readable as shapes.
-FROST_SCALE = 0.09
+# How far the blur goes, as a percentage. It is the fraction the snapshot is
+# scaled down to before being scaled back up, inverted so that a bigger
+# number is a blurrier picture, which is the only direction a control called
+# "blur" can sensibly run in.
+DEFAULT_BLUR = 91
+MIN_BLUR = 50
+MAX_BLUR = 99
 FROST_PASSES = 2
 
 # Blur alone is not enough to look like glass. A blurred dark window is just
@@ -116,37 +122,58 @@ FROST_PASSES = 2
 # behind it rather than as black.
 #
 # The same two moves here. Saturation first, so what colour survived the blur
-# is worth seeing; then the whole range compressed towards FROST_LUMINOSITY,
-# which lifts dark content off the floor and pulls bright content down,
-# leaving texture visible either way.
-FROST_SATURATION = 2.0
-FROST_LUMINOSITY = 108
-FROST_LUMINOSITY_MIX = 0.42
+# is worth seeing; then the whole range compressed towards a target
+# brightness, which lifts dark content off the floor and pulls bright content
+# down, leaving texture visible either way.
+#
+# Brightness is why a panel at 0% opacity is not transparent but grey: at 0%
+# there is no tint at all, so what is left is the levelled snapshot, and
+# levelling is what pulled it to the middle. Turning brightness down takes
+# the frost back towards the real colours of whatever is behind it; turning
+# the mix to 0 disables levelling entirely.
+DEFAULT_SATURATION = 200
+DEFAULT_BRIGHTNESS = 108
+DEFAULT_LEVELLING = 42
 
 
-def _blurred(pixmap: QPixmap) -> QPixmap:
-    """A blurred, saturated, luminosity-levelled copy at the original size."""
-    width = max(1, int(pixmap.width() * FROST_SCALE))
-    height = max(1, int(pixmap.height() * FROST_SCALE))
+def _blurred(pixmap: QPixmap, blur: int, saturation: int,
+             brightness: int, levelling: int) -> QPixmap:
+    """A blurred, saturated, brightness-levelled copy at the original size."""
+    scale = max(0.001, (100 - _clamp_int(blur, MIN_BLUR, MAX_BLUR)) / 100.0)
+    saturation = _clamp_int(saturation, 0, 400) / 100.0
+    brightness = _clamp_int(brightness, 0, 255)
+    mix = _clamp_int(levelling, 0, 100) / 100.0
+    width = max(1, int(pixmap.width() * scale))
+    height = max(1, int(pixmap.height() * scale))
     small = pixmap.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
     for _ in range(FROST_PASSES - 1):
         small = small.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
     # Per-pixel, but on the downscaled image -- a few hundred pixels rather
     # than the hundred thousand of the full-size one, and it is about to be
     # smoothly upscaled anyway, so the detail would be thrown away regardless.
+    if saturation == 1.0 and mix == 0.0:
+        # Nothing to do per pixel, and the loop is the expensive part.
+        return small.scaled(pixmap.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
     image = small.toImage().convertToFormat(QImage.Format_ARGB32)
     for y in range(image.height()):
         for x in range(image.width()):
             color = image.pixelColor(x, y)
-            hue, saturation, lightness, alpha = color.getHsl()
-            saturation = min(255, int(saturation * FROST_SATURATION))
-            lightness = int(lightness * (1.0 - FROST_LUMINOSITY_MIX)
-                            + FROST_LUMINOSITY * FROST_LUMINOSITY_MIX)
+            hue, sat, lightness, alpha = color.getHsl()
+            sat = min(255, int(sat * saturation))
+            lightness = int(lightness * (1.0 - mix) + brightness * mix)
             # A fully desaturated pixel reports hue -1, which QColor rejects.
             image.setPixelColor(x, y, QColor.fromHsl(
-                max(0, hue), saturation, max(0, min(255, lightness)), alpha))
+                max(0, hue), sat, max(0, min(255, lightness)), alpha))
     return QPixmap.fromImage(image).scaled(
         pixmap.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+
+def _clamp_int(value, low: int, high: int) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return low
+    return max(low, min(value, high))
 
 
 def _clamp_opacity(value) -> float:
@@ -210,9 +237,14 @@ class CaptureBox(QWidget):
         self.setStyleSheet("color: white; font-size: 14px;")
         self._bg_color = DEFAULT_BG_COLOR
         self._opacity_level = DEFAULT_OPACITY
-        self._backdrop = DEFAULT_BACKDROP
+        self._panel_frost = DEFAULT_PANEL_FROST
+        self._field_frost = DEFAULT_FIELD_FROST
+        self._blur = DEFAULT_BLUR
+        self._saturation = DEFAULT_SATURATION
+        self._brightness = DEFAULT_BRIGHTNESS
+        self._levelling = DEFAULT_LEVELLING
         # The blurred snapshot of whatever was behind the box when it opened,
-        # or None when the backdrop is off or the grab failed.
+        # or None when neither surface is frosted and nothing was grabbed.
         self._frost = None
 
         # Subtle fade effect
@@ -334,7 +366,7 @@ class CaptureBox(QWidget):
     def set_meter_style(self, style: str):
         self.meter.set_style(style)
 
-    def set_surface(self, color: str = None, opacity=None, backdrop: str = None):
+    def set_surface(self, color: str = None, opacity=None, frosted=None):
         """Set the box's background colour, how solid it is, and its backdrop.
 
         Only the background takes the opacity -- the text, the buttons and the
@@ -350,9 +382,28 @@ class CaptureBox(QWidget):
             self._bg_color = color
         if opacity is not None:
             self._opacity_level = _clamp_opacity(opacity)
-        if backdrop is not None:
-            self._backdrop = backdrop if backdrop in BACKDROPS else BACKDROP_NONE
+        if frosted is not None:
+            self._panel_frost = bool(frosted)
         self.update()
+
+    def set_frost(self, blur=None, saturation=None, brightness=None, levelling=None):
+        """Set how the blurred snapshot is processed, for both surfaces.
+
+        One snapshot serves the panel and the field, so these are not per
+        surface: the field's frost is a crop of the same picture.
+        """
+        if blur is not None:
+            self._blur = _clamp_int(blur, MIN_BLUR, MAX_BLUR)
+        if saturation is not None:
+            self._saturation = _clamp_int(saturation, 0, 400)
+        if brightness is not None:
+            self._brightness = _clamp_int(brightness, 0, 255)
+        if levelling is not None:
+            self._levelling = _clamp_int(levelling, 0, 100)
+        self.update()
+
+    def wants_frost(self) -> bool:
+        return self._panel_frost or self._field_frost
 
     def _grab_frost(self):
         """Snapshot and blur what is behind the box, before it is shown.
@@ -362,7 +413,7 @@ class CaptureBox(QWidget):
         covered by the box itself.
         """
         self._frost = None
-        if self._backdrop != BACKDROP_FROST:
+        if not self.wants_frost():
             return
         geometry = self.geometry()
         screen = (QGuiApplication.screenAt(geometry.center())
@@ -379,9 +430,10 @@ class CaptureBox(QWidget):
         # Drawn into a rect measured in logical pixels, so a ratio inherited
         # from a scaled display would halve the image inside it.
         shot.setDevicePixelRatio(1.0)
-        self._frost = _blurred(shot)
+        self._frost = _blurred(shot, self._blur, self._saturation,
+                               self._brightness, self._levelling)
 
-    def set_field(self, color: str = None, opacity=None):
+    def set_field(self, color: str = None, opacity=None, frosted=None):
         """Set the colour and fill of the inset the transcript sits in.
 
         Separate from set_surface() because the two are answering different
@@ -393,7 +445,10 @@ class CaptureBox(QWidget):
             self._field_color = color
         if opacity is not None:
             self._field_opacity = _clamp_opacity(opacity)
+        if frosted is not None:
+            self._field_frost = bool(frosted)
         self._apply_field_style()
+        self.update()
 
     def _apply_field_style(self):
         r, g, b = _rgb(self._field_color)
@@ -426,7 +481,7 @@ class CaptureBox(QWidget):
         # goes hard-edged again.
         path.addRoundedRect(
             self.rect().adjusted(0, 0, -1, -1), CORNER_RADIUS, CORNER_RADIUS)
-        if self._frost is not None:
+        if self._frost is not None and self._panel_frost:
             # Clipped to the same path as the tint, so the frost stops at the
             # rounded corners instead of squaring them off.
             painter.save()
@@ -434,6 +489,24 @@ class CaptureBox(QWidget):
             painter.drawPixmap(self.rect(), self._frost)
             painter.restore()
         painter.fillPath(path, self._surface_color())
+
+        if self._frost is not None and self._field_frost:
+            # A second sheet of glass, over the panel's tint rather than
+            # under it -- which is what makes the field read as its own
+            # surface rather than as a lighter patch of the panel. The crop
+            # is the same snapshot, so the two stay in register and the blur
+            # continues across the join instead of restarting at it.
+            #
+            # The field's own fill and border are still the QTextEdit's, and
+            # it paints them over this. That ordering is the whole trick: the
+            # fill is semi-transparent, so it tints the frost underneath.
+            field = self.text_area.geometry()
+            field_path = QPainterPath()
+            field_path.addRoundedRect(field, FIELD_RADIUS, FIELD_RADIUS)
+            painter.save()
+            painter.setClipPath(field_path)
+            painter.drawPixmap(field, self._frost, field)
+            painter.restore()
 
     def set_text(self, text):
         self.text_area.setPlainText(text)
