@@ -49,6 +49,10 @@ ANCHOR_OFFSET_X = 16
 ANCHOR_OFFSET_Y = 18
 
 DEFAULT_FONT_SIZE_PX = 14
+# Empty means whatever Qt would have used, which is the system UI font. Kept
+# as the default rather than naming a face: the one font certain to be
+# installed and to look native is the one already in use.
+DEFAULT_FONT_FAMILY = ""
 MIN_FONT_SIZE_PX = 9
 MAX_FONT_SIZE_PX = 48
 
@@ -325,6 +329,7 @@ class CaptureBox(QWidget):
                 color: white;
                 padding: 10px;
                 font-size: %(size)dpx;
+                %(family)s
             }
             QTextEdit:focus {
                 border: 1px solid rgba(%(r)d, %(g)d, %(b)d, %(focus).3f);
@@ -333,6 +338,7 @@ class CaptureBox(QWidget):
         """
         self._field_color = DEFAULT_FIELD_COLOR
         self._field_opacity = DEFAULT_FIELD_OPACITY
+        self._font_family = DEFAULT_FONT_FAMILY
         self._font_size = 0
         self.set_font_size(DEFAULT_FONT_SIZE_PX)
         layout.addWidget(self.text_area)
@@ -512,15 +518,35 @@ class CaptureBox(QWidget):
         self._apply_field_style()
         self.update()
 
+    def set_font_family(self, family: str):
+        """Set the transcript's typeface, and resize the box to match it.
+
+        Empty means the system UI font. The box's height is derived from the
+        line height, and line height is a property of the face as much as of
+        the size, so a change here has to re-measure exactly as a size change
+        does -- a tall face would otherwise show four lines where the last
+        one showed five.
+        """
+        family = (family or "").strip()
+        if family == self._font_family:
+            return
+        self._font_family = family
+        self._apply_field_style()
+        self._resize_to_font()
+
     def _apply_field_style(self):
         r, g, b = _rgb(self._field_color)
         fill = self._field_opacity
+        # Quoted, because family names have spaces in them and a bare one is
+        # read as a list of keywords.
+        family = f'font-family: "{self._font_family}";' if self._font_family else ""
         self.text_area.setStyleSheet(self._text_style % {
             "r": r, "g": g, "b": b,
             "fill": fill,
             "edge": min(1.0, fill + FIELD_BORDER_LIFT),
             "focus": min(1.0, fill + FIELD_FOCUS_LIFT),
             "size": self._font_size or DEFAULT_FONT_SIZE_PX,
+            "family": family,
         })
 
     def _surface_color(self) -> QColor:
@@ -591,12 +617,17 @@ class CaptureBox(QWidget):
             return
         self._font_size = size_px
         self._apply_field_style()
+        self._resize_to_font()
 
+    def _resize_to_font(self):
+        """Re-derive the box's height from the current face and size."""
         # Measured from an explicit QFont rather than the widget's own metrics:
         # a stylesheet font is not applied until the widget is next polished,
-        # so fontMetrics() here would still report the previous size.
+        # so fontMetrics() here would still report the previous one.
         font = QFont(self.text_area.font())
-        font.setPixelSize(size_px)
+        if self._font_family:
+            font.setFamily(self._font_family)
+        font.setPixelSize(self._font_size or DEFAULT_FONT_SIZE_PX)
         line_height = QFontMetrics(font).lineSpacing()
         self.text_area.setMinimumHeight(int(line_height * VISIBLE_LINES + 24))
         self.text_area.setMaximumHeight(int(line_height * MAX_LINES + 32))

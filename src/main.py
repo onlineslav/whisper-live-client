@@ -174,6 +174,8 @@ class WhisperBoardApp:
         self.settings_window = None
         self.capture_box = CaptureBox()
         self.capture_box.set_font_size(self.settings["capture_font_size"])
+        self.capture_box.set_font_family(
+            self.settings.get("capture_font_family", DEFAULT_SETTINGS["capture_font_family"]))
         self.capture_box.set_meter_style(self.settings["capture_meter_style"])
         self._apply_capture_appearance()
 
@@ -991,6 +993,8 @@ class WhisperBoardApp:
         self._start_hotkey_listener(self.settings["capture_hotkey"])
         self.capture_box.set_font_size(
             self.settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"]))
+        self.capture_box.set_font_family(
+            self.settings.get("capture_font_family", DEFAULT_SETTINGS["capture_font_family"]))
         self.capture_box.set_meter_style(
             self.settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"]))
         self._apply_capture_appearance()

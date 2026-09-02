@@ -16,9 +16,10 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QComboBox,
     QColorDialog,
+    QFontComboBox,
 )
 from PySide6.QtCore import Qt, Signal, QPoint, QTimer
-from PySide6.QtGui import QKeySequence, QColor
+from PySide6.QtGui import QKeySequence, QColor, QFont
 
 from signal_meter import SignalMeter
 
@@ -27,6 +28,7 @@ from capture_box import (
     DEFAULT_FONT_SIZE_PX,
     MIN_FONT_SIZE_PX,
     MAX_FONT_SIZE_PX,
+    DEFAULT_FONT_FAMILY,
     METER_STYLES,
     DEFAULT_OPACITY,
     MIN_OPACITY,
@@ -112,6 +114,8 @@ DEFAULT_SETTINGS = {
     # paste that instead of the text assembled live. See final_pass.py.
     "final_pass": True,
     "capture_font_size": DEFAULT_FONT_SIZE_PX,
+    # Empty means the system UI font.
+    "capture_font_family": DEFAULT_FONT_FAMILY,
     # How solid the Capture Box is, and what colour. Stored as a fraction
     # rather than a percentage so it goes straight into the stylesheet.
     "capture_opacity": DEFAULT_OPACITY,
@@ -182,6 +186,12 @@ class SettingsWindow(QWidget):
         self.model_combo.setToolTip(
             "The transcription model the server loads. The large models need an "
             "NVIDIA GPU; on a CPU, prefer the distil ones.")
+        self.capture_font_family_combo = QFontComboBox()
+        self.capture_font_family_combo.setToolTip(
+            "The transcript typeface. The box height follows the line height, "
+            "so a tall face can make the box taller.")
+        self.capture_font_family_combo.setEditable(False)
+        self.capture_font_family_combo.currentFontChanged.connect(self._on_font_picked)
         self.capture_font_size_spin = QSpinBox()
         self.capture_font_size_spin.setRange(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX)
         self.capture_font_size_spin.setSuffix(" px")
@@ -243,6 +253,9 @@ class SettingsWindow(QWidget):
         # What is currently on disk and in the app, to compare the form
         # against on the way out. None until load_settings has run.
         self._applied_settings = None
+        # Whether the font combo is showing the system default rather than a
+        # face the user picked. See _font_family.
+        self._font_is_default = True
         self.profile_combo = QComboBox()
         self.profile_combo.setToolTip(
             "A whole saved settings file, by name. Choosing one fills this "
@@ -374,7 +387,12 @@ class SettingsWindow(QWidget):
         server_start_column.addWidget(self.server_use_gpu_checkbox)
         server_start_column.addWidget(self.share_one_model_checkbox)
         form_layout.addRow(QLabel("Server Startup:"), server_start_column)
-        form_layout.addRow(QLabel("Capture Text Size:"), self.capture_font_size_spin)
+        type_row = QHBoxLayout()
+        type_row.setContentsMargins(0, 0, 0, 0)
+        type_row.addWidget(self.capture_font_family_combo, 1)
+        type_row.addSpacing(8)
+        type_row.addWidget(self.capture_font_size_spin)
+        form_layout.addRow(QLabel("Capture Text:"), type_row)
         appearance_row = QHBoxLayout()
         appearance_row.setContentsMargins(0, 0, 0, 0)
         appearance_row.addWidget(self.capture_opacity_spin)
@@ -420,6 +438,7 @@ class SettingsWindow(QWidget):
         for signal in (self.capture_opacity_spin.valueChanged,
                        self.capture_field_opacity_spin.valueChanged,
                        self.capture_font_size_spin.valueChanged,
+                       self.capture_font_family_combo.currentFontChanged,
                        self.capture_meter_style_combo.currentIndexChanged):
             signal.connect(lambda *_: self._sync_preview())
         # These change the snapshot itself rather than what is painted over
@@ -580,6 +599,35 @@ class SettingsWindow(QWidget):
         self.status_label.setText(f"Deleted profile '{name}'.")
         self._status_timer.start(2500)
 
+    def _font_family(self) -> str:
+        """The chosen family, or "" for the system default.
+
+        QFontComboBox always has something selected, so "the system font" is
+        not a state it can be in. It is stored as the empty string and shown
+        as whatever Qt actually resolved that to, which is the honest way to
+        display a default nobody named.
+        """
+        if self._font_is_default:
+            return ""
+        return self.capture_font_family_combo.currentFont().family()
+
+    def _set_font_family(self, family: str):
+        """Show `family` in the combo without it counting as a choice.
+
+        Signals are blocked over the assignment rather than the handler being
+        disconnected and reconnected around it: the handler is what tells a
+        deliberate pick from a value being loaded, and a connection made in
+        one place and undone in another is how it would end up attached twice.
+        """
+        combo = self.capture_font_family_combo
+        self._font_is_default = not (family or "").strip()
+        combo.blockSignals(True)
+        combo.setCurrentFont(QFont(family) if family else QWidget().font())
+        combo.blockSignals(False)
+
+    def _on_font_picked(self, _font):
+        self._font_is_default = False
+
     @staticmethod
     def _frost_spin(prefix: str, suffix: str, low: int, high: int, tip: str) -> QSpinBox:
         """One of the frost numeric controls.
@@ -682,6 +730,7 @@ class SettingsWindow(QWidget):
         if box is None:
             return
         box.set_font_size(self.capture_font_size_spin.value())
+        box.set_font_family(self._font_family())
         box.set_meter_style(self.capture_meter_style_combo.currentText())
         box.set_surface(self._bg_color,
                         self.capture_opacity_spin.value() / 100.0,
@@ -759,6 +808,8 @@ class SettingsWindow(QWidget):
         self._sync_server_startup_enabled()
         self.capture_font_size_spin.setValue(
             int(settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"])))
+        self._set_font_family(settings.get(
+            "capture_font_family", DEFAULT_SETTINGS["capture_font_family"]))
         self.capture_opacity_spin.setValue(int(round(float(
             settings.get("capture_opacity", DEFAULT_SETTINGS["capture_opacity"])) * 100)))
         self._set_bg_color(settings.get("capture_bg_color", DEFAULT_SETTINGS["capture_bg_color"]))
@@ -837,6 +888,7 @@ class SettingsWindow(QWidget):
             # by hand in config.json must survive a visit to this window.
             "server_docker_image": getattr(self, "_server_docker_image", ""),
             "capture_font_size": self.capture_font_size_spin.value(),
+            "capture_font_family": self._font_family(),
             "capture_opacity": self.capture_opacity_spin.value() / 100.0,
             "capture_bg_color": self._bg_color,
             "capture_panel_frost": self.capture_panel_frost_checkbox.isChecked(),
