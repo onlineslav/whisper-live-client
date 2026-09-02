@@ -175,6 +175,7 @@ class WhisperBoardApp:
         self.capture_box = CaptureBox()
         self.capture_box.set_font_size(self.settings["capture_font_size"])
         self.capture_box.set_meter_style(self.settings["capture_meter_style"])
+        self._apply_capture_appearance()
 
         # Core Components
         self.audio_capture = AudioCapture()
@@ -992,6 +993,7 @@ class WhisperBoardApp:
             self.settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"]))
         self.capture_box.set_meter_style(
             self.settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"]))
+        self._apply_capture_appearance()
         self.server_manager.update_settings(self.settings)
         self._init_websocket_client()
         # A server address or image change makes the previous verdict stale,
@@ -1000,6 +1002,12 @@ class WhisperBoardApp:
         self._server_failure_notified = False
         self._start_server_if_needed()
         self._sync_icon_state()
+
+    def _apply_capture_appearance(self):
+        """Push the Capture Box's look from settings onto the box."""
+        self.capture_box.set_surface(
+            self.settings.get("capture_bg_color", DEFAULT_SETTINGS["capture_bg_color"]),
+            self.settings.get("capture_opacity", DEFAULT_SETTINGS["capture_opacity"]))
 
     def on_meter_style_changed(self, style: str):
         """Persist a style picked by clicking the meter itself.

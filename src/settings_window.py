@@ -14,9 +14,10 @@ from PySide6.QtWidgets import (
     QKeySequenceEdit,
     QSpinBox,
     QComboBox,
+    QColorDialog,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QKeySequence, QColor
 
 from signal_meter import SignalMeter
 
@@ -25,6 +26,10 @@ from capture_box import (
     MIN_FONT_SIZE_PX,
     MAX_FONT_SIZE_PX,
     METER_STYLES,
+    DEFAULT_OPACITY,
+    MIN_OPACITY,
+    MAX_OPACITY,
+    DEFAULT_BG_COLOR,
 )
 
 # The preview sits on a dark panel matching the Capture Box, because that is
@@ -72,6 +77,10 @@ DEFAULT_SETTINGS = {
     # paste that instead of the text assembled live. See final_pass.py.
     "final_pass": True,
     "capture_font_size": DEFAULT_FONT_SIZE_PX,
+    # How solid the Capture Box is, and what colour. Stored as a fraction
+    # rather than a percentage so it goes straight into the stylesheet.
+    "capture_opacity": DEFAULT_OPACITY,
+    "capture_bg_color": DEFAULT_BG_COLOR,
     "capture_meter_style": METER_STYLES[0],
     # Server startup. WhisperBoard launches itself at login but the WhisperLive
     # server does not, which left the app looking ready with nothing to talk
@@ -124,6 +133,18 @@ class SettingsWindow(QWidget):
         self.capture_font_size_spin = QSpinBox()
         self.capture_font_size_spin.setRange(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX)
         self.capture_font_size_spin.setSuffix(" px")
+        self.capture_opacity_spin = QSpinBox()
+        self.capture_opacity_spin.setRange(int(MIN_OPACITY * 100), int(MAX_OPACITY * 100))
+        self.capture_opacity_spin.setSuffix(" %")
+        self.capture_opacity_spin.setToolTip(
+            "How solid the Capture Box is over whatever is behind it. Lower "
+            "lets the window underneath show through; higher makes the "
+            "transcript easier to read over a page of text.")
+        self.capture_bg_color_button = QPushButton()
+        self.capture_bg_color_button.setFixedWidth(90)
+        self.capture_bg_color_button.setToolTip("The Capture Box's background colour.")
+        self.capture_bg_color_button.clicked.connect(self._pick_bg_color)
+        self._bg_color = DEFAULT_BG_COLOR
         self.capture_meter_style_combo = QComboBox()
         self.capture_meter_style_combo.addItems(METER_STYLES)
         # A live preview, on the dark ground it will actually be seen against.
@@ -218,6 +239,13 @@ class SettingsWindow(QWidget):
         server_start_column.addWidget(self.share_one_model_checkbox)
         form_layout.addRow(QLabel("Server Startup:"), server_start_column)
         form_layout.addRow(QLabel("Capture Text Size:"), self.capture_font_size_spin)
+        appearance_row = QHBoxLayout()
+        appearance_row.setContentsMargins(0, 0, 0, 0)
+        appearance_row.addWidget(self.capture_opacity_spin)
+        appearance_row.addSpacing(8)
+        appearance_row.addWidget(self.capture_bg_color_button)
+        appearance_row.addStretch()
+        form_layout.addRow(QLabel("Capture Box:"), appearance_row)
         meter_row = QHBoxLayout()
         meter_row.setContentsMargins(0, 0, 0, 0)
         meter_row.addWidget(self.capture_meter_style_combo)
@@ -263,6 +291,30 @@ class SettingsWindow(QWidget):
             self.model_combo.insertItem(0, f"{model} — custom", model)
             index = 0
         self.model_combo.setCurrentIndex(max(index, 0))
+
+    def _pick_bg_color(self):
+        chosen = QColorDialog.getColor(
+            QColor(self._bg_color), self, "Capture Box background")
+        if chosen.isValid():
+            self._set_bg_color(chosen.name())
+
+    def _set_bg_color(self, color: str):
+        """Remember the colour and show it on the button that picks it.
+
+        The swatch is the button itself rather than a label beside it: the
+        colour is the only thing the button has to say, and a hex code means
+        nothing next to seeing it.
+        """
+        value = QColor(color)
+        if not value.isValid():
+            value = QColor(DEFAULT_BG_COLOR)
+        self._bg_color = value.name()
+        # Readable caption whichever end of the range the colour is from.
+        ink = "#000000" if value.lightness() > 127 else "#ffffff"
+        self.capture_bg_color_button.setText(self._bg_color)
+        self.capture_bg_color_button.setStyleSheet(
+            f"background-color: {self._bg_color}; color: {ink};"
+            " border: 1px solid #888; padding: 4px;")
 
     def _sync_server_startup_enabled(self):
         """The sub-options only mean anything when auto-start is on."""
@@ -323,6 +375,9 @@ class SettingsWindow(QWidget):
         self._sync_server_startup_enabled()
         self.capture_font_size_spin.setValue(
             int(settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"])))
+        self.capture_opacity_spin.setValue(int(round(float(
+            settings.get("capture_opacity", DEFAULT_SETTINGS["capture_opacity"])) * 100)))
+        self._set_bg_color(settings.get("capture_bg_color", DEFAULT_SETTINGS["capture_bg_color"]))
         meter_style = settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"])
         if meter_style not in METER_STYLES:
             meter_style = DEFAULT_SETTINGS["capture_meter_style"]
@@ -364,6 +419,8 @@ class SettingsWindow(QWidget):
             # by hand in config.json must survive a visit to this window.
             "server_docker_image": getattr(self, "_server_docker_image", ""),
             "capture_font_size": self.capture_font_size_spin.value(),
+            "capture_opacity": self.capture_opacity_spin.value() / 100.0,
+            "capture_bg_color": self._bg_color,
             "capture_meter_style": self.capture_meter_style_combo.currentText(),
         }
 

@@ -27,6 +27,9 @@ from PySide6.QtGui import (
     QTextOption,
     QGuiApplication,
     QTextCursor,
+    QPainter,
+    QColor,
+    QPainterPath,
 )
 
 from signal_meter import SignalMeter, STYLES as METER_STYLES
@@ -47,6 +50,40 @@ MAX_FONT_SIZE_PX = 48
 # amount of text at any size.
 VISIBLE_LINES = 5
 MAX_LINES = 10
+
+# How solid the box is over whatever is behind it. The box opens on top of the
+# text being dictated into, so this is a readability control before it is a
+# decorative one: too far down and the passage underneath shows through the
+# transcript and neither can be read.
+DEFAULT_OPACITY = 0.92
+MIN_OPACITY = 0.30
+MAX_OPACITY = 1.0
+
+# Near-black rather than black: a slight blue lift reads as a deliberate
+# surface at high opacity, where flat #000 reads as a hole in the screen.
+DEFAULT_BG_COLOR = "#12141a"
+
+# Corner radius of the box, in px.
+CORNER_RADIUS = 10
+
+
+def _clamp_opacity(value) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_OPACITY
+    return max(MIN_OPACITY, min(value, MAX_OPACITY))
+
+
+def _rgb(color: str):
+    """(r, g, b) from a #rrggbb string, falling back to the default."""
+    text = str(color).strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    try:
+        return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except (ValueError, IndexError):
+        return _rgb(DEFAULT_BG_COLOR)
 
 
 class CaptureBox(QWidget):
@@ -75,14 +112,16 @@ class CaptureBox(QWidget):
             | Qt.Tool  # Prevents it from appearing in the taskbar
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setStyleSheet(
-            """
-            background-color: rgba(0, 0, 0, 0.7);
-            color: white;
-            border-radius: 10px;
-            font-size: 14px;
-        """
-        )
+        # Text colour and default type size only. The surface itself is
+        # painted in paintEvent rather than set here: a bare QWidget does not
+        # draw a stylesheet background at all, and the box had been styled for
+        # a dark translucent one since it was written without ever painting
+        # it. What read as the box was its children's own backgrounds, with
+        # the gaps between them showing the screen straight through -- which
+        # is why the transcript was unreadable over a page of text.
+        self.setStyleSheet("color: white; font-size: 14px;")
+        self._bg_color = DEFAULT_BG_COLOR
+        self._opacity_level = DEFAULT_OPACITY
 
         # Subtle fade effect
         self._opacity = QGraphicsOpacityEffect(self)
@@ -194,6 +233,42 @@ class CaptureBox(QWidget):
 
     def set_meter_style(self, style: str):
         self.meter.set_style(style)
+
+    def set_surface(self, color: str = None, opacity=None):
+        """Set the box's background colour and how solid it is.
+
+        Only the background takes the opacity -- the text, the buttons and the
+        meter stay fully opaque on top of it. Fading the whole window instead
+        (setWindowOpacity, or the fade effect below) would take the transcript
+        down with it, which is the opposite of what this control is for.
+        """
+        if color is not None:
+            self._bg_color = color
+        if opacity is not None:
+            self._opacity_level = _clamp_opacity(opacity)
+        self.update()
+
+    def _surface_color(self) -> QColor:
+        r, g, b = _rgb(self._bg_color)
+        return QColor(r, g, b, int(round(self._opacity_level * 255)))
+
+    def paintEvent(self, event):
+        """Draw the box's surface: one rounded rectangle, and nothing else.
+
+        Done here rather than in the stylesheet because a plain QWidget never
+        draws a styled background, and because a border-radius on a
+        translucent window leaves the corners aliased against whatever is
+        behind them. An explicit path can be antialiased.
+        """
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        path = QPainterPath()
+        # A half-pixel inset so the antialiased edge has somewhere to land;
+        # without it the outermost row of pixels is clipped and the curve
+        # goes hard-edged again.
+        path.addRoundedRect(
+            self.rect().adjusted(0, 0, -1, -1), CORNER_RADIUS, CORNER_RADIUS)
+        painter.fillPath(path, self._surface_color())
 
     def set_text(self, text):
         self.text_area.setPlainText(text)
