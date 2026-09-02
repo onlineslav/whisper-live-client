@@ -184,6 +184,12 @@ class CaptureBox(QWidget):
         self._closing = False
         self._fade_duration_ms = 140
         self._shown_at = 0.0
+        # A preview box stands in the Settings window rather than over the
+        # app being dictated into, so every way a real capture ends -- losing
+        # activation, a click outside it, the keyboard -- would close it the
+        # moment the user went back to the control they are adjusting. It is
+        # the same widget otherwise, which is the point of previewing it.
+        self._preview_mode = False
 
         # Never shown (the window is frameless), but it makes the box
         # identifiable in window lists and in logs when tracing a stray paste.
@@ -306,11 +312,17 @@ class CaptureBox(QWidget):
         self.cancel_button.clicked.connect(self.on_cancel)
 
     def on_confirm(self):
+        if self._preview_mode:
+            self.hide()
+            return
         self._closing = True
         self.confirmed.emit(self.text_area.toPlainText())
         self._fade_out_and_hide()
 
     def on_cancel(self):
+        if self._preview_mode:
+            self.hide()
+            return
         self._closing = True
         self.cancelled.emit()
         self._fade_out_and_hide()
@@ -456,7 +468,43 @@ class CaptureBox(QWidget):
         # The box was sized for the old type; let it shrink as well as grow.
         self.resize(self.sizeHint())
 
+    def show_preview(self, at: QPoint = None):
+        """Show the box as a live sample of itself, next to the Settings window.
+
+        Never takes the foreground and never cancels itself, so it can sit
+        there while its own appearance is adjusted behind it.
+        """
+        self._preview_mode = True
+        self._closing = False
+        self.meter.reset()
+        self.adjustSize()
+        if at is not None:
+            self._move_near(at)
+        self._grab_frost()
+        self._opacity.setOpacity(0.0)
+        self.show()
+        self.raise_()
+        self._animate_opacity(0.0, 1.0)
+
+    def refresh_backdrop(self):
+        """Re-take the frost snapshot, for a box that is already up.
+
+        Only worth calling when the backdrop has been switched on or the box
+        has moved -- the snapshot does not go stale for a colour or opacity
+        change, since neither moves the box or alters what is behind it. The
+        box has to be out of its own photograph, hence the hide.
+        """
+        if not self.isVisible():
+            return
+        self.hide()
+        QApplication.processEvents()
+        self._grab_frost()
+        self.show()
+        self.raise_()
+        self._opacity.setOpacity(1.0)
+
     def show_at_cursor(self):
+        self._preview_mode = False
         self._closing = False
         self.meter.reset()
         self._shown_at = time.monotonic()
@@ -538,6 +586,10 @@ class CaptureBox(QWidget):
             pass
 
     def keyPressEvent(self, event: QKeyEvent):
+        if self._preview_mode:
+            # Confirming or cancelling a sample would mean pasting it.
+            super().keyPressEvent(event)
+            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             event.accept()
             self.on_confirm()
@@ -561,6 +613,7 @@ class CaptureBox(QWidget):
         """
         if (
             event.type() == QEvent.ActivationChange
+            and not self._preview_mode
             and not self._closing
             and self.isVisible()
             and not self.isActiveWindow()
@@ -570,7 +623,8 @@ class CaptureBox(QWidget):
         super().changeEvent(event)
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.MouseButtonPress and not self._closing:
+        if (event.type() == QEvent.MouseButtonPress
+                and not self._preview_mode and not self._closing):
             # An app-wide filter sees every press twice: first on the receiving
             # QWindow, then on the QWidget under it. The QWindow is not a
             # widget, so an isWidgetType()-only check misses our own window and

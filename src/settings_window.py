@@ -16,12 +16,13 @@ from PySide6.QtWidgets import (
     QComboBox,
     QColorDialog,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QPoint
 from PySide6.QtGui import QKeySequence, QColor
 
 from signal_meter import SignalMeter
 
 from capture_box import (
+    CaptureBox,
     DEFAULT_FONT_SIZE_PX,
     MIN_FONT_SIZE_PX,
     MAX_FONT_SIZE_PX,
@@ -35,6 +36,12 @@ from capture_box import (
     DEFAULT_FIELD_OPACITY,
     DEFAULT_FIELD_COLOR,
 )
+
+# What the preview box says. Long enough to wrap onto a second line, so the
+# line spacing and the field's height are part of what is being judged, and
+# ordinary enough to be read past while looking at the colours.
+PREVIEW_TEXT = ("I was thinking that we could probably move the meeting to "
+                "Thursday afternoon instead.")
 
 # The preview sits on a dark panel matching the Capture Box, because that is
 # where the meter really lives; the same blue on the settings window's own
@@ -176,6 +183,17 @@ class SettingsWindow(QWidget):
         self.capture_field_color_button.setToolTip("The transcript inset's colour.")
         self.capture_field_color_button.clicked.connect(self._pick_field_color)
         self._field_color = DEFAULT_FIELD_COLOR
+        self.capture_preview_button = QPushButton("Preview")
+        self.capture_preview_button.setCheckable(True)
+        self.capture_preview_button.setToolTip(
+            "Open a sample Capture Box beside this window and keep it there "
+            "while you adjust it. It is the real box, so what it looks like "
+            "is what dictation will look like -- it just does not listen, "
+            "paste, or close itself when you click away.")
+        self.capture_preview_button.toggled.connect(self._on_box_preview_toggled)
+        # A box of its own rather than the app's: a preview must not be able
+        # to interfere with a capture that is genuinely in progress.
+        self._preview_box = None
         self.capture_meter_style_combo = QComboBox()
         self.capture_meter_style_combo.addItems(METER_STYLES)
         # A live preview, on the dark ground it will actually be seen against.
@@ -278,6 +296,7 @@ class SettingsWindow(QWidget):
         appearance_row.addSpacing(8)
         appearance_row.addWidget(self.capture_backdrop_combo)
         appearance_row.addStretch()
+        appearance_row.addWidget(self.capture_preview_button)
         form_layout.addRow(QLabel("Panel:"), appearance_row)
         field_row = QHBoxLayout()
         field_row.setContentsMargins(0, 0, 0, 0)
@@ -286,6 +305,20 @@ class SettingsWindow(QWidget):
         field_row.addWidget(self.capture_field_color_button)
         field_row.addStretch()
         form_layout.addRow(QLabel("Transcript Field:"), field_row)
+        # Anything the box's appearance is made of, pushed straight at it.
+        # The backdrop is the one that needs a new snapshot rather than a
+        # repaint -- see _sync_preview.
+        # Lambdas rather than the bound method: every one of these signals
+        # carries a value, and it would arrive in `regrab` -- making any
+        # non-zero spinbox tick re-snapshot the backdrop, with the hide and
+        # show that costs.
+        for signal in (self.capture_opacity_spin.valueChanged,
+                       self.capture_field_opacity_spin.valueChanged,
+                       self.capture_font_size_spin.valueChanged,
+                       self.capture_meter_style_combo.currentIndexChanged):
+            signal.connect(lambda *_: self._sync_preview())
+        self.capture_backdrop_combo.currentIndexChanged.connect(
+            lambda *_: self._sync_preview(regrab=True))
         meter_row = QHBoxLayout()
         meter_row.setContentsMargins(0, 0, 0, 0)
         meter_row.addWidget(self.capture_meter_style_combo)
@@ -346,10 +379,12 @@ class SettingsWindow(QWidget):
     def _set_bg_color(self, color: str):
         self._bg_color = self._paint_swatch(
             self.capture_bg_color_button, color, DEFAULT_BG_COLOR)
+        self._sync_preview()
 
     def _set_field_color(self, color: str):
         self._field_color = self._paint_swatch(
             self.capture_field_color_button, color, DEFAULT_FIELD_COLOR)
+        self._sync_preview()
 
     @staticmethod
     def _paint_swatch(button, color: str, fallback: str) -> str:
@@ -380,9 +415,61 @@ class SettingsWindow(QWidget):
         # only ours to arrange when we launch it.
         self.share_one_model_checkbox.setEnabled(enabled)
 
+    def _on_box_preview_toggled(self, active: bool):
+        self.capture_preview_button.setText("Close preview" if active else "Preview")
+        if not active:
+            self.close_box_preview()
+            return
+        if self._preview_box is None:
+            self._preview_box = CaptureBox()
+            self._preview_box.set_text(PREVIEW_TEXT)
+            # Clicking the sample's own Confirm or Cancel closes it, so the
+            # button has to come back up with it.
+            self._preview_box.confirmed.connect(
+                lambda _: self.capture_preview_button.setChecked(False))
+            self._preview_box.cancelled.connect(
+                lambda: self.capture_preview_button.setChecked(False))
+        self._sync_preview()
+        # Beside this window rather than over it, so both are readable at
+        # once; _move_near flips it to the other side at a screen edge.
+        frame = self.frameGeometry()
+        self._preview_box.show_preview(QPoint(frame.right(), frame.top()))
+
+    def close_box_preview(self):
+        """Take the sample box down. Safe when there never was one."""
+        if self._preview_box is not None:
+            self._preview_box.hide()
+
+    def _sync_preview(self, regrab: bool = False):
+        """Push the controls' current values onto the sample box.
+
+        `regrab` re-takes the frosted snapshot, which only the backdrop and a
+        move actually invalidate: a colour or opacity change does not alter
+        what is behind the box, so repainting over the snapshot it already
+        has is both correct and free of the hide/show flicker regrabbing
+        costs.
+        """
+        box = self._preview_box
+        if box is None:
+            return
+        box.set_font_size(self.capture_font_size_spin.value())
+        box.set_meter_style(self.capture_meter_style_combo.currentText())
+        box.set_surface(self._bg_color,
+                        self.capture_opacity_spin.value() / 100.0,
+                        self.capture_backdrop_combo.currentData()
+                        or DEFAULT_SETTINGS["capture_backdrop"])
+        box.set_field(self._field_color,
+                      self.capture_field_opacity_spin.value() / 100.0)
+        if regrab:
+            box.refresh_backdrop()
+
     def set_preview_level_db(self, db: float):
         """Feed the preview meter, while the app has the mic open for it."""
         self.meter_preview.set_level_db(db)
+        # The sample box has a meter of its own, and a dead one in a preview
+        # of the box reads as a broken box.
+        if self._preview_box is not None and self._preview_box.isVisible():
+            self._preview_box.set_level_db(db)
 
     def _on_preview_toggled(self, active: bool):
         self.meter_test_button.setText("Stop test" if active else "Test mic")
@@ -557,6 +644,8 @@ class SettingsWindow(QWidget):
         # Before the close is announced: leaving the mic open behind a closed
         # settings window would be both a leak and a genuine privacy surprise.
         self.stop_preview()
+        self.capture_preview_button.setChecked(False)
+        self.close_box_preview()
         self.window_closed.emit()
         super().closeEvent(event)
 
