@@ -31,6 +31,7 @@ from PySide6.QtGui import (
     QColor,
     QPainterPath,
     QPixmap,
+    QImage,
 )
 
 from signal_meter import SignalMeter, STYLES as METER_STYLES
@@ -56,7 +57,7 @@ MAX_LINES = 10
 # text being dictated into, so this is a readability control before it is a
 # decorative one: too far down and the passage underneath shows through the
 # transcript and neither can be read.
-DEFAULT_OPACITY = 0.80
+DEFAULT_OPACITY = 0.55
 MIN_OPACITY = 0.30
 MAX_OPACITY = 1.0
 
@@ -91,15 +92,46 @@ DEFAULT_BACKDROP = BACKDROP_FROST
 FROST_SCALE = 0.09
 FROST_PASSES = 2
 
+# Blur alone is not enough to look like glass. A blurred dark window is just
+# a dark smear, and under any tint at all it is indistinguishable from a flat
+# fill -- which is what "the frost is not frosting" looks like on a dark
+# desktop. Windows' own acrylic does not stop at blurring either: it boosts
+# saturation hard and blends the result towards a middle luminosity, which is
+# why acrylic over a black window still reads as a surface with something
+# behind it rather than as black.
+#
+# The same two moves here. Saturation first, so what colour survived the blur
+# is worth seeing; then the whole range compressed towards FROST_LUMINOSITY,
+# which lifts dark content off the floor and pulls bright content down,
+# leaving texture visible either way.
+FROST_SATURATION = 2.0
+FROST_LUMINOSITY = 108
+FROST_LUMINOSITY_MIX = 0.42
+
 
 def _blurred(pixmap: QPixmap) -> QPixmap:
-    """A heavily blurred copy of `pixmap`, at its original size."""
+    """A blurred, saturated, luminosity-levelled copy at the original size."""
     width = max(1, int(pixmap.width() * FROST_SCALE))
     height = max(1, int(pixmap.height() * FROST_SCALE))
     small = pixmap.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
     for _ in range(FROST_PASSES - 1):
         small = small.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-    return small.scaled(pixmap.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    # Per-pixel, but on the downscaled image -- a few hundred pixels rather
+    # than the hundred thousand of the full-size one, and it is about to be
+    # smoothly upscaled anyway, so the detail would be thrown away regardless.
+    image = small.toImage().convertToFormat(QImage.Format_ARGB32)
+    for y in range(image.height()):
+        for x in range(image.width()):
+            color = image.pixelColor(x, y)
+            hue, saturation, lightness, alpha = color.getHsl()
+            saturation = min(255, int(saturation * FROST_SATURATION))
+            lightness = int(lightness * (1.0 - FROST_LUMINOSITY_MIX)
+                            + FROST_LUMINOSITY * FROST_LUMINOSITY_MIX)
+            # A fully desaturated pixel reports hue -1, which QColor rejects.
+            image.setPixelColor(x, y, QColor.fromHsl(
+                max(0, hue), saturation, max(0, min(255, lightness)), alpha))
+    return QPixmap.fromImage(image).scaled(
+        pixmap.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
 
 def _clamp_opacity(value) -> float:
