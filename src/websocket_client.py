@@ -19,6 +19,18 @@ from PySide6.QtCore import QObject, Signal
 # cover a cold load, bounded so a wedged server cannot grow it forever.
 MAX_PENDING_AUDIO_BYTES = 16000 * 4 * 60
 
+# Silence never reaches the decoder as silence: the faster-whisper VAD cuts it
+# out first. The defaults (min_silence_duration_ms 2000, speech_pad_ms 400)
+# leave over a second of a three-second pause in the clip, which is enough for
+# Whisper to break the sentence on its own. Cutting sooner and padding less
+# collapses the pause before it can. Lower than this starts clipping soft word
+# onsets. Shared with final_pass.py so the replay hears what the stream heard.
+VAD_PARAMETERS = {
+    "onset": 0.5,
+    "min_silence_duration_ms": 400,
+    "speech_pad_ms": 100,
+}
+
 
 class WebSocketClient(QObject):
     """
@@ -142,7 +154,20 @@ class WebSocketClient(QObject):
                         "task": "transcribe",
                         "model": self.model,
                         "use_vad": True,
-                        "same_output_threshold": 4,
+                        # How many identical transcriptions in a row before the
+                        # server commits the pending segment. Committing also
+                        # DROPS the audio behind it (base.py, timestamp_offset
+                        # + get_audio_chunk_for_processing), so the next pass
+                        # starts from a clip beginning at the pause -- with no
+                        # preceding audio, Whisper capitalizes and punctuates it
+                        # as a fresh sentence. Each iteration is one transcribe
+                        # of the whole buffer (~100-400ms), so the upstream
+                        # default of 10 is roughly 2-4s of silence; 4 was under
+                        # two, which split ordinary mid-thought pauses into
+                        # separate sentences. clip_audio still bounds the buffer
+                        # at 25s, so a high value here cannot run away.
+                        "same_output_threshold": 12,
+                        "vad_parameters": VAD_PARAMETERS,
                         # How much of the transcript each message repeats. The
                         # client reassembles the whole thing from these windows
                         # (transcript.py), so this only has to be wide enough
