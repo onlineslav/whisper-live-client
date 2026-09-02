@@ -68,6 +68,9 @@ DEFAULT_SETTINGS = {
     "launch_on_startup": False,
     "model": "distil-small.en",
     "connect_on_demand": True,
+    # Re-transcribe the whole capture in one piece when it is confirmed, and
+    # paste that instead of the text assembled live. See final_pass.py.
+    "final_pass": True,
     "capture_font_size": DEFAULT_FONT_SIZE_PX,
     "capture_meter_style": METER_STYLES[0],
     # Server startup. WhisperBoard launches itself at login but the WhisperLive
@@ -150,6 +153,14 @@ class SettingsWindow(QWidget):
         )
         self.launch_on_startup_checkbox = QCheckBox("Launch WhisperBoard on system startup")
         self.connect_on_demand_checkbox = QCheckBox("Connect to server only when capture starts (on-demand)")
+        self.final_pass_checkbox = QCheckBox(
+            "Re-transcribe the whole capture before pasting")
+        self.final_pass_checkbox.setToolTip(
+            "Live transcription works on a rolling buffer and discards audio as "
+            "it goes, so a pause mid-sentence can come out as two sentences. "
+            "This sends the capture again in one piece when you confirm it, "
+            "which reads the whole thing in context. Costs up to a second "
+            "before the paste appears.")
         self.auto_start_server_checkbox = QCheckBox(
             "Start the WhisperLive server automatically (Docker)")
         self.auto_start_server_checkbox.setToolTip(
@@ -197,6 +208,7 @@ class SettingsWindow(QWidget):
         connection_column.setContentsMargins(0, 0, 0, 0)
         connection_column.addWidget(self.connect_on_demand_checkbox)
         connection_column.addWidget(self.reconnect_after_capture_checkbox)
+        connection_column.addWidget(self.final_pass_checkbox)
         form_layout.addRow(QLabel("Connection Mode:"), connection_column)
         server_start_column = QVBoxLayout()
         server_start_column.setContentsMargins(0, 0, 0, 0)
@@ -293,6 +305,7 @@ class SettingsWindow(QWidget):
         self._select_model(settings.get("model", DEFAULT_SETTINGS["model"]))
         self.launch_on_startup_checkbox.setChecked(settings.get("launch_on_startup", DEFAULT_SETTINGS["launch_on_startup"]))
         self.connect_on_demand_checkbox.setChecked(settings.get("connect_on_demand", DEFAULT_SETTINGS["connect_on_demand"]))
+        self.final_pass_checkbox.setChecked(settings.get("final_pass", DEFAULT_SETTINGS["final_pass"]))
         self.auto_start_server_checkbox.setChecked(
             settings.get("auto_start_server", DEFAULT_SETTINGS["auto_start_server"]))
         self.start_docker_desktop_checkbox.setChecked(
@@ -340,6 +353,7 @@ class SettingsWindow(QWidget):
             "launch_on_startup": self.launch_on_startup_checkbox.isChecked(),
             "model": self.model_combo.currentData() or DEFAULT_SETTINGS["model"],
             "connect_on_demand": self.connect_on_demand_checkbox.isChecked(),
+            "final_pass": self.final_pass_checkbox.isChecked(),
             "auto_start_server": self.auto_start_server_checkbox.isChecked(),
             "start_docker_desktop": self.start_docker_desktop_checkbox.isChecked(),
             "server_use_gpu": self.server_use_gpu_checkbox.isChecked(),

@@ -149,6 +149,16 @@ Other good options:
     - To **confirm** and paste the text, press the hotkey again, press `Enter`, or click the "✓" button.
     - To **cancel**, press `Esc`, click the "✗" button, or simply click away from the Capture Box.
 
+    The text in the box is a live preview. On confirm, WhisperBoard sends the
+    whole capture again in one piece and pastes that instead — which is why the
+    pasted text is sometimes punctuated a little differently from what you
+    watched appear. Live transcription reads a rolling buffer and discards
+    audio as it goes, so a pause mid-sentence can come out as two sentences;
+    reading the capture whole does not have that problem. It costs up to a
+    second before the paste lands. Turn it off with **Settings → Connection
+    Mode → Re-transcribe the whole capture before pasting** if you would rather
+    have the text immediately.
+
 ## Building the Executable (Optional)
 
 You can bundle WhisperBoard into a single `.exe` file for easy distribution using `PyInstaller`.
