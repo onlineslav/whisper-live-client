@@ -3,6 +3,7 @@ import json
 import os
 from PySide6.QtWidgets import (
     QWidget,
+    QInputDialog,
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
@@ -83,6 +84,23 @@ MODEL_CHOICES = [
 APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WhisperBoard")
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
+
+# Saved settings, by name. One file each rather than a section inside
+# config.json: a profile is then something that can be copied to another
+# machine, backed up, or deleted with the file manager, and a config that
+# fails to parse cannot take the profiles down with it.
+PROFILE_DIR = os.path.join(APP_DATA_DIR, "profiles")
+
+# Characters a profile name may not contain, being a filename as well as a
+# label. Replaced rather than rejected: someone naming a profile "dark/light"
+# means something by it and should not have to be told about paths.
+_PROFILE_UNSAFE = '<>:"/\\|?*'
+
+
+def profile_path(name: str) -> str:
+    safe = "".join("-" if c in _PROFILE_UNSAFE else c for c in name).strip()
+    return os.path.join(PROFILE_DIR, f"{safe}.json")
+
 
 DEFAULT_SETTINGS = {
     "server_address": "ws://localhost:9090",
@@ -220,6 +238,16 @@ class SettingsWindow(QWidget):
         # What is currently on disk and in the app, to compare the form
         # against on the way out. None until load_settings has run.
         self._applied_settings = None
+        self.profile_combo = QComboBox()
+        self.profile_combo.setToolTip(
+            "A whole saved settings file, by name. Choosing one fills this "
+            "window in from it -- nothing reaches the app until Apply.")
+        self.profile_combo.setMinimumWidth(150)
+        self.profile_save_button = QPushButton("Save as...")
+        self.profile_save_button.setToolTip(
+            "Save everything in this window as a named profile.")
+        self.profile_delete_button = QPushButton("Delete")
+        self.profile_delete_button.setToolTip("Delete the selected profile.")
         self.capture_preview_button = QPushButton("Preview")
         self.capture_preview_button.setCheckable(True)
         self.capture_preview_button.setToolTip(
@@ -369,6 +397,14 @@ class SettingsWindow(QWidget):
             frost_row.addSpacing(4)
         frost_row.addStretch()
         form_layout.addRow(QLabel("Frost:"), frost_row)
+        profile_row = QHBoxLayout()
+        profile_row.setContentsMargins(0, 0, 0, 0)
+        profile_row.addWidget(self.profile_combo)
+        profile_row.addSpacing(8)
+        profile_row.addWidget(self.profile_save_button)
+        profile_row.addWidget(self.profile_delete_button)
+        profile_row.addStretch()
+        form_layout.addRow(QLabel("Profile:"), profile_row)
         # Anything the box's appearance is made of, pushed straight at it.
         # The backdrop is the one that needs a new snapshot rather than a
         # repaint -- see _sync_preview.
@@ -418,10 +454,14 @@ class SettingsWindow(QWidget):
         self.meter_preview.style_changed.connect(self.capture_meter_style_combo.setCurrentText)
         self.meter_test_button.toggled.connect(self._on_preview_toggled)
         self.auto_start_server_checkbox.toggled.connect(self._sync_server_startup_enabled)
+        self.profile_combo.activated.connect(self._on_profile_chosen)
+        self.profile_save_button.clicked.connect(self._save_profile)
+        self.profile_delete_button.clicked.connect(self._delete_profile)
         self.apply_button.clicked.connect(self.apply_settings)
         self.save_button.clicked.connect(self.save_settings)
         self.cancel_button.clicked.connect(self.close)
 
+        self._refresh_profiles()
         self.load_settings()
 
     def _select_model(self, model: str):
@@ -438,6 +478,102 @@ class SettingsWindow(QWidget):
             self.model_combo.insertItem(0, f"{model} — custom", model)
             index = 0
         self.model_combo.setCurrentIndex(max(index, 0))
+
+    def _profile_names(self):
+        try:
+            names = [f[:-5] for f in os.listdir(PROFILE_DIR) if f.endswith(".json")]
+        except OSError:
+            return []
+        return sorted(names, key=str.lower)
+
+    def _refresh_profiles(self, select: str = None):
+        """Reload the profile list, leaving `select` (or nothing) chosen."""
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        # A placeholder rather than auto-selecting the first: opening this
+        # window must not look like a profile is in force when none is.
+        self.profile_combo.addItem("(none)", None)
+        for name in self._profile_names():
+            self.profile_combo.addItem(name, name)
+        if select:
+            index = self.profile_combo.findData(select)
+            if index >= 0:
+                self.profile_combo.setCurrentIndex(index)
+        self.profile_combo.blockSignals(False)
+        self.profile_delete_button.setEnabled(bool(self.profile_combo.currentData()))
+
+    def _on_profile_chosen(self, _index: int):
+        """Fill the form in from the chosen profile.
+
+        Loaded into the window and no further: a profile that took effect the
+        instant it was picked would give no way to look at one without
+        adopting it. Apply is still what commits.
+        """
+        name = self.profile_combo.currentData()
+        self.profile_delete_button.setEnabled(bool(name))
+        if not name:
+            return
+        try:
+            with open(profile_path(name), "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except Exception as e:
+            QMessageBox.warning(self, "Profile", f"Could not read '{name}': {e}")
+            self._refresh_profiles()
+            return
+        if not isinstance(settings, dict):
+            QMessageBox.warning(self, "Profile", f"'{name}' is not a settings file.")
+            return
+        # Over the defaults, so a profile written by an older version is
+        # missing keys rather than carrying stale ones.
+        merged = copy.deepcopy(DEFAULT_SETTINGS)
+        merged.update(settings)
+        self.load_settings(merged)
+        self._sync_preview(regrab=True)
+        self.status_label.setText(f"Loaded '{name}' -- not applied yet.")
+        self._status_timer.start(4000)
+
+    def _save_profile(self):
+        current = self.profile_combo.currentData() or ""
+        name, ok = QInputDialog.getText(
+            self, "Save profile", "Profile name:", text=current)
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        settings = self._collect_settings()
+        if settings is None:
+            return
+        path = profile_path(name)
+        if os.path.exists(path) and QMessageBox.question(
+                self, "Save profile",
+                f"'{name}' already exists. Replace it?") != QMessageBox.Yes:
+            return
+        try:
+            os.makedirs(PROFILE_DIR, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=4)
+        except Exception as e:
+            QMessageBox.warning(self, "Profile", f"Could not save '{name}': {e}")
+            return
+        self._refresh_profiles(select=name)
+        self.status_label.setText(f"Saved profile '{name}'.")
+        self._status_timer.start(2500)
+
+    def _delete_profile(self):
+        name = self.profile_combo.currentData()
+        if not name:
+            return
+        if QMessageBox.question(
+                self, "Delete profile",
+                f"Delete the profile '{name}'? This cannot be undone."
+        ) != QMessageBox.Yes:
+            return
+        try:
+            os.remove(profile_path(name))
+        except OSError as e:
+            QMessageBox.warning(self, "Profile", f"Could not delete '{name}': {e}")
+        self._refresh_profiles()
+        self.status_label.setText(f"Deleted profile '{name}'.")
+        self._status_timer.start(2500)
 
     @staticmethod
     def _frost_spin(prefix: str, suffix: str, low: int, high: int, tip: str) -> QSpinBox:
@@ -577,13 +713,22 @@ class SettingsWindow(QWidget):
     def get_config_path(self):
         return CONFIG_FILE
 
-    def load_settings(self):
-        path = self.get_config_path()
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                settings = json.load(f)
-        else:
-            settings = copy.deepcopy(DEFAULT_SETTINGS)
+    def load_settings(self, settings=None):
+        """Fill the form in, from the config file or from `settings`.
+
+        A caller-supplied dict is a profile being read into the window, which
+        is deliberately not the same as the window being opened: the clean
+        state is only re-taken for what actually came off disk, so a loaded
+        profile counts as an unapplied edit and Cancel says so.
+        """
+        from_disk = settings is None
+        if from_disk:
+            path = self.get_config_path()
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    settings = json.load(f)
+            else:
+                settings = copy.deepcopy(DEFAULT_SETTINGS)
 
         self.server_address_edit.setText(settings.get("server_address", DEFAULT_SETTINGS["server_address"]))
         capture_hotkey = settings.get("capture_hotkey", DEFAULT_SETTINGS["capture_hotkey"])
@@ -642,7 +787,8 @@ class SettingsWindow(QWidget):
         # rather than kept from the file: a config missing a key, or holding
         # one this window does not edit, would otherwise read as dirty the
         # moment it opened.
-        self._applied_settings = self._collect_settings(validate=False)
+        if from_disk:
+            self._applied_settings = self._collect_settings(validate=False)
 
     def _collect_settings(self, validate: bool = True):
         """Everything the form is currently saying, as a settings dict.
