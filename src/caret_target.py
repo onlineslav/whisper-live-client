@@ -97,9 +97,14 @@ FIELD_IS_WINDOW_RATIO = 0.92
 #           "none". The overlay draws a different thing for each, because the
 #           difference between "here, exactly" and "somewhere in this window"
 #           is the whole point of showing anything.
-Target = namedtuple("Target", "caret field window label source")
+#   style   (font family, size in points) at the caret, or None. Only the
+#           ghost text uses it, and only to look like it belongs where it is
+#           standing -- see ghost_text.py.
+Target = namedtuple("Target", "caret field window label source style")
+# So the five-field construction sites elsewhere keep working.
+Target.__new__.__defaults__ = (None,)
 
-EMPTY = Target(None, None, None, "", "none")
+EMPTY = Target(None, None, None, "", "none", None)
 
 
 class _GUITHREADINFO(ctypes.Structure):
@@ -269,7 +274,49 @@ _RANGES_GET_ELEMENT = 4
 # IUIAutomationTextRange
 _RANGE_CLONE = 3
 _RANGE_EXPAND_TO_ENCLOSING_UNIT = 6
+_RANGE_GET_ATTRIBUTE_VALUE = 9
 _RANGE_GET_BOUNDING_RECTANGLES = 10
+
+# Text attributes at the caret, for drawing ghost text that looks like it
+# belongs in the document rather than pasted on top of it. Both are routinely
+# unsupported -- an application that answers "mixed" or "not supported" hands
+# back a reserved sentinel object rather than a value -- so both are strictly
+# best effort and the caller has a fallback for each.
+_UIA_FONT_NAME_ATTR = 40005
+_UIA_FONT_SIZE_ATTR = 40006
+
+# The VARIANT tags worth reading. Anything else (including the VT_UNKNOWN
+# sentinels above) is ignored.
+_VT_I4 = 3
+_VT_R4 = 4
+_VT_R8 = 5
+_VT_BSTR = 8
+
+
+class _VARIANT(ctypes.Structure):
+    """Just enough VARIANT to read a string or a number out of one.
+
+    The real thing is a large union; only the members below are ever touched,
+    and the padding keeps the struct the size the callee expects to write into
+    (24 bytes on x64, 16 on x86).
+    """
+
+    class _Value(ctypes.Union):
+        _fields_ = [
+            ("lVal", ctypes.c_long),
+            ("fltVal", ctypes.c_float),
+            ("dblVal", ctypes.c_double),
+            ("bstrVal", ctypes.c_void_p),
+            ("_pad", ctypes.c_byte * 16),
+        ]
+
+    _fields_ = [
+        ("vt", ctypes.c_ushort),
+        ("wReserved1", ctypes.c_ushort),
+        ("wReserved2", ctypes.c_ushort),
+        ("wReserved3", ctypes.c_ushort),
+        ("value", _Value),
+    ]
 
 
 class _GUID(ctypes.Structure):
@@ -294,6 +341,8 @@ try:
 
     _oleaut32.SysFreeString.restype = None
     _oleaut32.SysFreeString.argtypes = [_PVOID]
+    _oleaut32.VariantClear.restype = ctypes.c_long
+    _oleaut32.VariantClear.argtypes = [_PVOID]
     _oleaut32.SafeArrayGetLBound.restype = ctypes.c_long
     _oleaut32.SafeArrayGetLBound.argtypes = [
         _PVOID, ctypes.c_uint, ctypes.POINTER(ctypes.c_long)]
@@ -451,21 +500,21 @@ class _UIAutomation:
             self._client = None
 
     def focused(self):
-        """(caret, field, name) for the element with focus. Any may be None/"".
+        """(caret, field, name, style) for the focused element; any may be None.
 
         Must be called while the target still *has* focus -- once the Capture
         Box is up, the focused element is our own text area.
         """
         if not self._ensure_client():
-            return None, None, ""
+            return None, None, "", None
 
         element = _PVOID()
         if _call(self._client, _GET_FOCUSED_ELEMENT,
                  _out(element)) < 0 or not element.value:
-            return None, None, ""
+            return None, None, "", None
         try:
-            return (self._caret(element), self._bounds(element),
-                    self._name(element))
+            caret, style = self._caret(element)
+            return caret, self._bounds(element), self._name(element), style
         finally:
             _release(element)
 
@@ -484,7 +533,7 @@ class _UIAutomation:
         return bounds if bounds[2] > 0 and bounds[3] > 0 else None
 
     def _caret(self, element):
-        """The insertion point inside `element`, from its TextPattern.
+        """(insertion point, text style) inside `element`, from its TextPattern.
 
         The selection of a text control with nothing selected is a collapsed
         range, and a collapsed range's bounding rectangle is -- reasonably
@@ -497,21 +546,21 @@ class _UIAutomation:
         pattern = _PVOID()
         if _call(element, _ELEM_GET_CURRENT_PATTERN, ctypes.c_int(_UIA_TEXT_PATTERN),
                  _out(pattern)) < 0 or not pattern.value:
-            return None
+            return None, None
         try:
             ranges = _PVOID()
             if _call(pattern, _TEXT_GET_SELECTION,
                      _out(ranges)) < 0 or not ranges.value:
-                return None
+                return None, None
             try:
                 length = ctypes.c_int()
                 if _call(ranges, _RANGES_GET_LENGTH,
                          _out(length)) < 0 or length.value < 1:
-                    return None
+                    return None, None
                 selection = _PVOID()
                 if _call(ranges, _RANGES_GET_ELEMENT, ctypes.c_int(0),
                          _out(selection)) < 0 or not selection.value:
-                    return None
+                    return None, None
                 try:
                     return self._range_rect(selection)
                 finally:
@@ -522,39 +571,88 @@ class _UIAutomation:
             _release(pattern)
 
     def _range_rect(self, selection):
+        """(rect, style) for the character the collapsed selection sits on."""
         clone = _PVOID()
         if _call(selection, _RANGE_CLONE,
                  _out(clone)) < 0 or not clone.value:
-            return None
+            return None, None
         try:
             _call(clone, _RANGE_EXPAND_TO_ENCLOSING_UNIT,
                   ctypes.c_int(_TEXT_UNIT_CHARACTER))
+            # Read before the rectangles: both come from the same expanded
+            # range, and the style is what makes ghost text drawn at that
+            # rectangle look like it belongs there.
+            style = self._range_style(clone)
             array = _PVOID()
             if _call(clone, _RANGE_GET_BOUNDING_RECTANGLES,
                      _out(array)) < 0:
-                return None
+                return None, style
             rects = _rects_from_safearray(array.value)
             if not rects:
-                return None
+                return None, style
             # The first line of the range. A range expanded over one character
             # is one line by construction, but a caret sitting on a wrap point
             # can report the end of one line and the start of the next.
             caret = rects[0]
-            return caret if _sane_caret(caret) else None
+            return (caret if _sane_caret(caret) else None), style
         finally:
             _release(clone)
+
+    def _range_style(self, text_range):
+        """(font family, size in points) for `text_range`, or None.
+
+        Both halves are optional and either can come back missing: an
+        application that has no opinion, or whose range spans more than one
+        font, returns a reserved sentinel rather than a value. None means
+        "draw it however you like", which is what ghost_text.py falls back to.
+        """
+        family = self._attribute(text_range, _UIA_FONT_NAME_ATTR)
+        size = self._attribute(text_range, _UIA_FONT_SIZE_ATTR)
+        if not family and not size:
+            return None
+        return (family or None, size or None)
+
+    def _attribute(self, text_range, attribute_id: int):
+        """One text attribute as a str or float, or None if it is not a value."""
+        variant = _VARIANT()
+        if _call(text_range, _RANGE_GET_ATTRIBUTE_VALUE,
+                 ctypes.c_int(attribute_id), _out(variant)) < 0:
+            return None
+        try:
+            tag = variant.vt
+            if tag == _VT_BSTR:
+                # Read, but do not free: VariantClear below owns the string.
+                return ctypes.c_wchar_p(variant.value.bstrVal).value or None
+            if tag == _VT_R8:
+                return float(variant.value.dblVal)
+            if tag == _VT_R4:
+                return float(variant.value.fltVal)
+            if tag == _VT_I4:
+                return float(variant.value.lVal)
+            # VT_UNKNOWN (the "not supported" / "mixed" sentinels), VT_EMPTY,
+            # or anything else this does not need.
+            return None
+        finally:
+            _oleaut32.VariantClear(_out(variant))
 
 
 _uia = _UIAutomation()
 
 
-def locate(hwnd) -> Target:
+def locate(hwnd, want_style: bool = False) -> Target:
     """Find where text sent to `hwnd` right now would land.
 
     Call this while `hwnd` still has the foreground -- at the top of a
     capture, before the Capture Box appears. Everything afterwards goes
     through refresh(), which cannot ask the target anything but also cannot
     stall.
+
+    `want_style` asks for the font at the caret as well, which only UI
+    Automation can answer. Without it the cheap rung short-circuits the whole
+    COM path whenever it finds a caret, so the font comes back None -- fine
+    for the marker, which does not draw text, and not fine for ghost text,
+    which has to be set in the document's own face. It is a parameter rather
+    than always-on because it turns a free lookup into a cross-process call.
     """
     if not _AVAILABLE or not hwnd or not _user32.IsWindow(hwnd):
         return EMPTY
@@ -564,20 +662,29 @@ def locate(hwnd) -> Target:
 
     # The cheap rung first, so a Win32 target never pays for a COM call.
     info = _gui_thread_info(hwnd)
-    caret = _caret_from_gui_thread(info)
+    classic_caret = _caret_from_gui_thread(info)
+    caret = classic_caret
     field = None
     name = ""
+    style = None
 
-    if caret is None and _uia.available:
+    if (classic_caret is None or want_style) and _uia.available:
         started = time.monotonic()
         try:
-            caret, field, name = _uia.focused()
+            uia_caret, field, name, style = _uia.focused()
         except OSError:
             logger.exception("UI Automation raised while locating the caret.")
-            caret, field, name = None, None, ""
+            uia_caret, field, name, style = None, None, "", None
         elapsed = time.monotonic() - started
         if elapsed > UIA_BUDGET:
             _uia.disable(f"an acquisition took {elapsed:.1f}s")
+        # When both rungs answer, the caller's purpose decides which wins.
+        # The classic caret is the real one the application blinks, so it is
+        # the better *position*; UI Automation's is the character cell, whose
+        # height is the line box -- which is the leading ghost text has to
+        # advance by, and which a bare caret is often shorter than.
+        if uia_caret is not None and (classic_caret is None or want_style):
+            caret = uia_caret
 
     if field is None and info is not None and info.hwndFocus:
         # The focused control's own window rectangle. Only a real answer for
@@ -602,9 +709,9 @@ def locate(hwnd) -> Target:
     else:
         source = "none"
 
-    target = Target(caret, field, window, label, source)
-    logger.debug("Target for 0x%X: %s via %s (caret=%s field=%s)",
-                 hwnd, label or "<untitled>", source, caret, field)
+    target = Target(caret, field, window, label, source, style)
+    logger.debug("Target for 0x%X: %s via %s (caret=%s field=%s style=%s)",
+                 hwnd, label or "<untitled>", source, caret, field, style)
     return target
 
 
@@ -650,7 +757,7 @@ def refresh(target: Target, hwnd) -> Target:
     if source == "lost":
         # The window came back -- a minimised target restored, most likely.
         source = "caret" if caret else ("field" if field else "window")
-    return Target(caret, field, window, target.label, source)
+    return Target(caret, field, window, target.label, source, target.style)
 
 
 def _shifted(rect, dx: int, dy: int):

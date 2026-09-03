@@ -1,4 +1,4 @@
-import copy
+﻿import copy
 import json
 import os
 from PySide6.QtWidgets import (
@@ -173,6 +173,11 @@ DEFAULT_SETTINGS = {
     # mouse. Only possible now that the caret is located at all, and only
     # takes effect when it was found -- see caret_target.py.
     "capture_follow_caret": True,
+    # Paint the transcript at the caret as it is spoken, in the target's own
+    # font -- see ghost_text.py. Nothing is typed into the target; it is a
+    # drawing over it. Only ever runs for a capture with a real caret, and
+    # slims the Capture Box to its meter and buttons while it does.
+    "capture_ghost_text": True,
     "capture_font_size": DEFAULT_FONT_SIZE_PX,
     # Empty means the system UI font.
     "capture_font_family": DEFAULT_FONT_FAMILY,
@@ -422,6 +427,13 @@ class SettingsWindow(QWidget):
         self.capture_follow_caret_checkbox.setToolTip(
             "Put the Capture Box next to the text caret when it can be found. "
             "Falls back to the mouse pointer otherwise.")
+        self.capture_ghost_text_checkbox = QCheckBox(
+            "Preview the words at the caret as you speak")
+        self.capture_ghost_text_checkbox.setToolTip(
+            "Draw the transcript at the insertion point in the target's own "
+            "font, greyed, while you dictate. Nothing is typed into the app — "
+            "it is drawn over it — so cancelling leaves no trace. Needs an "
+            "exact caret, and slims the Capture Box to its meter and buttons.")
         self.auto_start_server_checkbox = QCheckBox(
             "Start the WhisperLive server automatically (Docker)")
         self.auto_start_server_checkbox.setToolTip(
@@ -493,6 +505,7 @@ class SettingsWindow(QWidget):
         target_column.setContentsMargins(0, 0, 0, 0)
         target_column.addWidget(self.capture_show_target_checkbox)
         target_column.addWidget(self.capture_follow_caret_checkbox)
+        target_column.addWidget(self.capture_ghost_text_checkbox)
         form_layout.addRow(QLabel("Paste Target:"), target_column)
         server_start_column = QVBoxLayout()
         server_start_column.setContentsMargins(0, 0, 0, 0)
@@ -972,6 +985,8 @@ class SettingsWindow(QWidget):
             "capture_show_target", DEFAULT_SETTINGS["capture_show_target"])))
         self.capture_follow_caret_checkbox.setChecked(bool(settings.get(
             "capture_follow_caret", DEFAULT_SETTINGS["capture_follow_caret"])))
+        self.capture_ghost_text_checkbox.setChecked(bool(settings.get(
+            "capture_ghost_text", DEFAULT_SETTINGS["capture_ghost_text"])))
         self.auto_start_server_checkbox.setChecked(
             settings.get("auto_start_server", DEFAULT_SETTINGS["auto_start_server"]))
         self.start_docker_desktop_checkbox.setChecked(
@@ -1085,6 +1100,7 @@ class SettingsWindow(QWidget):
             "final_pass": self.final_pass_checkbox.isChecked(),
             "capture_show_target": self.capture_show_target_checkbox.isChecked(),
             "capture_follow_caret": self.capture_follow_caret_checkbox.isChecked(),
+            "capture_ghost_text": self.capture_ghost_text_checkbox.isChecked(),
             "auto_start_server": self.auto_start_server_checkbox.isChecked(),
             "start_docker_desktop": self.start_docker_desktop_checkbox.isChecked(),
             "server_use_gpu": self.server_use_gpu_checkbox.isChecked(),

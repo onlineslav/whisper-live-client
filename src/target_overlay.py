@@ -213,18 +213,19 @@ def apply_mapping(mapping, rect) -> QRectF:
                   rect[2] / ratio, rect[3] / ratio)
 
 
-def caret_anchor(caret):
-    """The bottom-left of a physical caret rectangle, as a Qt screen point.
+def anchor_below(rect):
+    """The bottom-left of a physical rectangle, as a Qt screen point.
 
-    What the Capture Box hangs from when it is following the caret rather
-    than the mouse: the box opens below and to the right of its anchor, so
-    anchoring at the bottom of the caret puts it under the line being typed
-    instead of over it. None for a caret that was never found.
+    What the Capture Box hangs from: it opens below and to the right of its
+    anchor, so the bottom-left of a thing is "just under that thing". Given
+    the caret, the box lands under the line being typed; given the field, it
+    lands under the whole control, which is where it goes when ghost text is
+    using the space in between. None for a rectangle that was never found.
     """
-    if not caret:
+    if not rect:
         return None
-    rect = apply_mapping(mapping_for((caret[0], caret[1])), caret)
-    return QPoint(int(rect.left()), int(rect.bottom()))
+    box = apply_mapping(mapping_for((rect[0], rect[1])), rect)
+    return QPoint(int(box.left()), int(box.bottom()))
 
 
 class TargetOverlay(QWidget):
@@ -255,6 +256,9 @@ class TargetOverlay(QWidget):
         self._map = (0, 0, 0, 0, 1.0)
         self._flash_started = 0.0
         self._shown_at = 0.0
+        # Cleared while ghost text is drawing its own words at the caret --
+        # see set_caret_visible.
+        self._caret_visible = True
 
         self._timer = QTimer(self)
         self._timer.setInterval(FRAME_MS)
@@ -269,6 +273,23 @@ class TargetOverlay(QWidget):
             self._accent = chosen
             if self.isVisible():
                 self.update()
+
+    def set_caret_visible(self, visible: bool):
+        """Draw the caret bar, or leave that spot to something else.
+
+        Turned off when ghost text is showing: it paints the transcript
+        starting at the very pixel the bar stands on, so the two overlap and
+        the bar ends up struck through the first letter. The words are the
+        better marker of the two once they exist, and the field outline still
+        says which control they are going into.
+        """
+        visible = bool(visible)
+        if visible == self._caret_visible:
+            return
+        self._caret_visible = visible
+        self._sync_timer()
+        if self.isVisible():
+            self.update()
 
     def show_target(self, target):
         """Show the marker for `target`, opening with the flash."""
@@ -405,7 +426,8 @@ class TargetOverlay(QWidget):
             self._timer.stop()
             return
         flashing = time.monotonic() - self._flash_started < FLASH_MS / 1000.0
-        pulsing = self._target.caret is not None and self._target.source != "lost"
+        pulsing = (self._target.caret is not None and self._caret_visible
+                   and self._target.source != "lost")
         if flashing or pulsing:
             if not self._timer.isActive():
                 self._timer.start()
@@ -460,7 +482,7 @@ class TargetOverlay(QWidget):
         elif target.window is not None and target.caret is None:
             self._paint_window(painter, self._to_local(target.window), emphasis)
 
-        if target.caret is not None:
+        if target.caret is not None and self._caret_visible:
             self._paint_caret(painter, self._to_local(target.caret), emphasis)
 
     def _paint_field(self, painter: QPainter, rect: QRectF, emphasis: float):

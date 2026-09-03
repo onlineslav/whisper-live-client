@@ -21,6 +21,7 @@ import server_manager
 import caret_target
 import target_overlay
 from target_overlay import TargetOverlay
+from ghost_text import GhostText
 from server_manager import ServerManager
 from transcript import Transcript
 from final_pass import FinalPass, BYTES_PER_SECOND, MAX_REPLAY_SECONDS, TIMEOUT_MS as FINAL_PASS_TIMEOUT_MS
@@ -172,6 +173,9 @@ class WhisperTypeApp:
         # on it. Resolved once per capture while the target still has focus --
         # see _record_paste_target.
         self._paste_target = None
+        # True while this capture is previewing its words at the caret, which
+        # is also what decides whether the Capture Box runs slimmed down.
+        self._ghosting = False
 
         # Load settings
         self.load_settings()
@@ -189,6 +193,7 @@ class WhisperTypeApp:
             self.settings.get("capture_grow_to_fit", DEFAULT_SETTINGS["capture_grow_to_fit"]))
         self.capture_box.set_meter_style(self.settings["capture_meter_style"])
         self.target_overlay = TargetOverlay()
+        self.ghost_text = GhostText()
         self._apply_capture_appearance()
 
         # Core Components
@@ -378,6 +383,11 @@ class WhisperTypeApp:
         "Connecting..." indefinitely, with no way to tell a slow model load
         from a Docker daemon that is never going to come up.
         """
+        # A slimmed box has no transcript area to say this in, and "waiting on
+        # Docker" is exactly the message that must not be invisible. The box
+        # goes back to full height for as long as it has status to report, and
+        # _begin_streaming slims it again once there is a transcript instead.
+        self.capture_box.set_compact(False)
         if detail:
             self.capture_box.set_text(f"{label}\u2026\n{detail}")
         else:
@@ -700,7 +710,11 @@ class WhisperTypeApp:
             # placeholder rather than blanking it, and leaves toPlainText()
             # empty so confirming without speaking pastes nothing.
             if full_text:
+                # The box is fed even while it is slimmed down and hiding its
+                # transcript: confirming reads the text back out of it.
                 self.capture_box.set_text(full_text)
+                if self._ghosting:
+                    self.ghost_text.set_text(full_text)
                 self.logger.debug("Updated capture text (%d chars).", len(full_text))
             else:
                 self.logger.debug("Message received but no text found: %s", message)
@@ -725,6 +739,10 @@ class WhisperTypeApp:
             payload_log.log_event("capture_start")
             # Record the target window now, before the Capture Box steals focus.
             self._record_paste_target()
+            # Ghost first: whether it could be shown decides both what the
+            # marker draws and how much of the box is needed.
+            self._ghosting = self._start_ghost_text()
+            self.capture_box.set_compact(self._ghosting)
             # Before the box, so the flash is already running when the box
             # fades in over it rather than starting after it has settled.
             self._show_target_marker()
@@ -787,12 +805,41 @@ class WhisperTypeApp:
             # nothing to spend a UI Automation round trip on.
             return
         try:
-            self._paste_target = caret_target.locate(self._prev_foreground_hwnd)
+            # The font at the caret is only worth a COM call when something is
+            # going to draw text in it.
+            self._paste_target = caret_target.locate(
+                self._prev_foreground_hwnd,
+                want_style=self.settings.get(
+                    "capture_ghost_text", DEFAULT_SETTINGS["capture_ghost_text"]))
         except Exception:
             # Never at the cost of the capture itself: a marker that cannot be
             # worked out is a missing marker, not a dictation that does not
             # start.
             self.logger.exception("Could not locate the paste target.")
+
+    def _start_ghost_text(self) -> bool:
+        """Open the ghost layer, if this capture is precise enough for it.
+
+        True when it is showing, which is also the signal to slim the Capture
+        Box: the words are being drawn at the caret, so the box repeating them
+        would be saying the same thing twice while covering the document.
+        """
+        if not self.settings.get("capture_ghost_text",
+                                 DEFAULT_SETTINGS["capture_ghost_text"]):
+            return False
+        if not self.ghost_text.can_show(self._paste_target):
+            return False
+        try:
+            return self.ghost_text.show_for(self._paste_target)
+        except Exception:
+            self.logger.exception("Could not show the ghost text.")
+            return False
+
+    def _hide_ghost_text(self):
+        try:
+            self.ghost_text.dismiss()
+        except Exception:
+            self.logger.exception("Could not dismiss the ghost text.")
 
     def _show_target_marker(self):
         """Put the marker up for the capture that is starting."""
@@ -802,14 +849,19 @@ class WhisperTypeApp:
         if self._paste_target is None or self._paste_target.source == "none":
             return
         try:
+            # The ghost paints its first word on the exact pixel the caret bar
+            # stands on, so only one of the two may draw there.
+            self.target_overlay.set_caret_visible(not self.ghost_text.isVisible())
             self.target_overlay.show_target(self._paste_target)
             self._target_timer.start()
         except Exception:
             self.logger.exception("Could not show the target marker.")
 
     def _hide_target_marker(self):
-        """Take the marker down. Safe whether or not it ever went up."""
+        """Take the marker and the ghost down. Safe if neither went up."""
         self._target_timer.stop()
+        self._ghosting = False
+        self._hide_ghost_text()
         try:
             self.target_overlay.dismiss()
         except Exception:
@@ -830,21 +882,31 @@ class WhisperTypeApp:
             self._paste_target = caret_target.refresh(
                 self._paste_target, self._prev_foreground_hwnd)
             self.target_overlay.update_target(self._paste_target)
+            if self._ghosting:
+                self.ghost_text.retarget(self._paste_target)
         except Exception:
             self.logger.exception("Could not refresh the target marker.")
             self._hide_target_marker()
 
     def _capture_anchor(self):
-        """Where the Capture Box should open, or None for beside the mouse."""
+        """Where the Capture Box should open, or None for beside the mouse.
+
+        Under the caret normally. Under the whole field while ghost text is
+        showing, because the space just below the caret is where the ghost is
+        about to write -- a box anchored there would cover the words it exists
+        to stop duplicating.
+        """
         if not self.settings.get("capture_follow_caret",
                                  DEFAULT_SETTINGS["capture_follow_caret"]):
             return None
         if self._paste_target is None:
             return None
         try:
-            return target_overlay.caret_anchor(self._paste_target.caret)
+            if self._ghosting and self._paste_target.field is not None:
+                return target_overlay.anchor_below(self._paste_target.field)
+            return target_overlay.anchor_below(self._paste_target.caret)
         except Exception:
-            self.logger.exception("Could not derive a caret anchor.")
+            self.logger.exception("Could not derive a capture anchor.")
             return None
 
     def _begin_streaming(self):
@@ -852,6 +914,11 @@ class WhisperTypeApp:
         # Empty text => the box shows its "Listening..." placeholder, while
         # toPlainText() stays "" so confirming without speaking pastes nothing.
         self.capture_box.set_text("")
+        # Back to a strip, if this capture is ghosting: any status message
+        # that widened the box has served its purpose once audio is flowing.
+        self.capture_box.set_compact(self._ghosting)
+        if self._ghosting:
+            self.ghost_text.set_text("")
         # Drop the last capture's words before any of this one arrive.
         self._transcript.reset()
         self._capture_audio.clear()

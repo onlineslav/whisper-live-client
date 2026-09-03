@@ -573,6 +573,10 @@ class CaptureBox(QWidget):
 
         self.setMinimumWidth(420)
         self.setMaximumWidth(720)
+        # See set_compact. The full width is restored whenever it is turned
+        # back off, so the two are kept rather than recomputed.
+        self._full_min_width = 420
+        self._compact = False
 
         # Connections
         self.confirm_button.clicked.connect(self.on_confirm)
@@ -622,6 +626,37 @@ class CaptureBox(QWidget):
             # app the paste is heading for, from being read as a cancel.
             self._closing = True
         self.confirm_button.set_busy(busy)
+
+    def set_compact(self, compact: bool):
+        """Hide the transcript area, leaving the meter and the two buttons.
+
+        For captures where ghost text is showing the words at the caret
+        instead. The box would otherwise be saying the same thing twice, in
+        two places, and the transcript area is nearly all of its height --
+        which is height spent covering the document being dictated into.
+
+        What is left still has a job: the meter is the only proof the
+        microphone is being heard, and Confirm/Cancel are the controls. So the
+        box shrinks rather than disappearing.
+        """
+        compact = bool(compact)
+        if compact == self._compact:
+            return
+        self._compact = compact
+        self.text_area.setVisible(not compact)
+        if compact:
+            # The meter and two buttons need far less than the transcript's
+            # minimum, and leaving it at 420 would pad the strip with empty
+            # space the frost then has to be photographed for.
+            self.setMinimumWidth(0)
+        else:
+            self.setMinimumWidth(self._full_min_width)
+        # The box was sized for the other mode; let it shrink as well as grow.
+        self.adjustSize()
+        self.resize(self.sizeHint())
+
+    def is_compact(self) -> bool:
+        return self._compact
 
     def set_level_db(self, db: float):
         """Feed the meter a raw chunk level in dBFS."""
@@ -1053,7 +1088,10 @@ class CaptureBox(QWidget):
         Past the ceiling the field stops growing and scrolls, which is the
         same box the setting was turned off for.
         """
-        if not self._grow_to_fit:
+        if not self._grow_to_fit or self._compact:
+            # Compact: the transcript widget is hidden and still being filled
+            # (confirm reads it back), so sizing the box to text nobody can
+            # see would grow a strip that is meant to stay a strip.
             return
         document = self.text_area.document()
         # A document only knows its height once it knows its width, and the
