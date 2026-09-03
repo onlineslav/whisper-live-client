@@ -173,9 +173,12 @@ Other good options:
     finished transcript, which is usually punctuated a little differently — see
     the note about the final pass below.
 
-    Two things to know. Each revision is a separate undo step in the target
-    application, so undoing right after a dictation may take a few presses. And
-    an editor with aggressive autocorrect can fight the inserted text.
+    Two things to know. **Undo works, in one press**: `Ctrl+Z` after a
+    dictation puts the document back exactly as it was. Pressing it a second
+    time is where it gets untidy — instead of continuing further back, it
+    brings the half-finished versions of your sentence back for a few presses
+    before returning to where the first press had already got you. And an
+    editor with aggressive autocorrect can fight the inserted text.
 
     Turn it off with **Settings → Paste Target → Type the words into the app as
     you speak**, and the full transcript box comes back.

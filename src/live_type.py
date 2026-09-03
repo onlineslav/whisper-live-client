@@ -67,9 +67,14 @@ first insertion of every capture is checked -- if the caret did not move,
 nothing arrived, and live typing stands down for that capture having touched
 nothing.
 
-It is still, unavoidably, real editing. Every revision is an undo step in the
-target application, and an editor with autocorrect or autocomplete may fight
-the inserted text. Those are the costs of the text being real.
+It is still, unavoidably, real editing, and it leaves a mark on the target's
+undo history. Measured in Notepad: one Ctrl+Z after a confirmed dictation
+restores the document to exactly its pre-dictation state, which is the case
+that matters and costs one press. Pressing again does not continue past it --
+it brings the intermediate revisions back, and takes several more presses to
+return to where one press had already arrived. So undo is correct but not
+clean, and an editor with autocorrect or autocomplete may fight the inserted
+text besides. Those are the costs of the text being real.
 """
 
 import logging
