@@ -45,6 +45,7 @@ KEYEVENTF_UNICODE = 0x0004
 
 VK_CONTROL = 0x11
 VK_V = 0x56
+VK_BACK = 0x08
 
 # Left/right halves are probed separately: GetAsyncKeyState(VK_CONTROL) reports
 # the merged state, but a keyup has to name the side that is actually down.
@@ -127,6 +128,9 @@ try:
 
     _user32.SendInput.restype = wintypes.UINT
     _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+    _user32.PostMessageW.restype = wintypes.BOOL
+    _user32.PostMessageW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     _user32.MapVirtualKeyW.restype = wintypes.UINT
     _user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
     _user32.GetAsyncKeyState.restype = ctypes.c_short
@@ -292,6 +296,111 @@ def send_ctrl_v() -> bool:
         _key_event(VK_V, up=True),
         _key_event(VK_CONTROL, up=True),
     ])
+
+
+# Posted-message text entry, for the live preview.
+#
+# SendInput is the right tool for a one-shot Ctrl+V into another application:
+# it goes through the real input queue, so the target cannot tell it from
+# typing. That same property is what makes it the wrong tool for typing a
+# transcript as it is spoken. Every low-level keyboard hook installed anywhere
+# on the desktop is called synchronously for every event before SendInput
+# returns, and a desktop with PowerToys, a launcher and a hotkey daemon on it
+# has several. Measured here: 960 microseconds per event, against a few
+# microseconds with no hooks. A sentence is a few hundred events, so it spends
+# a quarter of a second inside the hook chain -- past Windows'
+# LowLevelHooksTimeout, at which point events are dropped, and a remapping
+# hook such as PowerToys' Keyboard Manager re-injects others. That is where
+# the lost and repeated characters came from: "meeting" arriving as "ng", or
+# thirty d's where one belonged. It failed about half the time.
+#
+# A posted WM_CHAR never enters the hook chain -- it goes straight onto the
+# target window's message queue. Measured at 0.02 milliseconds per character
+# and correct in every trial. The cost is that it is not real input: an
+# application that does its text entry somewhere other than WM_CHAR will
+# ignore it silently, which is why live_type.py checks that the caret actually
+# moved before trusting it.
+WM_CHAR = 0x0102
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+
+# lParam for a posted key message: repeat count 1, the key's scan code in bits
+# 16-23, and for the key-up the transition and previous-state bits set. Some
+# controls read the scan code out of here, and a few check the transition bit
+# to tell a press from a release.
+_BACKSPACE_SCAN = 0x0E
+_KEYDOWN_LPARAM = 0x00000001 | (_BACKSPACE_SCAN << 16)
+_KEYUP_LPARAM = _KEYDOWN_LPARAM | 0xC0000000
+
+
+def post_text(hwnd, text: str) -> bool:
+    """Insert `text` at `hwnd`'s caret by posting WM_CHAR. See the note above.
+
+    Returns False only if the messages could not be posted at all. A window
+    that accepts the messages and does nothing with them still returns True,
+    so the caller has to confirm the text actually arrived by other means.
+    """
+    if not _AVAILABLE or not hwnd or not text:
+        return False
+    for char in text:
+        point = ord(char)
+        if point <= 0xFFFF:
+            units = [point]
+        else:
+            # Outside the BMP: WM_CHAR carries UTF-16, so the pair goes as two
+            # messages and the receiver recombines them.
+            units = [0xD800 + ((point - 0x10000) >> 10),
+                     0xDC00 + ((point - 0x10000) & 0x3FF)]
+        for unit in units:
+            if not _user32.PostMessageW(hwnd, WM_CHAR, unit, 1):
+                logger.warning("PostMessage(WM_CHAR) failed (error %d).",
+                               ctypes.get_last_error())
+                return False
+    return True
+
+
+def post_backspaces(hwnd, count: int) -> bool:
+    """Post `count` Backspace key messages to `hwnd`.
+
+    The counterpart to post_text, and posted for the same reason: a preview
+    put in without touching the input queue has to come out the same way, or
+    the removal is slow and lossy where the insertion was neither.
+    """
+    if not _AVAILABLE or not hwnd or count <= 0:
+        return False
+    for _ in range(count):
+        if not _user32.PostMessageW(hwnd, WM_KEYDOWN, VK_BACK, _KEYDOWN_LPARAM):
+            return False
+        _user32.PostMessageW(hwnd, WM_KEYUP, VK_BACK, _KEYUP_LPARAM)
+    return True
+
+
+def send_backspaces(count: int) -> bool:
+    """Inject `count` Backspace presses into whatever window has focus.
+
+    Used to take back text typed as a live preview when the server revises
+    its guess -- see live_type.py, which is also where the reason this is
+    dangerous in the wrong window is written down. This function does no
+    checking of its own: Backspace where the focus is not a text field is
+    Back in a browser, and deciding that it is safe to send is the caller's
+    job, not this one's.
+    """
+    if not _AVAILABLE or count <= 0:
+        return False
+
+    events = []
+    for _ in range(count):
+        events.append(_key_event(VK_BACK, up=False))
+        events.append(_key_event(VK_BACK, up=True))
+
+    # Chunked exactly as type_text is, and for the same reason: a very large
+    # batch can overrun the target's input queue and lose the tail, which here
+    # would leave characters behind that we believe were removed.
+    for start in range(0, len(events), 200):
+        if not _send(events[start:start + 200]):
+            return False
+        time.sleep(0.001)
+    return True
 
 
 def type_text(text: str) -> bool:

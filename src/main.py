@@ -1,4 +1,4 @@
-import copy
+﻿import copy
 import ctypes
 import sys
 import json
@@ -21,7 +21,7 @@ import server_manager
 import caret_target
 import target_overlay
 from target_overlay import TargetOverlay
-from ghost_text import GhostText
+from live_type import LiveTyper
 from server_manager import ServerManager
 from transcript import Transcript
 from final_pass import FinalPass, BYTES_PER_SECOND, MAX_REPLAY_SECONDS, TIMEOUT_MS as FINAL_PASS_TIMEOUT_MS
@@ -193,7 +193,7 @@ class WhisperTypeApp:
             self.settings.get("capture_grow_to_fit", DEFAULT_SETTINGS["capture_grow_to_fit"]))
         self.capture_box.set_meter_style(self.settings["capture_meter_style"])
         self.target_overlay = TargetOverlay()
-        self.ghost_text = GhostText()
+        self.live_typer = LiveTyper()
         self._apply_capture_appearance()
 
         # Core Components
@@ -714,7 +714,7 @@ class WhisperTypeApp:
                 # transcript: confirming reads the text back out of it.
                 self.capture_box.set_text(full_text)
                 if self._ghosting:
-                    self.ghost_text.set_text(full_text)
+                    self.live_typer.update(full_text)
                 self.logger.debug("Updated capture text (%d chars).", len(full_text))
             else:
                 self.logger.debug("Message received but no text found: %s", message)
@@ -739,10 +739,12 @@ class WhisperTypeApp:
             payload_log.log_event("capture_start")
             # Record the target window now, before the Capture Box steals focus.
             self._record_paste_target()
-            # Ghost first: whether it could be shown decides both what the
-            # marker draws and how much of the box is needed.
-            self._ghosting = self._start_ghost_text()
+            # Live typing first: whether it started decides how much of the
+            # box is needed, whether the box may take the keyboard, and what
+            # the marker draws.
+            self._ghosting = self._start_live_typing()
             self.capture_box.set_compact(self._ghosting)
+            self.capture_box.set_passive(self._ghosting)
             # Before the box, so the flash is already running when the box
             # fades in over it rather than starting after it has settled.
             self._show_target_marker()
@@ -810,36 +812,40 @@ class WhisperTypeApp:
             self._paste_target = caret_target.locate(
                 self._prev_foreground_hwnd,
                 want_style=self.settings.get(
-                    "capture_ghost_text", DEFAULT_SETTINGS["capture_ghost_text"]))
+                    "capture_live_typing", DEFAULT_SETTINGS["capture_live_typing"]))
         except Exception:
             # Never at the cost of the capture itself: a marker that cannot be
             # worked out is a missing marker, not a dictation that does not
             # start.
             self.logger.exception("Could not locate the paste target.")
 
-    def _start_ghost_text(self) -> bool:
-        """Open the ghost layer, if this capture is precise enough for it.
+    def _start_live_typing(self) -> bool:
+        """Begin typing the transcript into the target, if it qualifies.
 
-        True when it is showing, which is also the signal to slim the Capture
-        Box: the words are being drawn at the caret, so the box repeating them
-        would be saying the same thing twice while covering the document.
+        True when it is running, which is also the signal to slim the Capture
+        Box and stop it taking the keyboard: the words are going into the
+        document itself, so the box has no transcript to show and the target
+        must keep focus for the keystrokes to reach it.
         """
-        if not self.settings.get("capture_ghost_text",
-                                 DEFAULT_SETTINGS["capture_ghost_text"]):
-            return False
-        if not self.ghost_text.can_show(self._paste_target):
+        if not self.settings.get("capture_live_typing",
+                                 DEFAULT_SETTINGS["capture_live_typing"]):
             return False
         try:
-            return self.ghost_text.show_for(self._paste_target)
+            return self.live_typer.begin(self._paste_target,
+                                         self._prev_foreground_hwnd)
         except Exception:
-            self.logger.exception("Could not show the ghost text.")
+            self.logger.exception("Could not start live typing.")
             return False
 
-    def _hide_ghost_text(self):
+    def _undo_live_typing(self):
+        """Take back the preview text, wherever the capture is going next."""
         try:
-            self.ghost_text.dismiss()
+            if self.live_typer.typed:
+                self.live_typer.clear()
         except Exception:
-            self.logger.exception("Could not dismiss the ghost text.")
+            self.logger.exception("Could not remove the live-typed preview.")
+        finally:
+            self.live_typer.reset()
 
     def _show_target_marker(self):
         """Put the marker up for the capture that is starting."""
@@ -849,19 +855,19 @@ class WhisperTypeApp:
         if self._paste_target is None or self._paste_target.source == "none":
             return
         try:
-            # The ghost paints its first word on the exact pixel the caret bar
-            # stands on, so only one of the two may draw there.
-            self.target_overlay.set_caret_visible(not self.ghost_text.isVisible())
+            # The application's own caret is moving along with the typed text
+            # while live typing runs, so a second marker sitting where the
+            # caret started is worse than none. The field outline stays.
+            self.target_overlay.set_caret_visible(not self._ghosting)
             self.target_overlay.show_target(self._paste_target)
             self._target_timer.start()
         except Exception:
             self.logger.exception("Could not show the target marker.")
 
     def _hide_target_marker(self):
-        """Take the marker and the ghost down. Safe if neither went up."""
+        """Take the marker down. Safe whether or not it ever went up."""
         self._target_timer.stop()
         self._ghosting = False
-        self._hide_ghost_text()
         try:
             self.target_overlay.dismiss()
         except Exception:
@@ -882,8 +888,6 @@ class WhisperTypeApp:
             self._paste_target = caret_target.refresh(
                 self._paste_target, self._prev_foreground_hwnd)
             self.target_overlay.update_target(self._paste_target)
-            if self._ghosting:
-                self.ghost_text.retarget(self._paste_target)
         except Exception:
             self.logger.exception("Could not refresh the target marker.")
             self._hide_target_marker()
@@ -914,11 +918,9 @@ class WhisperTypeApp:
         # Empty text => the box shows its "Listening..." placeholder, while
         # toPlainText() stays "" so confirming without speaking pastes nothing.
         self.capture_box.set_text("")
-        # Back to a strip, if this capture is ghosting: any status message
-        # that widened the box has served its purpose once audio is flowing.
+        # Back to a strip, if this capture is typing: any status message that
+        # widened the box has served its purpose once audio is flowing.
         self.capture_box.set_compact(self._ghosting)
-        if self._ghosting:
-            self.ghost_text.set_text("")
         # Drop the last capture's words before any of this one arrive.
         self._transcript.reset()
         self._capture_audio.clear()
@@ -1060,6 +1062,10 @@ class WhisperTypeApp:
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
         payload_log.log_event("capture_cancelled")
+        # Before the marker goes: the target still has the keyboard at this
+        # point (a passive box never took it), which is what makes taking the
+        # preview back possible at all.
+        self._undo_live_typing()
         self._hide_target_marker()
         self._paste_pending = False
         if self._final_pass:
@@ -1230,6 +1236,10 @@ class WhisperTypeApp:
         self.write_to_history(text, status="CONFIRMED")
         if not text:
             self.logger.debug("Nothing transcribed; skipping paste.")
+            # There can still be a preview in the document even when the final
+            # transcript came back empty, and leaving it there would be the
+            # one outcome nobody could undo without knowing what to look for.
+            self._undo_live_typing()
             return
 
         # Dictation happens a phrase at a time, and the next paste lands right
@@ -1269,6 +1279,12 @@ class WhisperTypeApp:
                 f"could not focus '{get_window_title(hwnd)}'", text)
             return
 
+        # Focus is confirmed on the target, so the live-typed preview can be
+        # taken back. It goes out before the finished text goes in: the final
+        # pass re-reads the whole clip and usually punctuates it differently
+        # from the running preview, so the two must not be concatenated.
+        self._undo_live_typing()
+
         # Clear anything the user is still holding. Confirming with the hotkey
         # means Ctrl is usually down; a held Shift or Alt would turn the
         # injected Ctrl+V into a different shortcut entirely.
@@ -1304,6 +1320,7 @@ class WhisperTypeApp:
         """Last resort when the clipboard is unusable: type the text out."""
         hwnd = self._prev_foreground_hwnd
         if hwnd and is_window(hwnd) and not is_own_window(hwnd) and focus_window(hwnd):
+            self._undo_live_typing()
             win_input.release_modifiers()
             if win_input.type_text(text):
                 self.logger.info("Typed %d chars into 0x%X.", len(text), hwnd)

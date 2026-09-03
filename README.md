@@ -8,7 +8,7 @@ WhisperType is a sleek, hotkey-driven dictation utility for Windows. It captures
 - **Live Transcription**: A minimalist "Capture Box" appears, showing your transcribed text as you speak.
 - **Paste at Cursor**: Confirmed transcriptions are automatically pasted into whatever application you're using.
 - **Shows You the Target**: The place the text will land is marked for the length of the capture, so you can see where you are dictating before you speak.
-- **Ghost Text**: The words appear at the caret as you say them, in the document's own font — a preview drawn over the app, never typed into it.
+- **Live Typing**: The words go into the document as you say them, correcting themselves in place as the transcription firms up.
 - **System Tray Control**: Runs unobtrusively in the system tray, providing status and access to settings.
 - **Configurable**: Easily change the server address and hotkey.
 - **Transcription History**: Automatically saves a log of all your transcriptions.
@@ -162,21 +162,28 @@ Other good options:
     focus is not in a text field at all. The mark is also why the Capture Box
     now opens beside your caret rather than beside the mouse. Both behaviours
     are under **Settings → Paste Target**.
-5.  **Speak**: Where an exact caret was found, the words appear **at the caret
-    itself**, greyed, in the document's own font — and the Capture Box slims to
-    just its level meter and buttons, so it is not saying the same thing twice
-    over the top of your document.
+5.  **Speak**: Where an exact caret was found, the words are typed **straight
+    into the document** as you say them, correcting themselves in place as the
+    transcription firms up — and the Capture Box slims to just its level meter
+    and buttons, so it is not saying the same thing twice over the top of your
+    work. The caret stays in your document the whole time; the box never takes
+    the keyboard.
 
-    Nothing is typed into the application. The preview is drawn *over* it, so
-    cancelling leaves no trace and nothing can be left behind in your document
-    if something goes wrong. Because it is a drawing, it covers any text to the
-    right of the caret rather than pushing it along, and it does not follow the
-    document if you scroll — both sort themselves out the moment the real paste
-    happens. Turn it off with **Settings → Paste Target → Preview the words at
-    the caret as you speak**, and the full transcript box comes back.
+    Cancelling removes everything it typed. On confirm it is replaced by the
+    finished transcript, which is usually punctuated a little differently — see
+    the note about the final pass below.
+
+    Two things to know. Each revision is a separate undo step in the target
+    application, so undoing right after a dictation may take a few presses. And
+    an editor with aggressive autocorrect can fight the inserted text.
+
+    Turn it off with **Settings → Paste Target → Type the words into the app as
+    you speak**, and the full transcript box comes back.
 
     Everywhere else — no caret found — the box keeps its transcript area and
-    behaves as it always did.
+    behaves as it always did. Live typing never runs without a confirmed text
+    caret, and it stands down by itself in an application that turns out not to
+    accept the text.
 6.  **Confirm or Cancel**:
     - To **confirm** and paste the text, press the hotkey again, press `Enter`, or click the "✓" button.
     - To **cancel**, press `Esc`, click the "✗" button, or simply click away from the Capture Box.

@@ -99,7 +99,7 @@ FIELD_IS_WINDOW_RATIO = 0.92
 #           is the whole point of showing anything.
 #   style   (font family, size in points) at the caret, or None. Only the
 #           ghost text uses it, and only to look like it belongs where it is
-#           standing -- see ghost_text.py.
+#           standing -- see live_type.py.
 Target = namedtuple("Target", "caret field window label source style")
 # So the five-field construction sites elsewhere keep working.
 Target.__new__.__defaults__ = (None,)
@@ -213,6 +213,19 @@ def _gui_thread_info(hwnd):
     if not _user32.GetGUIThreadInfo(thread, ctypes.byref(info)):
         return None
     return info
+
+
+def focused_control(hwnd):
+    """The window inside `hwnd` that has the keyboard focus, or `hwnd` itself.
+
+    Where posted text messages have to be aimed -- see live_type.py. A
+    top-level window is usually a frame around the control that actually
+    handles text, and a WM_CHAR sent to the frame is ignored.
+    """
+    info = _gui_thread_info(hwnd)
+    if info is not None and info.hwndFocus:
+        return info.hwndFocus
+    return hwnd
 
 
 def _caret_from_gui_thread(info):
@@ -604,7 +617,7 @@ class _UIAutomation:
         Both halves are optional and either can come back missing: an
         application that has no opinion, or whose range spans more than one
         font, returns a reserved sentinel rather than a value. None means
-        "draw it however you like", which is what ghost_text.py falls back to.
+        "draw it however you like". Nothing needs it since live typing replaced the
         """
         family = self._attribute(text_range, _UIA_FONT_NAME_ATTR)
         size = self._attribute(text_range, _UIA_FONT_SIZE_ATTR)

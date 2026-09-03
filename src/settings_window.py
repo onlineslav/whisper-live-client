@@ -173,11 +173,13 @@ DEFAULT_SETTINGS = {
     # mouse. Only possible now that the caret is located at all, and only
     # takes effect when it was found -- see caret_target.py.
     "capture_follow_caret": True,
-    # Paint the transcript at the caret as it is spoken, in the target's own
-    # font -- see ghost_text.py. Nothing is typed into the target; it is a
-    # drawing over it. Only ever runs for a capture with a real caret, and
-    # slims the Capture Box to its meter and buttons while it does.
-    "capture_ghost_text": True,
+    # Type the transcript into the target as it is spoken, revising it in
+    # place as the server changes its mind -- see live_type.py. Only ever runs
+    # for a capture with a confirmed text caret, because the mechanism is
+    # Backspace and Backspace outside a text field is the browser's Back
+    # button. Slims the Capture Box to its meter and buttons, and stops it
+    # taking the keyboard, for as long as it runs.
+    "capture_live_typing": True,
     "capture_font_size": DEFAULT_FONT_SIZE_PX,
     # Empty means the system UI font.
     "capture_font_family": DEFAULT_FONT_FAMILY,
@@ -427,13 +429,14 @@ class SettingsWindow(QWidget):
         self.capture_follow_caret_checkbox.setToolTip(
             "Put the Capture Box next to the text caret when it can be found. "
             "Falls back to the mouse pointer otherwise.")
-        self.capture_ghost_text_checkbox = QCheckBox(
-            "Preview the words at the caret as you speak")
-        self.capture_ghost_text_checkbox.setToolTip(
-            "Draw the transcript at the insertion point in the target's own "
-            "font, greyed, while you dictate. Nothing is typed into the app — "
-            "it is drawn over it — so cancelling leaves no trace. Needs an "
-            "exact caret, and slims the Capture Box to its meter and buttons.")
+        self.capture_live_typing_checkbox = QCheckBox(
+            "Type the words into the app as you speak")
+        self.capture_live_typing_checkbox.setToolTip(
+            "Type the transcript straight into the app as you dictate, "
+            "correcting it in place as the server revises it. Cancelling "
+            "removes it again. Needs an exact caret, so it only runs in real "
+            "text fields; elsewhere the transcript stays in the box. Each "
+            "revision is an undo step in the target app.")
         self.auto_start_server_checkbox = QCheckBox(
             "Start the WhisperLive server automatically (Docker)")
         self.auto_start_server_checkbox.setToolTip(
@@ -505,7 +508,7 @@ class SettingsWindow(QWidget):
         target_column.setContentsMargins(0, 0, 0, 0)
         target_column.addWidget(self.capture_show_target_checkbox)
         target_column.addWidget(self.capture_follow_caret_checkbox)
-        target_column.addWidget(self.capture_ghost_text_checkbox)
+        target_column.addWidget(self.capture_live_typing_checkbox)
         form_layout.addRow(QLabel("Paste Target:"), target_column)
         server_start_column = QVBoxLayout()
         server_start_column.setContentsMargins(0, 0, 0, 0)
@@ -985,8 +988,8 @@ class SettingsWindow(QWidget):
             "capture_show_target", DEFAULT_SETTINGS["capture_show_target"])))
         self.capture_follow_caret_checkbox.setChecked(bool(settings.get(
             "capture_follow_caret", DEFAULT_SETTINGS["capture_follow_caret"])))
-        self.capture_ghost_text_checkbox.setChecked(bool(settings.get(
-            "capture_ghost_text", DEFAULT_SETTINGS["capture_ghost_text"])))
+        self.capture_live_typing_checkbox.setChecked(bool(settings.get(
+            "capture_live_typing", DEFAULT_SETTINGS["capture_live_typing"])))
         self.auto_start_server_checkbox.setChecked(
             settings.get("auto_start_server", DEFAULT_SETTINGS["auto_start_server"]))
         self.start_docker_desktop_checkbox.setChecked(
@@ -1100,7 +1103,7 @@ class SettingsWindow(QWidget):
             "final_pass": self.final_pass_checkbox.isChecked(),
             "capture_show_target": self.capture_show_target_checkbox.isChecked(),
             "capture_follow_caret": self.capture_follow_caret_checkbox.isChecked(),
-            "capture_ghost_text": self.capture_ghost_text_checkbox.isChecked(),
+            "capture_live_typing": self.capture_live_typing_checkbox.isChecked(),
             "auto_start_server": self.auto_start_server_checkbox.isChecked(),
             "start_docker_desktop": self.start_docker_desktop_checkbox.isChecked(),
             "server_use_gpu": self.server_use_gpu_checkbox.isChecked(),

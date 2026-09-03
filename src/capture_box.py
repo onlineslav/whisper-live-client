@@ -151,6 +151,18 @@ METER_LEFT_INSET = 8
 CORNER_RADIUS = 10
 FIELD_RADIUS = 8
 
+# The box's padding, full and slimmed. A strip holding one row wants far less
+# room around it than a box holding a transcript, and reusing the full
+# margins is most of what made the first slimmed box look wrong -- 12px of
+# padding around a 35px row reads as a window whose contents failed to load.
+FULL_MARGINS = (12, 12, 12, 12)
+COMPACT_MARGINS = (10, 8, 10, 8)
+
+# Toggled on the slimmed box so the target application keeps the keyboard
+# while its own text is being typed into it. See CaptureBox.set_passive.
+GWL_EXSTYLE = -20
+WS_EX_NOACTIVATE = 0x08000000
+
 # Frosted glass: what is behind the box, blurred, so a page of text
 # underneath reads as texture instead of competing with the transcript.
 #
@@ -417,6 +429,16 @@ class CaptureBox(QWidget):
         self._closing = False
         self._fade_duration_ms = 140
         self._shown_at = 0.0
+        # Set before anything builds the layout: _sync_meter_alignment runs
+        # during construction and asks whether the box is slimmed.
+        #
+        # _compact hides the transcript and lays the rest out as a strip;
+        # _passive stops the box taking the keyboard so the target can keep
+        # it. They travel together for live typing but are separate switches,
+        # because only one of them is about how the box looks.
+        self._full_min_width = 420
+        self._compact = False
+        self._passive = False
         # A preview box stands in the Settings window rather than over the
         # app being dictated into, so every way a real capture ends -- losing
         # activation, a click outside it, the keyboard -- would close it the
@@ -571,12 +593,8 @@ class CaptureBox(QWidget):
         self.meter.style_changed.connect(self._sync_meter_alignment)
         self._sync_meter_alignment(self.meter.style_name())
 
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(self._full_min_width)
         self.setMaximumWidth(720)
-        # See set_compact. The full width is restored whenever it is turned
-        # back off, so the two are kept rather than recomputed.
-        self._full_min_width = 420
-        self._compact = False
 
         # Connections
         self.confirm_button.clicked.connect(self.on_confirm)
@@ -630,33 +648,102 @@ class CaptureBox(QWidget):
     def set_compact(self, compact: bool):
         """Hide the transcript area, leaving the meter and the two buttons.
 
-        For captures where ghost text is showing the words at the caret
-        instead. The box would otherwise be saying the same thing twice, in
-        two places, and the transcript area is nearly all of its height --
-        which is height spent covering the document being dictated into.
+        For captures that are typing the words into the target itself -- see
+        live_type.py. The transcript is already on screen, in the document, so
+        a box repeating it would be saying the same thing twice while covering
+        the place it is being said.
 
         What is left still has a job: the meter is the only proof the
         microphone is being heard, and Confirm/Cancel are the controls. So the
-        box shrinks rather than disappearing.
+        box becomes a strip rather than disappearing, and it is laid out as a
+        strip rather than as the full box with a hole in it -- the transcript's
+        margins and minimum width are what made the first attempt at this look
+        like a window with its contents missing.
         """
         compact = bool(compact)
         if compact == self._compact:
             return
         self._compact = compact
         self.text_area.setVisible(not compact)
+
+        layout = self.layout()
         if compact:
+            layout.setContentsMargins(*COMPACT_MARGINS)
+            layout.setSpacing(0)
             # The meter and two buttons need far less than the transcript's
-            # minimum, and leaving it at 420 would pad the strip with empty
-            # space the frost then has to be photographed for.
+            # minimum, and holding the box at 420 wide would pad the strip out
+            # with empty space.
             self.setMinimumWidth(0)
         else:
+            layout.setContentsMargins(*FULL_MARGINS)
+            layout.setSpacing(8)
             self.setMinimumWidth(self._full_min_width)
-        # The box was sized for the other mode; let it shrink as well as grow.
+        # The meter goes hard left in a strip whatever style it is: the row is
+        # the whole window now, so the centring that balances it against a
+        # transcript above has nothing left to balance against.
+        self._sync_meter_alignment()
+        self._settle_layout()
+
+    def _settle_layout(self):
+        """Re-measure the box now, rather than at the next event loop turn.
+
+        A hidden widget's layout is not recalculated until something asks, so
+        adjustSize() straight after hiding the transcript returns the size the
+        box had *before* it was hidden. That stale size then reaches the frost
+        snapshot, which photographs a region of screen the wrong size for the
+        window it ends up behind -- which is what put a torn piece of some
+        other window inside the strip. Activating the layout first is what
+        makes the measurement true.
+        """
+        layout = self.layout()
+        if layout is not None:
+            layout.invalidate()
+            layout.activate()
         self.adjustSize()
         self.resize(self.sizeHint())
 
     def is_compact(self) -> bool:
         return self._compact
+
+    def set_passive(self, passive: bool):
+        """Stop the box taking the keyboard, so the target keeps it.
+
+        Live typing needs the target application focused for the whole
+        capture, because injected keystrokes go to whatever is in front. The
+        box normally takes the foreground so Enter and Esc reach it, which is
+        exactly the wrong thing here: it would take focus out of the text
+        field, and then the typing would land in the box.
+
+        WS_EX_NOACTIVATE is set on the window rather than the flag being
+        changed through Qt, because changing window flags destroys and
+        recreates the native window -- and with it the capture-exclusion and
+        every other property set on the handle. Clicks still arrive; the
+        window simply never becomes the active one, so the buttons keep
+        working while the caret stays blinking in the document.
+        """
+        passive = bool(passive)
+        if passive == self._passive:
+            return
+        self._passive = passive
+        self.setAttribute(Qt.WA_ShowWithoutActivating, passive)
+        if sys.platform != "win32":
+            return
+        try:
+            user32 = ctypes.windll.user32
+            user32.GetWindowLongPtrW.restype = ctypes.c_longlong
+            user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            user32.SetWindowLongPtrW.restype = ctypes.c_longlong
+            user32.SetWindowLongPtrW.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong]
+            handle = ctypes.c_void_p(int(self.winId()))
+            style = user32.GetWindowLongPtrW(handle, GWL_EXSTYLE)
+            style = (style | WS_EX_NOACTIVATE) if passive else (
+                style & ~WS_EX_NOACTIVATE)
+            user32.SetWindowLongPtrW(handle, GWL_EXSTYLE, style)
+        except Exception:
+            # Not fatal: without it the box takes focus and live typing is
+            # degraded, which main.py notices and reports.
+            pass
 
     def set_level_db(self, db: float):
         """Feed the meter a raw chunk level in dBFS."""
@@ -676,7 +763,10 @@ class CaptureBox(QWidget):
         trailing one the only nonzero factor sends all the slack to its
         right instead, flushing the meter to the left edge.
         """
-        left = self.meter.style_name() in LEFT_ALIGNED_METER_STYLES
+        # A slimmed box is nothing but this row, so there is no transcript
+        # above for a centred meter to balance against -- it just floats in
+        # the middle of a strip. Hard left, whatever the style.
+        left = self._compact or self.meter.style_name() in LEFT_ALIGNED_METER_STYLES
         # The leading spacer keeps the Expanding policy addStretch() gave it,
         # so it still collapses to nothing when both sides are meant to
         # balance -- only its floor changes, from 0 (centred) to one inset
@@ -958,7 +1048,15 @@ class CaptureBox(QWidget):
             # part the box currently covers may be drawn. Stretching it would
             # smear the backdrop further every time a line of transcript
             # arrived.
-            painter.drawPixmap(self.rect(), self._frost, self.rect())
+            #
+            # Intersected with the snapshot's own bounds, because asking for a
+            # source rectangle bigger than the pixmap does not clamp -- it
+            # reads whatever is past the edge, which is how a torn piece of
+            # another window ended up inside the box whenever it was resized
+            # between the snapshot and the paint.
+            source = self.rect().intersected(self._frost.rect())
+            if not source.isEmpty():
+                painter.drawPixmap(source, self._frost, source)
             painter.restore()
         painter.fillPath(path, self._surface_color())
 
@@ -972,13 +1070,14 @@ class CaptureBox(QWidget):
             # The field's own fill and border are still the QTextEdit's, and
             # it paints them over this. That ordering is the whole trick: the
             # fill is semi-transparent, so it tints the frost underneath.
-            field = self.text_area.geometry()
-            field_path = QPainterPath()
-            field_path.addRoundedRect(field, FIELD_RADIUS, FIELD_RADIUS)
-            painter.save()
-            painter.setClipPath(field_path)
-            painter.drawPixmap(field, self._frost, field)
-            painter.restore()
+            field = self.text_area.geometry().intersected(self._frost.rect())
+            if not field.isEmpty():
+                field_path = QPainterPath()
+                field_path.addRoundedRect(field, FIELD_RADIUS, FIELD_RADIUS)
+                painter.save()
+                painter.setClipPath(field_path)
+                painter.drawPixmap(field, self._frost, field)
+                painter.restore()
 
     def set_text(self, text):
         self.text_area.setPlainText(text)
@@ -1189,7 +1288,10 @@ class CaptureBox(QWidget):
         self.set_busy(False)
         self.meter.reset()
         self._shown_at = time.monotonic()
-        self.adjustSize()
+        # Activated rather than merely requested, so the geometry measured
+        # below -- and photographed for the frost -- is the one the box will
+        # actually have when it appears.
+        self._settle_layout()
 
         app = QApplication.instance()
         if app:
@@ -1204,9 +1306,14 @@ class CaptureBox(QWidget):
         self._opacity.setOpacity(0.0)
         self.show()
         self.raise_()
-        self.activateWindow()
-        self.setFocus()
-        self._take_foreground()
+        if not self._passive:
+            self.activateWindow()
+            self.setFocus()
+            self._take_foreground()
+        # Passive: the target keeps the keyboard so its own text can be typed
+        # into it, and the box is driven by the hotkey and its buttons
+        # instead. Taking the foreground here would move focus out of the
+        # text field and the transcript would be typed into this box.
         self._animate_opacity(0.0, 1.0)
 
     def _anchor_point(self) -> QPoint:
@@ -1304,6 +1411,11 @@ class CaptureBox(QWidget):
         if (
             event.type() == QEvent.ActivationChange
             and not self._preview_mode
+            # A passive box is never the active window by design, so "lost
+            # activation" is its normal state rather than a signal that the
+            # user went elsewhere. Without this it cancels itself the instant
+            # it appears.
+            and not self._passive
             and not self._closing
             and self.isVisible()
             and not self.isActiveWindow()
@@ -1313,8 +1425,12 @@ class CaptureBox(QWidget):
         super().changeEvent(event)
 
     def eventFilter(self, obj, event):
+        # Click-away cancel is off for a passive box: the user is meant to be
+        # clicking around in their own document while it types into it, and
+        # every one of those clicks arrives here as a press outside the box.
         if (event.type() == QEvent.MouseButtonPress
-                and not self._preview_mode and not self._closing):
+                and not self._preview_mode and not self._passive
+                and not self._closing):
             # An app-wide filter sees every press twice: first on the receiving
             # QWindow, then on the QWidget under it. The QWindow is not a
             # widget, so an isWidgetType()-only check misses our own window and
