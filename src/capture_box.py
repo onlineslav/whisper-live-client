@@ -1,3 +1,4 @@
+import ctypes
 import sys
 import time
 
@@ -137,6 +138,25 @@ FIELD_RADIUS = 8
 # wanting one is not wanting the other.
 DEFAULT_PANEL_FROST = True
 DEFAULT_FIELD_FROST = False
+
+# Windows lets a window declare itself invisible to screen-capture APIs while
+# staying on screen for the person looking at it. That is exactly the
+# difference the frost needs -- the box has to photograph the screen it is
+# standing on without photographing itself -- and it is why the snapshot no
+# longer costs a hide and a show. WDA_EXCLUDEFROMCAPTURE is Windows 10 2004
+# and later; where it is refused, the box falls back to getting out of the
+# way for the length of the grab.
+WDA_NONE = 0x0
+WDA_EXCLUDEFROMCAPTURE = 0x11
+
+# How often a preview box re-takes its frost. Only the preview does this: it
+# is the one box whose whole job is to be looked at while its own settings
+# are adjusted, so a backdrop frozen at the moment it opened is the wrong
+# answer there -- moving a window behind it has to change what it looks like.
+# A real capture keeps its snapshot: it is up for a few seconds over a page
+# that is not moving, and a gaussian several times a second is not worth
+# spending while someone is dictating.
+PREVIEW_FROST_INTERVAL_MS = 400
 
 # Blur radius, in pixels -- a real gaussian one. The blur used to be a
 # downscale to a few per cent followed by a smooth upscale, which is fast but
@@ -402,6 +422,10 @@ class CaptureBox(QWidget):
         # The blurred snapshot of whatever was behind the box when it opened,
         # or None when neither surface is frosted and nothing was grabbed.
         self._frost = None
+        # Runs only for a preview box -- see PREVIEW_FROST_INTERVAL_MS.
+        self._frost_timer = QTimer(self)
+        self._frost_timer.setInterval(PREVIEW_FROST_INTERVAL_MS)
+        self._frost_timer.timeout.connect(self._refresh_frost_live)
 
         # Subtle fade effect
         self._opacity = QGraphicsOpacityEffect(self)
@@ -581,6 +605,7 @@ class CaptureBox(QWidget):
             self._opacity_level = _clamp_opacity(opacity)
         if frosted is not None:
             self._panel_frost = bool(frosted)
+        self._sync_frost_timer()
         self.update()
 
     def set_frost(self, blur=None, saturation=None, brightness=None, levelling=None):
@@ -602,16 +627,46 @@ class CaptureBox(QWidget):
     def wants_frost(self) -> bool:
         return self._panel_frost or self._field_frost
 
-    def _grab_frost(self):
-        """Snapshot and blur what is behind the box, before it is shown.
+    def _exclude_from_capture(self, excluded: bool) -> bool:
+        """Hide this window from screen-capture APIs, or stop. False if refused.
 
-        Called with the box positioned but still hidden, which is the only
-        moment the screen underneath is both in its final place and not
-        covered by the box itself.
+        The window stays on screen throughout -- this only changes what a
+        screenshot of the screen it is on contains.
+        """
+        if sys.platform != "win32":
+            return False
+        try:
+            return bool(ctypes.windll.user32.SetWindowDisplayAffinity(
+                ctypes.c_void_p(int(self.winId())),
+                ctypes.c_uint(WDA_EXCLUDEFROMCAPTURE if excluded else WDA_NONE)))
+        except Exception:
+            return False
+
+    def _grab_frost(self) -> bool:
+        """Snapshot and blur what is behind the box. True if it was taken.
+
+        Safe to call with the box on screen: for the length of the grab it
+        marks itself invisible to screen capture, so what comes back is the
+        screen underneath rather than the box's own last frame stacked on
+        itself. False means that could not be arranged and the caller has to
+        get the box out of the way itself -- see refresh_backdrop.
         """
         self._frost = None
         if not self.wants_frost():
-            return
+            return True
+        excluded = False
+        if self.isVisible():
+            excluded = self._exclude_from_capture(True)
+            if not excluded:
+                return False
+        try:
+            self._take_frost()
+        finally:
+            if excluded:
+                self._exclude_from_capture(False)
+        return True
+
+    def _take_frost(self):
         geometry = self.geometry()
         # Photographed for every height the box may reach, not just the one it
         # has: a box that grows afterwards would otherwise have nothing behind
@@ -647,6 +702,26 @@ class CaptureBox(QWidget):
             geometry.x() - padded.x(), geometry.y() - padded.y(),
             geometry.width(), geometry.height()))
 
+    def _sync_frost_timer(self):
+        """Keep a preview box's frost live for as long as it is showing one."""
+        if self._preview_mode and self.isVisible() and self.wants_frost():
+            if not self._frost_timer.isActive():
+                self._frost_timer.start()
+        else:
+            self._frost_timer.stop()
+
+    def _refresh_frost_live(self):
+        if not self.isVisible() or not self.wants_frost():
+            self._frost_timer.stop()
+            return
+        if self._grab_frost():
+            self.update()
+        else:
+            # Only possible without a hide on a system that will exclude the
+            # window from capture. Where it will not, one blink per frame is
+            # far worse than a frost that stands still.
+            self._frost_timer.stop()
+
     def set_field(self, color: str = None, opacity=None, frosted=None):
         """Set the colour and fill of the inset the transcript sits in.
 
@@ -662,6 +737,7 @@ class CaptureBox(QWidget):
         if frosted is not None:
             self._field_frost = bool(frosted)
         self._apply_field_style()
+        self._sync_frost_timer()
         self.update()
 
     def set_font_family(self, family: str):
@@ -912,6 +988,7 @@ class CaptureBox(QWidget):
         self._opacity.setOpacity(0.0)
         self.show()
         self.raise_()
+        self._sync_frost_timer()
         self._animate_opacity(0.0, 1.0)
 
     def refresh_backdrop(self):
@@ -924,13 +1001,21 @@ class CaptureBox(QWidget):
         """
         if not self.isVisible():
             return
+        self._reserve_grow_room()
+        if self._grab_frost():
+            self.update()
+            self._sync_frost_timer()
+            return
+        # The box could not take itself out of its own photograph, so it has
+        # to leave the screen for the length of the grab. The original way
+        # round, kept for where the capture exclusion is refused.
         self.hide()
         QApplication.processEvents()
-        self._reserve_grow_room()
         self._grab_frost()
         self.show()
         self.raise_()
         self._opacity.setOpacity(1.0)
+        self._sync_frost_timer()
 
     def show_at_cursor(self):
         self._preview_mode = False
@@ -1087,6 +1172,7 @@ class CaptureBox(QWidget):
         # deactivation that follows from being read as a click-away cancel.
         self._closing = True
         self.set_busy(False)
+        self._frost_timer.stop()
         self.meter.reset()
         app = QApplication.instance()
         if app:
