@@ -176,6 +176,10 @@ class WhisperBoardApp:
         self.capture_box.set_font_size(self.settings["capture_font_size"])
         self.capture_box.set_font_family(
             self.settings.get("capture_font_family", DEFAULT_SETTINGS["capture_font_family"]))
+        self.capture_box.set_line_spacing(
+            self.settings.get("capture_line_spacing", DEFAULT_SETTINGS["capture_line_spacing"]))
+        self.capture_box.set_grow_to_fit(
+            self.settings.get("capture_grow_to_fit", DEFAULT_SETTINGS["capture_grow_to_fit"]))
         self.capture_box.set_meter_style(self.settings["capture_meter_style"])
         self._apply_capture_appearance()
 
@@ -995,6 +999,10 @@ class WhisperBoardApp:
             self.settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"]))
         self.capture_box.set_font_family(
             self.settings.get("capture_font_family", DEFAULT_SETTINGS["capture_font_family"]))
+        self.capture_box.set_line_spacing(
+            self.settings.get("capture_line_spacing", DEFAULT_SETTINGS["capture_line_spacing"]))
+        self.capture_box.set_grow_to_fit(
+            self.settings.get("capture_grow_to_fit", DEFAULT_SETTINGS["capture_grow_to_fit"]))
         self.capture_box.set_meter_style(
             self.settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"]))
         self._apply_capture_appearance()

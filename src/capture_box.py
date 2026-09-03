@@ -32,6 +32,7 @@ from PySide6.QtGui import (
     QTextOption,
     QGuiApplication,
     QTextCursor,
+    QTextBlockFormat,
     QPainter,
     QColor,
     QPainterPath,
@@ -61,6 +62,28 @@ MAX_FONT_SIZE_PX = 48
 # amount of text at any size.
 VISIBLE_LINES = 5
 MAX_LINES = 10
+
+# Space between lines, as a percentage of the face's own line height. 100 is
+# whatever the typeface asks for; above that opens the transcript up, which
+# is worth having when it is being read at a glance over a busy window.
+DEFAULT_LINE_SPACING = 100
+MIN_LINE_SPACING = 80
+MAX_LINE_SPACING = 250
+
+# Grow the box downwards for a long transcript instead of scrolling it. Off
+# by default: a box that changes size while it is being read is the more
+# surprising of the two, so it is opted into.
+DEFAULT_GROW_TO_FIT = False
+
+# The most of the screen's height a grown box may take. The room it can grow
+# into is reserved when the box opens -- see _reserve_grow_room -- and that
+# reservation also sets how much screen has to be photographed for the frost,
+# so it is bounded for the cost as well as for the look.
+GROW_SCREEN_FRACTION = 0.8
+
+# The transcript field's own padding and border, added to the height of the
+# text to get the height of the widget around it.
+FIELD_CHROME_PX = 24
 
 # The box has two surfaces, and they are set separately because they are
 # doing different jobs. The PANEL is the whole window -- what separates the
@@ -340,6 +363,16 @@ class CaptureBox(QWidget):
         self._field_opacity = DEFAULT_FIELD_OPACITY
         self._font_family = DEFAULT_FONT_FAMILY
         self._font_size = 0
+        self._line_spacing = DEFAULT_LINE_SPACING
+        self._grow_to_fit = DEFAULT_GROW_TO_FIT
+        # The tallest the whole box may become where it currently stands,
+        # decided when it opens; 0 until then, and whenever it is not allowed
+        # to grow at all.
+        self._grow_room = 0
+        # The field's height with nothing in it, kept because growing
+        # overwrites the widget's own minimum and the floor has to survive
+        # that to be restored when the transcript is short again.
+        self._min_field_height = 0
         self.set_font_size(DEFAULT_FONT_SIZE_PX)
         layout.addWidget(self.text_area)
 
@@ -472,6 +505,11 @@ class CaptureBox(QWidget):
         if not self.wants_frost():
             return
         geometry = self.geometry()
+        # Photographed for every height the box may reach, not just the one it
+        # has: a box that grows afterwards would otherwise have nothing behind
+        # its lower half but a stretched copy of the top.
+        if self._grow_room > geometry.height():
+            geometry.setHeight(self._grow_room)
         screen = (QGuiApplication.screenAt(geometry.center())
                   or QApplication.primaryScreen())
         if screen is None:
@@ -574,7 +612,13 @@ class CaptureBox(QWidget):
             # rounded corners instead of squaring them off.
             painter.save()
             painter.setClipPath(path)
-            painter.drawPixmap(self.rect(), self._frost)
+            # Source rectangle given explicitly rather than letting the whole
+            # pixmap stretch into the box: with "grow to fit" on, the frost is
+            # photographed at the full height the box may reach, and only the
+            # part the box currently covers may be drawn. Stretching it would
+            # smear the backdrop further every time a line of transcript
+            # arrived.
+            painter.drawPixmap(self.rect(), self._frost, self.rect())
             painter.restore()
         painter.fillPath(path, self._surface_color())
 
@@ -598,7 +642,51 @@ class CaptureBox(QWidget):
 
     def set_text(self, text):
         self.text_area.setPlainText(text)
+        # Block formatting does not survive setPlainText, so the spacing is
+        # re-stamped on every update rather than set once.
+        self._apply_line_spacing()
         self.text_area.moveCursor(QTextCursor.End)
+        self._grow_to_text()
+
+    def set_line_spacing(self, percent):
+        """Set the space between transcript lines, as a percentage.
+
+        100 is the typeface's own line height. The box's height follows,
+        exactly as the type size does: five lines has to stay five lines.
+        """
+        percent = _clamp_int(percent, MIN_LINE_SPACING, MAX_LINE_SPACING)
+        if percent == self._line_spacing:
+            return
+        self._line_spacing = percent
+        self._apply_line_spacing()
+        self._resize_to_font()
+
+    def set_grow_to_fit(self, grow: bool):
+        """Grow the box downwards for a long transcript, instead of scrolling.
+
+        The room to grow into is reserved when the box opens, so turning this
+        on for a box already on screen only takes effect from the next
+        capture -- which is where it is set from anyway.
+        """
+        grow = bool(grow)
+        if grow == self._grow_to_fit:
+            return
+        self._grow_to_fit = grow
+        if not grow:
+            self._grow_room = 0
+        self._resize_to_font()
+        self._grow_to_text()
+
+    def _apply_line_spacing(self):
+        """Stamp the current spacing onto every block in the transcript."""
+        cursor = self.text_area.textCursor()
+        cursor.select(QTextCursor.Document)
+        spacing = QTextBlockFormat()
+        # The height type goes in as a plain int: the overload PySide exposes
+        # takes one, and passing the enum itself is a TypeError.
+        spacing.setLineHeight(float(self._line_spacing),
+                              QTextBlockFormat.ProportionalHeight.value)
+        cursor.mergeBlockFormat(spacing)
 
     def set_font_size(self, size_px: int):
         """Set the transcription type size and resize the box to match.
@@ -619,8 +707,8 @@ class CaptureBox(QWidget):
         self._apply_field_style()
         self._resize_to_font()
 
-    def _resize_to_font(self):
-        """Re-derive the box's height from the current face and size."""
+    def _line_height(self) -> float:
+        """One line of transcript, in px, at the current face, size and spacing."""
         # Measured from an explicit QFont rather than the widget's own metrics:
         # a stylesheet font is not applied until the widget is next polished,
         # so fontMetrics() here would still report the previous one.
@@ -628,11 +716,74 @@ class CaptureBox(QWidget):
         if self._font_family:
             font.setFamily(self._font_family)
         font.setPixelSize(self._font_size or DEFAULT_FONT_SIZE_PX)
-        line_height = QFontMetrics(font).lineSpacing()
-        self.text_area.setMinimumHeight(int(line_height * VISIBLE_LINES + 24))
-        self.text_area.setMaximumHeight(int(line_height * MAX_LINES + 32))
+        return QFontMetrics(font).lineSpacing() * self._line_spacing / 100.0
+
+    def _resize_to_font(self):
+        """Re-derive the box's height from the current face, size and spacing."""
+        line_height = self._line_height()
+        self._min_field_height = int(line_height * VISIBLE_LINES + FIELD_CHROME_PX)
+        self.text_area.setMinimumHeight(self._min_field_height)
+        self.text_area.setMaximumHeight(self._field_height_cap())
         # The box was sized for the old type; let it shrink as well as grow.
         self.resize(self.sizeHint())
+
+    def _field_height_cap(self) -> int:
+        """The tallest the transcript field may get, in px.
+
+        Without room reserved this is a fixed number of lines and the field
+        scrolls past it. With it, the ceiling is the room itself, less
+        everything in the box that is not the field.
+        """
+        if self._grow_to_fit and self._grow_room:
+            chrome = self.height() - self.text_area.height()
+            return max(self._min_field_height, self._grow_room - chrome)
+        return int(self._line_height() * MAX_LINES + FIELD_CHROME_PX)
+
+    def _grow_to_text(self):
+        """Size the field to what it is holding, up to the room reserved.
+
+        Both the minimum and the maximum are set, because a QTextEdit has no
+        height of its own to speak of -- the layout gives it whatever the two
+        allow, and pinning them together is how it is given a specific one.
+        Past the ceiling the field stops growing and scrolls, which is the
+        same box the setting was turned off for.
+        """
+        if not self._grow_to_fit:
+            return
+        document = self.text_area.document()
+        # A document only knows its height once it knows its width, and the
+        # viewport is the width the text actually wraps to.
+        document.setTextWidth(self.text_area.viewport().width())
+        needed = int(document.size().height()) + FIELD_CHROME_PX
+        height = max(self._min_field_height, min(needed, self._field_height_cap()))
+        if height == self.text_area.minimumHeight() == self.text_area.maximumHeight():
+            return
+        self.text_area.setMinimumHeight(height)
+        self.text_area.setMaximumHeight(height)
+        self.adjustSize()
+
+    def _reserve_grow_room(self):
+        """Work out how tall the box may become where it now stands.
+
+        Downwards only, from the position it opened at, and never past the
+        bottom of the screen. Fixing this once means the box grows into space
+        it already owns rather than walking up the screen as the transcript
+        arrives -- and means the frost behind it can be photographed for the
+        whole reservation in one go, so a taller box is still in register with
+        the backdrop it was given.
+        """
+        self._grow_room = 0
+        if not self._grow_to_fit:
+            return
+        screen = (QGuiApplication.screenAt(self.geometry().center())
+                  or QApplication.primaryScreen())
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        below = available.bottom() - self.y()
+        self._grow_room = max(
+            self.height(), min(below, int(available.height() * GROW_SCREEN_FRACTION)))
+        self.text_area.setMaximumHeight(self._field_height_cap())
 
     def show_preview(self, at: QPoint = None):
         """Show the box as a live sample of itself, next to the Settings window.
@@ -646,6 +797,8 @@ class CaptureBox(QWidget):
         self.adjustSize()
         if at is not None:
             self._move_near(at)
+        self._reserve_grow_room()
+        self._grow_to_text()
         self._grab_frost()
         self._opacity.setOpacity(0.0)
         self.show()
@@ -664,6 +817,7 @@ class CaptureBox(QWidget):
             return
         self.hide()
         QApplication.processEvents()
+        self._reserve_grow_room()
         self._grab_frost()
         self.show()
         self.raise_()
@@ -681,6 +835,9 @@ class CaptureBox(QWidget):
             app.installEventFilter(self)
 
         self._move_near(self._anchor_point())
+        # Before the snapshot: the reservation decides how much of the screen
+        # has to be photographed.
+        self._reserve_grow_room()
         # Before show(), so the box does not photograph itself.
         self._grab_frost()
         self._opacity.setOpacity(0.0)

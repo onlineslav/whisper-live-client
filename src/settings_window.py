@@ -29,6 +29,10 @@ from capture_box import (
     MIN_FONT_SIZE_PX,
     MAX_FONT_SIZE_PX,
     DEFAULT_FONT_FAMILY,
+    DEFAULT_LINE_SPACING,
+    MIN_LINE_SPACING,
+    MAX_LINE_SPACING,
+    DEFAULT_GROW_TO_FIT,
     METER_STYLES,
     DEFAULT_OPACITY,
     MIN_OPACITY,
@@ -116,6 +120,11 @@ DEFAULT_SETTINGS = {
     "capture_font_size": DEFAULT_FONT_SIZE_PX,
     # Empty means the system UI font.
     "capture_font_family": DEFAULT_FONT_FAMILY,
+    # Space between transcript lines, as a percentage of the face's own line
+    # height, and whether a long transcript makes the box taller instead of
+    # scrolling inside it.
+    "capture_line_spacing": DEFAULT_LINE_SPACING,
+    "capture_grow_to_fit": DEFAULT_GROW_TO_FIT,
     # How solid the Capture Box is, and what colour. Stored as a fraction
     # rather than a percentage so it goes straight into the stylesheet.
     "capture_opacity": DEFAULT_OPACITY,
@@ -195,6 +204,22 @@ class SettingsWindow(QWidget):
         self.capture_font_size_spin = QSpinBox()
         self.capture_font_size_spin.setRange(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX)
         self.capture_font_size_spin.setSuffix(" px")
+        self.capture_line_spacing_spin = QSpinBox()
+        self.capture_line_spacing_spin.setRange(MIN_LINE_SPACING, MAX_LINE_SPACING)
+        self.capture_line_spacing_spin.setPrefix("Lines ")
+        self.capture_line_spacing_spin.setSuffix(" %")
+        self.capture_line_spacing_spin.setSingleStep(5)
+        self.capture_line_spacing_spin.setToolTip(
+            "Space between lines of transcript, as a percentage of the "
+            "typeface's own line height. 100% is what the face asks for; "
+            "more opens the text up for reading at a glance. The box height "
+            "follows, so five lines stays five lines.")
+        self.capture_grow_to_fit_checkbox = QCheckBox("Grow for long transcripts")
+        self.capture_grow_to_fit_checkbox.setToolTip(
+            "Make the box taller as the transcript gets longer, instead of "
+            "scrolling inside a fixed one. It grows downwards into the space "
+            "below where it opened and stops at the bottom of the screen, "
+            "after which it scrolls as before.")
         self.capture_opacity_spin = QSpinBox()
         self.capture_opacity_spin.setRange(int(MIN_OPACITY * 100), int(MAX_OPACITY * 100))
         self.capture_opacity_spin.setSuffix(" %")
@@ -392,7 +417,10 @@ class SettingsWindow(QWidget):
         type_row.addWidget(self.capture_font_family_combo, 1)
         type_row.addSpacing(8)
         type_row.addWidget(self.capture_font_size_spin)
+        type_row.addSpacing(8)
+        type_row.addWidget(self.capture_line_spacing_spin)
         form_layout.addRow(QLabel("Capture Text:"), type_row)
+        form_layout.addRow(QLabel(""), self.capture_grow_to_fit_checkbox)
         appearance_row = QHBoxLayout()
         appearance_row.setContentsMargins(0, 0, 0, 0)
         appearance_row.addWidget(self.capture_opacity_spin)
@@ -438,12 +466,14 @@ class SettingsWindow(QWidget):
         for signal in (self.capture_opacity_spin.valueChanged,
                        self.capture_field_opacity_spin.valueChanged,
                        self.capture_font_size_spin.valueChanged,
+                       self.capture_line_spacing_spin.valueChanged,
                        self.capture_font_family_combo.currentFontChanged,
                        self.capture_meter_style_combo.currentIndexChanged):
             signal.connect(lambda *_: self._sync_preview())
         # These change the snapshot itself rather than what is painted over
         # it, so they need it taken again.
         for signal in (self.capture_panel_frost_checkbox.toggled,
+                       self.capture_grow_to_fit_checkbox.toggled,
                        self.capture_field_frost_checkbox.toggled,
                        self.capture_blur_spin.valueChanged,
                        self.capture_saturation_spin.valueChanged,
@@ -731,6 +761,8 @@ class SettingsWindow(QWidget):
             return
         box.set_font_size(self.capture_font_size_spin.value())
         box.set_font_family(self._font_family())
+        box.set_line_spacing(self.capture_line_spacing_spin.value())
+        box.set_grow_to_fit(self.capture_grow_to_fit_checkbox.isChecked())
         box.set_meter_style(self.capture_meter_style_combo.currentText())
         box.set_surface(self._bg_color,
                         self.capture_opacity_spin.value() / 100.0,
@@ -810,6 +842,10 @@ class SettingsWindow(QWidget):
             int(settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"])))
         self._set_font_family(settings.get(
             "capture_font_family", DEFAULT_SETTINGS["capture_font_family"]))
+        self.capture_line_spacing_spin.setValue(int(settings.get(
+            "capture_line_spacing", DEFAULT_SETTINGS["capture_line_spacing"])))
+        self.capture_grow_to_fit_checkbox.setChecked(bool(settings.get(
+            "capture_grow_to_fit", DEFAULT_SETTINGS["capture_grow_to_fit"])))
         self.capture_opacity_spin.setValue(int(round(float(
             settings.get("capture_opacity", DEFAULT_SETTINGS["capture_opacity"])) * 100)))
         self._set_bg_color(settings.get("capture_bg_color", DEFAULT_SETTINGS["capture_bg_color"]))
@@ -889,6 +925,8 @@ class SettingsWindow(QWidget):
             "server_docker_image": getattr(self, "_server_docker_image", ""),
             "capture_font_size": self.capture_font_size_spin.value(),
             "capture_font_family": self._font_family(),
+            "capture_line_spacing": self.capture_line_spacing_spin.value(),
+            "capture_grow_to_fit": self.capture_grow_to_fit_checkbox.isChecked(),
             "capture_opacity": self.capture_opacity_spin.value() / 100.0,
             "capture_bg_color": self._bg_color,
             "capture_panel_frost": self.capture_panel_frost_checkbox.isChecked(),
