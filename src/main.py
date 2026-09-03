@@ -18,6 +18,9 @@ from capture_box import CaptureBox
 import win_input
 import payload_log
 import server_manager
+import caret_target
+import target_overlay
+from target_overlay import TargetOverlay
 from server_manager import ServerManager
 from transcript import Transcript
 from final_pass import FinalPass, BYTES_PER_SECOND, MAX_REPLAY_SECONDS, TIMEOUT_MS as FINAL_PASS_TIMEOUT_MS
@@ -72,6 +75,12 @@ TRAY_STATE_COLORS = {
 # How often the tray re-reads its own status while something is in progress,
 # so the elapsed counter in the tooltip actually moves.
 STATUS_TICK_MS = 1000
+
+# How often the target marker re-checks the window it is drawn on. Only ever
+# the cheap half of caret_target -- no cross-process call -- so this is not
+# about cost but about how quickly the marker should follow a window being
+# dragged, which is the one thing it has to keep up with.
+TARGET_POLL_MS = 200
 
 # How often to check that the server is still there while no socket is open.
 # In on-demand mode nothing else would notice it going away, and a tray icon
@@ -159,6 +168,10 @@ class WhisperTypeApp:
         # Win32 handle of the window that had focus before the Capture Box
         # appeared, so paste can be routed back to it (e.g. Notepad).
         self._prev_foreground_hwnd = None
+        # Where in that window the text is going to land, and the marker drawn
+        # on it. Resolved once per capture while the target still has focus --
+        # see _record_paste_target.
+        self._paste_target = None
 
         # Load settings
         self.load_settings()
@@ -175,6 +188,7 @@ class WhisperTypeApp:
         self.capture_box.set_grow_to_fit(
             self.settings.get("capture_grow_to_fit", DEFAULT_SETTINGS["capture_grow_to_fit"]))
         self.capture_box.set_meter_style(self.settings["capture_meter_style"])
+        self.target_overlay = TargetOverlay()
         self._apply_capture_appearance()
 
         # Core Components
@@ -381,6 +395,11 @@ class WhisperTypeApp:
         self._probe_timer.setInterval(IDLE_PROBE_MS)
         self._probe_timer.timeout.connect(self._on_idle_probe)
         self._probe_timer.start()
+
+        # Keeps the target marker on the target. Runs only during a capture.
+        self._target_timer = QTimer()
+        self._target_timer.setInterval(TARGET_POLL_MS)
+        self._target_timer.timeout.connect(self._on_target_tick)
 
     def _on_status_tick(self):
         icon_state, _, _ = self._status_summary()
@@ -706,7 +725,10 @@ class WhisperTypeApp:
             payload_log.log_event("capture_start")
             # Record the target window now, before the Capture Box steals focus.
             self._record_paste_target()
-            self.capture_box.show_at_cursor()
+            # Before the box, so the flash is already running when the box
+            # fades in over it rather than starting after it has settled.
+            self._show_target_marker()
+            self.capture_box.show_at_cursor(self._capture_anchor())
             if self.connection_status == "Ready":
                 self._begin_streaming()
             else:
@@ -730,23 +752,100 @@ class WhisperTypeApp:
                 self.on_capture_confirmed(self.capture_box.text_area.toPlainText())
 
     def _record_paste_target(self):
-        """Remember the window the transcript should be pasted into.
+        """Remember the window the transcript should be pasted into, and where.
 
         Anything belonging to WhisperType itself is refused: a leftover
         Capture Box or the Settings window can hold the foreground when the
         hotkey fires, and routing the paste there throws the text away. In that
         case the previous target is kept, which is nearly always the window the
         user is actually working in.
+
+        The caret is located here rather than anywhere later because this is
+        the last moment it can be: locating it asks the operating system what
+        has focus, and a few milliseconds from now the answer is the Capture
+        Box's own read-only text area. See caret_target.py.
         """
         hwnd = get_foreground_window()
         if hwnd and is_own_window(hwnd):
             self.logger.debug(
                 "Foreground window 0x%X is ours; keeping previous paste target.",
                 hwnd)
+        else:
+            self._prev_foreground_hwnd = hwnd
+            if hwnd:
+                self.logger.debug("Paste target: 0x%X '%s'", hwnd,
+                                  get_window_title(hwnd))
+
+        self._paste_target = None
+        if not self._prev_foreground_hwnd:
             return
-        self._prev_foreground_hwnd = hwnd
-        if hwnd:
-            self.logger.debug("Paste target: 0x%X '%s'", hwnd, get_window_title(hwnd))
+        if not (self.settings.get("capture_show_target",
+                                  DEFAULT_SETTINGS["capture_show_target"])
+                or self.settings.get("capture_follow_caret",
+                                     DEFAULT_SETTINGS["capture_follow_caret"])):
+            # Neither the marker nor caret-following is wanted, so there is
+            # nothing to spend a UI Automation round trip on.
+            return
+        try:
+            self._paste_target = caret_target.locate(self._prev_foreground_hwnd)
+        except Exception:
+            # Never at the cost of the capture itself: a marker that cannot be
+            # worked out is a missing marker, not a dictation that does not
+            # start.
+            self.logger.exception("Could not locate the paste target.")
+
+    def _show_target_marker(self):
+        """Put the marker up for the capture that is starting."""
+        if not self.settings.get("capture_show_target",
+                                 DEFAULT_SETTINGS["capture_show_target"]):
+            return
+        if self._paste_target is None or self._paste_target.source == "none":
+            return
+        try:
+            self.target_overlay.show_target(self._paste_target)
+            self._target_timer.start()
+        except Exception:
+            self.logger.exception("Could not show the target marker.")
+
+    def _hide_target_marker(self):
+        """Take the marker down. Safe whether or not it ever went up."""
+        self._target_timer.stop()
+        try:
+            self.target_overlay.dismiss()
+        except Exception:
+            self.logger.exception("Could not dismiss the target marker.")
+
+    def _on_target_tick(self):
+        """Keep the marker on the target while the capture runs.
+
+        Only the cheap half of caret_target -- see refresh() there. The window
+        can be dragged, minimised or closed while the box is up, and the
+        marker following it (or going grey when it cannot) is the difference
+        between a mark that means something and a mark left on the desktop.
+        """
+        if self._paste_target is None or not self.target_overlay.isVisible():
+            self._target_timer.stop()
+            return
+        try:
+            self._paste_target = caret_target.refresh(
+                self._paste_target, self._prev_foreground_hwnd)
+            self.target_overlay.update_target(self._paste_target)
+        except Exception:
+            self.logger.exception("Could not refresh the target marker.")
+            self._hide_target_marker()
+
+    def _capture_anchor(self):
+        """Where the Capture Box should open, or None for beside the mouse."""
+        if not self.settings.get("capture_follow_caret",
+                                 DEFAULT_SETTINGS["capture_follow_caret"]):
+            return None
+        if self._paste_target is None:
+            return None
+        try:
+            return target_overlay.caret_anchor(self._paste_target.caret)
+        except Exception:
+            self.logger.exception("Could not derive a caret anchor.")
+            return None
 
     def _begin_streaming(self):
         """Start audio streaming for a capture on a connected session."""
@@ -794,7 +893,13 @@ class WhisperTypeApp:
         processEvents() flushes the hide and the focus change that follows it,
         so the OS can start handing the foreground back to the app being
         dictated into while the paste is still being set up.
+
+        The marker goes with it. It is deliberately kept up for the whole of
+        the final pass -- the box spinning is exactly when someone wonders
+        where the text is about to go -- and taken down here, one moment
+        before it actually goes there.
         """
+        self._hide_target_marker()
         self.capture_box.set_busy(False)
         self.capture_box.hide()
         QApplication.processEvents()
@@ -888,6 +993,7 @@ class WhisperTypeApp:
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
         payload_log.log_event("capture_cancelled")
+        self._hide_target_marker()
         self._paste_pending = False
         if self._final_pass:
             self._final_pass.abandon()
@@ -1004,6 +1110,12 @@ class WhisperTypeApp:
             self.settings.get("capture_text_color",
                               DEFAULT_SETTINGS["capture_text_color"]))
         self.capture_box.set_accent_color(
+            self.settings.get("capture_accent_color",
+                              DEFAULT_SETTINGS["capture_accent_color"]))
+        # The marker takes the box's accent, so the thing pointing at the
+        # target and the thing showing the transcript read as one tool rather
+        # than as two overlays that happen to be up at once.
+        self.target_overlay.set_accent_color(
             self.settings.get("capture_accent_color",
                               DEFAULT_SETTINGS["capture_accent_color"]))
         self.capture_box.set_frost(
@@ -1153,6 +1265,8 @@ class WhisperTypeApp:
 
     def _shutdown(self):
         self._paste_pending = False
+        self._hide_target_marker()
+        caret_target.shutdown()
         if getattr(self, "_final_pass", None):
             self._final_pass.abandon()
         self.audio_capture.shutdown()

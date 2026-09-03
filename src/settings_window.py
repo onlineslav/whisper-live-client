@@ -164,6 +164,15 @@ DEFAULT_SETTINGS = {
     # Re-transcribe the whole capture in one piece when it is confirmed, and
     # paste that instead of the text assembled live. See final_pass.py.
     "final_pass": True,
+    # Mark the place the transcript is going to be pasted into for the length
+    # of the capture. See target_overlay.py. Not a profile setting: it is
+    # about whether the marker is shown at all, not about how the box looks,
+    # so switching appearance profiles must not turn it on or off.
+    "capture_show_target": True,
+    # Open the Capture Box beside the caret it found rather than beside the
+    # mouse. Only possible now that the caret is located at all, and only
+    # takes effect when it was found -- see caret_target.py.
+    "capture_follow_caret": True,
     "capture_font_size": DEFAULT_FONT_SIZE_PX,
     # Empty means the system UI font.
     "capture_font_family": DEFAULT_FONT_FAMILY,
@@ -401,6 +410,18 @@ class SettingsWindow(QWidget):
             "On Confirm, re-send the whole clip for one transcription read in "
             "context. Fixes pauses split into two sentences; adds up to a "
             "second before the paste.")
+        self.capture_show_target_checkbox = QCheckBox(
+            "Mark where the text will be pasted")
+        self.capture_show_target_checkbox.setToolTip(
+            "Outline the field you were typing in and mark the caret while "
+            "you dictate, so you can see where the transcript is going before "
+            "you speak. Falls back to outlining the whole window in apps that "
+            "do not report a caret.")
+        self.capture_follow_caret_checkbox = QCheckBox(
+            "Open the box beside the caret, not the mouse")
+        self.capture_follow_caret_checkbox.setToolTip(
+            "Put the Capture Box next to the text caret when it can be found. "
+            "Falls back to the mouse pointer otherwise.")
         self.auto_start_server_checkbox = QCheckBox(
             "Start the WhisperLive server automatically (Docker)")
         self.auto_start_server_checkbox.setToolTip(
@@ -465,6 +486,14 @@ class SettingsWindow(QWidget):
         connection_column.addWidget(self.reconnect_after_capture_checkbox)
         connection_column.addWidget(self.final_pass_checkbox)
         form_layout.addRow(QLabel("Connection Mode:"), connection_column)
+        # Where the capture happens, as opposed to how it looks: both of these
+        # are about the target window, which is why they sit apart from the
+        # appearance box below.
+        target_column = QVBoxLayout()
+        target_column.setContentsMargins(0, 0, 0, 0)
+        target_column.addWidget(self.capture_show_target_checkbox)
+        target_column.addWidget(self.capture_follow_caret_checkbox)
+        form_layout.addRow(QLabel("Paste Target:"), target_column)
         server_start_column = QVBoxLayout()
         server_start_column.setContentsMargins(0, 0, 0, 0)
         server_start_column.addWidget(self.auto_start_server_checkbox)
@@ -939,6 +968,10 @@ class SettingsWindow(QWidget):
         self.launch_on_startup_checkbox.setChecked(settings.get("launch_on_startup", DEFAULT_SETTINGS["launch_on_startup"]))
         self.connect_on_demand_checkbox.setChecked(settings.get("connect_on_demand", DEFAULT_SETTINGS["connect_on_demand"]))
         self.final_pass_checkbox.setChecked(settings.get("final_pass", DEFAULT_SETTINGS["final_pass"]))
+        self.capture_show_target_checkbox.setChecked(bool(settings.get(
+            "capture_show_target", DEFAULT_SETTINGS["capture_show_target"])))
+        self.capture_follow_caret_checkbox.setChecked(bool(settings.get(
+            "capture_follow_caret", DEFAULT_SETTINGS["capture_follow_caret"])))
         self.auto_start_server_checkbox.setChecked(
             settings.get("auto_start_server", DEFAULT_SETTINGS["auto_start_server"]))
         self.start_docker_desktop_checkbox.setChecked(
@@ -1050,6 +1083,8 @@ class SettingsWindow(QWidget):
             "model": self.model_combo.currentData() or DEFAULT_SETTINGS["model"],
             "connect_on_demand": self.connect_on_demand_checkbox.isChecked(),
             "final_pass": self.final_pass_checkbox.isChecked(),
+            "capture_show_target": self.capture_show_target_checkbox.isChecked(),
+            "capture_follow_caret": self.capture_follow_caret_checkbox.isChecked(),
             "auto_start_server": self.auto_start_server_checkbox.isChecked(),
             "start_docker_desktop": self.start_docker_desktop_checkbox.isChecked(),
             "server_use_gpu": self.server_use_gpu_checkbox.isChecked(),

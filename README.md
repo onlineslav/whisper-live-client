@@ -7,6 +7,7 @@ WhisperType is a sleek, hotkey-driven dictation utility for Windows. It captures
 - **Hotkey Activated**: Press a global hotkey to instantly start or stop dictating.
 - **Live Transcription**: A minimalist "Capture Box" appears, showing your transcribed text as you speak.
 - **Paste at Cursor**: Confirmed transcriptions are automatically pasted into whatever application you're using.
+- **Shows You the Target**: The place the text will land is marked for the length of the capture, so you can see where you are dictating before you speak.
 - **System Tray Control**: Runs unobtrusively in the system tray, providing status and access to settings.
 - **Configurable**: Easily change the server address and hotkey.
 - **Transcription History**: Automatically saves a log of all your transcriptions.
@@ -145,8 +146,23 @@ Other good options:
     that the socket opened, which is why a cold start shows "Loading model"
     for a while first.
 3.  **Press the Hotkey**: Press the configured hotkey (`Ctrl+\` by default) to make the Capture Box appear.
-4.  **Speak**: The box will show "Listening...". As you speak, the transcribed text will appear.
-5.  **Confirm or Cancel**:
+4.  **Check where it is going**: The place the text will be pasted is marked
+    as the box opens, and stays marked until it lands. How precise the mark is
+    tells you how precisely WhisperType knows —
+
+    | What you see | What it means |
+    |---|---|
+    | A bar at the text caret | The exact insertion point was found |
+    | An outline around a field or control | That control has focus; the text goes into it |
+    | A dashed outline round a window, with its name | Only the window is known, not the spot in it |
+    | Everything turns grey | The target window has gone away |
+
+    A dashed outline is worth a second look before speaking: it usually means
+    focus is not in a text field at all. The mark is also why the Capture Box
+    now opens beside your caret rather than beside the mouse. Both behaviours
+    are under **Settings → Paste Target**.
+5.  **Speak**: The box will show "Listening...". As you speak, the transcribed text will appear.
+6.  **Confirm or Cancel**:
     - To **confirm** and paste the text, press the hotkey again, press `Enter`, or click the "✓" button.
     - To **cancel**, press `Esc`, click the "✗" button, or simply click away from the Capture Box.
 

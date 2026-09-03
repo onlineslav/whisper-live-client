@@ -1138,7 +1138,14 @@ class CaptureBox(QWidget):
         self._opacity.setOpacity(1.0)
         self._sync_frost_timer()
 
-    def show_at_cursor(self):
+    def show_at_cursor(self, anchor: QPoint = None):
+        """Open the box for a capture, beside `anchor` or beside the mouse.
+
+        `anchor` is the caret found in the target application -- see
+        caret_target.py. Passing it puts the box next to the text it is about
+        to become rather than next to the pointer, which is usually somewhere
+        else entirely. It is optional because the caret is not always found.
+        """
         self._preview_mode = False
         self._closing = False
         self.set_busy(False)
@@ -1150,7 +1157,7 @@ class CaptureBox(QWidget):
         if app:
             app.installEventFilter(self)
 
-        self._move_near(self._anchor_point())
+        self._move_near(anchor if anchor is not None else self._anchor_point())
         # Before the snapshot: the reservation decides how much of the screen
         # has to be photographed.
         self._reserve_grow_room()
@@ -1165,11 +1172,12 @@ class CaptureBox(QWidget):
         self._animate_opacity(0.0, 1.0)
 
     def _anchor_point(self) -> QPoint:
-        """The point the box hangs from: the text caret if visible, else the mouse.
+        """Where to hang the box when the caller had no caret to offer.
 
-        cursorRectangle() only reports carets inside our own process, so in
-        practice this is the mouse position almost every time; the caret branch
-        is kept for when real caret tracking lands.
+        cursorRectangle() only reports carets inside our own process, so this
+        is the mouse position in every real capture; the caret in another
+        application is found by caret_target.py instead and handed to
+        show_at_cursor() directly.
         """
         caret = QGuiApplication.inputMethod().cursorRectangle()
         if caret.width() > 0 and caret.height() > 0:

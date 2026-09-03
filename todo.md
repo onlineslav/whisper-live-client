@@ -37,6 +37,7 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 - [x] **Persist the server's model cache** — the container had no volume for `/root/.cache/huggingface`, so every recreate re-downloaded every model (2.4 GB, measured). Now a named volume, so switching models in Settings costs one download ever
 - [x] **Fix: the health probe was flooding the server log** — a bare TCP connect makes WhisperLive log a 27-line traceback, once every probe. The idle poll now asks Docker for containers it manages (zero server-side noise) and only falls back to the network for servers it does not own, where it sends a request line rather than hanging up
 - [x] **Click-away to cancel, properly** — driven by window activation loss; a Qt event filter cannot observe clicks in other applications, so the previous implementation never actually worked
+- [x] **Show where the text is going to land** — `caret_target.py` finds the paste target through a three-rung ladder (`GetGUIThreadInfo`'s classic caret, then UI Automation's `TextPattern` selection, then the window itself) and `target_overlay.py` draws on it: a flash when the capture opens, then a caret bar that stays for the length of it. Nothing on screen had ever said where the transcript would go, so a capture aimed at the wrong window looked exactly like one aimed at the right one right up until the paste. The rung that answered is deliberately visible — an exact caret gets a bar, a control gets its own outline, a window and nothing more gets a dashed outline and its name — and a focused element that fills its own window is demoted to the window rung rather than drawn as if it were precise. UI Automation is a cross-process call that can block, so it runs once per capture inside a time budget and disables itself for the session if it overruns; everything after that is pure user32 and free
 
 ---
 
@@ -57,7 +58,7 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 ## Phase 2 — Excellent capture box
 
 - [ ] **Make the text editable before confirming** so transcription errors can be fixed in place
-- [ ] **Real caret-aware positioning** — `QInputMethod.cursorRectangle()` only reports carets inside our own process, so the box always falls back to the mouse; needs `GetGUIThreadInfo` or UI Automation
+- [x] **Real caret-aware positioning** — done as a side effect of the target marker above: `caret_target.locate()` finds the caret in the *other* application, and the box now opens beside it rather than beside the mouse. Off with "Open the box beside the caret, not the mouse", and it still falls back to the pointer wherever no caret is found
 - [ ] **Theme support** (light / dark / follow system) — specified since day one, never built
 - [ ] **Max capture duration** so a forgotten capture cannot stream forever
 - [ ] Visual refinement: icon buttons (`✓` / `✗`) instead of text, opacity setting
