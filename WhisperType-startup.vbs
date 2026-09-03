@@ -3,4 +3,4 @@
 ' Put a shortcut to THIS file in shell:startup.
 Set sh = CreateObject("WScript.Shell")
 sh.Run """" & CreateObject("Scripting.FileSystemObject") _
-    .GetParentFolderName(WScript.ScriptFullName) & "\WhisperBoard.bat""", 0, False
+    .GetParentFolderName(WScript.ScriptFullName) & "\WhisperType.bat""", 0, False

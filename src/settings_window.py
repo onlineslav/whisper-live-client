@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QPoint, QTimer
 from PySide6.QtGui import QKeySequence, QColor, QFont
 
+from branding import wordmark_icon
 from signal_meter import SignalMeter, STYLE_LABELS
 
 from capture_box import (
@@ -90,7 +91,19 @@ MODEL_CHOICES = [
     ("large-v3", "most accurate, slowest"),
 ]
 
-APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "WhisperBoard")
+_APP_DATA_ROOT = os.environ.get("APPDATA", os.path.expanduser("~"))
+APP_DATA_DIR = os.path.join(_APP_DATA_ROOT, "WhisperType")
+
+# Carry a pre-rename data directory over on first launch under the new name,
+# so config, profiles and history survive the rename. One-shot: once the new
+# directory exists this does nothing.
+_LEGACY_APP_DATA_DIR = os.path.join(_APP_DATA_ROOT, "WhisperBoard")
+if not os.path.exists(APP_DATA_DIR) and os.path.isdir(_LEGACY_APP_DATA_DIR):
+    try:
+        os.rename(_LEGACY_APP_DATA_DIR, APP_DATA_DIR)
+    except OSError:
+        pass
+
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 
@@ -189,7 +202,7 @@ DEFAULT_SETTINGS = {
     # reopening it comes back to the same one rather than to "(none)" over
     # settings that plainly are a profile. Empty means none.
     "active_profile": "",
-    # Server startup. WhisperBoard launches itself at login but the WhisperLive
+    # Server startup. WhisperType launches itself at login but the WhisperLive
     # server does not, which left the app looking ready with nothing to talk
     # to. These let it bring the server up itself -- only ever for a server
     # address on this machine.
@@ -220,11 +233,19 @@ class SettingsWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WhisperBoard Settings")
+        self.setWindowTitle("WhisperType Settings")
+        # The same wordmark the tray uses, so the window is recognisably the
+        # app's in the title bar and Alt-Tab.
+        self.setWindowIcon(wordmark_icon())
 
         # UI Elements
         self.server_address_edit = QLineEdit()
+        self.server_address_edit.setToolTip(
+            "host:port of the WhisperLive server. Use localhost to run it on "
+            "this machine.")
         self.capture_hotkey_edit = QKeySequenceEdit()
+        self.capture_hotkey_edit.setToolTip(
+            "Press the key combination that starts and stops a capture.")
         self.model_combo = QComboBox()
         for choice in MODEL_CHOICES:
             if choice is None:
@@ -235,102 +256,85 @@ class SettingsWindow(QWidget):
             # the description is the part that makes the list choosable.
             self.model_combo.addItem(f"{name} — {description}", name)
         self.model_combo.setToolTip(
-            "The transcription model the server loads. The large models need an "
-            "NVIDIA GPU; on a CPU, prefer the distil ones.")
+            "Accuracy against speed. The large models need an NVIDIA GPU; "
+            "on a CPU, pick a distil one.")
         self.capture_font_family_combo = QFontComboBox()
         self.capture_font_family_combo.setToolTip(
-            "The transcript typeface. The box height follows the line height, "
-            "so a tall face can make the box taller.")
+            "Transcript typeface. A tall face makes the box taller.")
         self.capture_font_family_combo.setEditable(False)
         self.capture_font_family_combo.currentFontChanged.connect(self._on_font_picked)
         self.capture_font_size_spin = QSpinBox()
         self.capture_font_size_spin.setRange(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX)
         self.capture_font_size_spin.setSuffix(" px")
+        self.capture_font_size_spin.setToolTip("Transcript text size.")
         self.capture_line_spacing_spin = QSpinBox()
         self.capture_line_spacing_spin.setRange(MIN_LINE_SPACING, MAX_LINE_SPACING)
         self.capture_line_spacing_spin.setPrefix("Lines ")
         self.capture_line_spacing_spin.setSuffix(" %")
         self.capture_line_spacing_spin.setSingleStep(5)
         self.capture_line_spacing_spin.setToolTip(
-            "Space between lines of transcript, as a percentage of the "
-            "typeface's own line height. 100% is what the face asks for; "
-            "more opens the text up for reading at a glance. The box height "
-            "follows, so five lines stays five lines.")
+            "Gap between lines, as a % of the font's natural spacing. "
+            "Higher is easier to skim.")
         self.capture_grow_to_fit_checkbox = QCheckBox("Grow for long transcripts")
         self.capture_grow_to_fit_checkbox.setToolTip(
-            "Make the box taller as the transcript gets longer, instead of "
-            "scrolling inside a fixed one. It grows downwards into the space "
-            "below where it opened and stops at the bottom of the screen, "
-            "after which it scrolls as before.")
+            "Let the box grow downward for long transcripts instead of "
+            "scrolling. Stops at the screen edge, then scrolls.")
         self.capture_opacity_spin = QSpinBox()
         self.capture_opacity_spin.setRange(int(MIN_OPACITY * 100), int(MAX_OPACITY * 100))
         self.capture_opacity_spin.setSuffix(" %")
         self.capture_opacity_spin.setToolTip(
-            "How solid the Capture Box is over whatever is behind it. Lower "
-            "lets the window underneath show through; higher makes the "
-            "transcript easier to read over a page of text.")
+            "How opaque the panel is. Lower shows the window behind; "
+            "higher makes the transcript easier to read.")
         self.capture_bg_color_button = QPushButton()
         self.capture_bg_color_button.setFixedWidth(90)
-        self.capture_bg_color_button.setToolTip("The Capture Box's background colour.")
+        self.capture_bg_color_button.setToolTip("Panel background colour.")
         self.capture_bg_color_button.clicked.connect(self._pick_bg_color)
         self._bg_color = DEFAULT_BG_COLOR
         self.capture_panel_frost_checkbox = QCheckBox("Frosted")
         self.capture_panel_frost_checkbox.setToolTip(
-            "Blur whatever is behind the panel, so a page of text underneath "
-            "reads as texture rather than competing with the transcript. The "
-            "blur is of the screen as it was when the box opened, so it does "
-            "not follow anything moving behind it.")
+            "Blur the screen behind the panel. Captured when the box opens, "
+            "so it does not track windows moving behind it.")
         self.capture_field_frost_checkbox = QCheckBox("Frosted")
         self.capture_field_frost_checkbox.setToolTip(
-            "Frost the transcript inset as well, as a second sheet of glass "
-            "over the panel. Drawn over the panel tint rather than under it, "
-            "so the field reads as its own surface.")
+            "Blur again behind the transcript area, so it reads as its own "
+            "pane over the panel.")
         self.capture_blur_spin = self._frost_spin(
             "Blur ", " px", MIN_BLUR_RADIUS, MAX_BLUR_RADIUS,
-            "Gaussian blur radius. Higher is blurrier, and costs a little "
-            "more each time the box opens.")
+            "Blur strength. Higher is blurrier and a little slower to open.")
         self.capture_saturation_spin = self._frost_spin(
             "Sat ", " %", 0, 400,
-            "Colour in the blurred snapshot. 100% is what was actually on "
-            "screen; above that is what makes frost read as glass rather "
-            "than as a grey smear on a dark desktop.")
+            "Colour in the blur. Above 100% keeps frost from looking like a "
+            "grey smear on a dark desktop.")
         self.capture_brightness_spin = self._frost_spin(
             "Bright ", "", 0, 255,
-            "The brightness the frost is pulled towards, 0 black to 255 "
-            "white. Only has an effect to the extent Level is above zero.")
+            "The tint the frost fades toward, 0 black to 255 white. "
+            "Needs Level above 0 to show.")
         self.capture_levelling_spin = self._frost_spin(
             "Level ", " %", 0, 100,
-            "How hard the frost is pulled towards Bright. This is why a "
-            "panel at 0% opacity still looks grey rather than clear: at 0% "
-            "there is no tint left, so what shows is the levelled snapshot. "
-            "Set this to 0 and the frost keeps the real colours of whatever "
-            "is behind it.")
+            "How far the frost fades toward the Bright tint. Set 0 to keep "
+            "the real colours behind the box.")
         self.capture_field_opacity_spin = QSpinBox()
         self.capture_field_opacity_spin.setRange(int(MIN_OPACITY * 100), int(MAX_OPACITY * 100))
         self.capture_field_opacity_spin.setSuffix(" %")
         self.capture_field_opacity_spin.setToolTip(
-            "How strongly the transcript's inset is filled over the panel "
-            "behind it. This is what separates the text from the buttons and "
-            "the meter; a few per cent is usually enough.")
+            "Fill strength of the transcript area over the panel. A few "
+            "per cent is usually enough to set it apart.")
         self.capture_field_color_button = QPushButton()
         self.capture_field_color_button.setFixedWidth(90)
-        self.capture_field_color_button.setToolTip("The transcript inset's colour.")
+        self.capture_field_color_button.setToolTip("Transcript area colour.")
         self.capture_field_color_button.clicked.connect(self._pick_field_color)
         self._field_color = DEFAULT_FIELD_COLOR
         self.capture_text_color_button = QPushButton()
         self.capture_text_color_button.setFixedWidth(90)
         self.capture_text_color_button.setToolTip(
-            "The transcript's own colour. Set it against the field it sits "
-            "on, not against the desktop -- on a frosted box the field is "
-            "most of what is behind the text.")
+            "Transcript colour. Choose it against the field colour, not "
+            "the desktop.")
         self.capture_text_color_button.clicked.connect(self._pick_text_color)
         self._text_color = DEFAULT_TEXT_COLOR
         self.capture_accent_color_button = QPushButton()
         self.capture_accent_color_button.setFixedWidth(90)
         self.capture_accent_color_button.setToolTip(
-            "The one colour the box draws attention with: the level meter "
-            "and the Confirm button. Cancel stays grey, so the two buttons "
-            "do not compete.")
+            "Colour for the level meter and the Confirm button.")
         self.capture_accent_color_button.clicked.connect(self._pick_accent_color)
         self._accent_color = DEFAULT_ACCENT_COLOR
         # What is currently on disk and in the app, to compare the form
@@ -341,22 +345,19 @@ class SettingsWindow(QWidget):
         self._font_is_default = True
         self.profile_combo = QComboBox()
         self.profile_combo.setToolTip(
-            "A saved Capture Box appearance, by name -- everything from the "
-            "transcript typeface down to the level meter. Choosing one fills "
-            "in the group below; nothing reaches the app until Apply.")
+            "Load a saved look into the fields below. Nothing changes until "
+            "you Apply.")
         self.profile_combo.setMinimumWidth(150)
         self.profile_save_button = QPushButton("Save as...")
         self.profile_save_button.setToolTip(
-            "Save every appearance setting in this group as a named profile.")
+            "Save the fields in this box as a named profile.")
         self.profile_delete_button = QPushButton("Delete")
         self.profile_delete_button.setToolTip("Delete the selected profile.")
         self.capture_preview_button = QPushButton("Preview")
         self.capture_preview_button.setCheckable(True)
         self.capture_preview_button.setToolTip(
-            "Open a sample Capture Box beside this window and keep it there "
-            "while you adjust it. It is the real box, so what it looks like "
-            "is what dictation will look like -- it just does not listen, "
-            "paste, or close itself when you click away.")
+            "Show a live sample box beside this window while you adjust it. "
+            "It is the real box, minus listening and pasting.")
         self.capture_preview_button.toggled.connect(self._on_box_preview_toggled)
         # A box of its own rather than the app's: a preview must not be able
         # to interfere with a capture that is genuinely in progress.
@@ -392,48 +393,44 @@ class SettingsWindow(QWidget):
         self.meter_test_button.setToolTip(
             "Open the microphone to preview the meter. Nothing is sent to the server."
         )
-        self.launch_on_startup_checkbox = QCheckBox("Launch WhisperBoard on system startup")
+        self.launch_on_startup_checkbox = QCheckBox("Launch WhisperType on system startup")
         self.connect_on_demand_checkbox = QCheckBox("Connect to server only when capture starts (on-demand)")
         self.final_pass_checkbox = QCheckBox(
             "Re-transcribe the whole capture before pasting")
         self.final_pass_checkbox.setToolTip(
-            "Live transcription works on a rolling buffer and discards audio as "
-            "it goes, so a pause mid-sentence can come out as two sentences. "
-            "This sends the capture again in one piece when you confirm it, "
-            "which reads the whole thing in context. Costs up to a second "
-            "before the paste appears.")
+            "On Confirm, re-send the whole clip for one transcription read in "
+            "context. Fixes pauses split into two sentences; adds up to a "
+            "second before the paste.")
         self.auto_start_server_checkbox = QCheckBox(
             "Start the WhisperLive server automatically (Docker)")
         self.auto_start_server_checkbox.setToolTip(
-            "Runs the WhisperLive container on this machine when WhisperBoard "
-            "starts. Ignored when the server address points at another machine.")
+            "Run the WhisperLive container locally at startup. Ignored when "
+            "the server address is another machine.")
         self.start_docker_desktop_checkbox = QCheckBox(
             "Launch Docker Desktop if it is not already running")
         self.server_use_gpu_checkbox = QCheckBox(
             "Use the NVIDIA GPU server image")
         self.server_use_gpu_checkbox.setToolTip(
-            "Requires an NVIDIA GPU with Docker's container toolkit installed.")
+            "Needs an NVIDIA GPU with Docker's container toolkit installed.")
         self.share_one_model_checkbox = QCheckBox(
             "Load the model once and share it between connections")
         self.share_one_model_checkbox.setToolTip(
-            "Without this the server loads a separate copy of the model for every "
-            "connection, which accumulates in GPU memory and slows transcription "
-            "down. Changing the model rebuilds the server container.")
+            "One model copy for all connections. Off makes each connection "
+            "load its own, filling GPU memory. Changing the model rebuilds "
+            "the container.")
         self.reconnect_after_capture_checkbox = QCheckBox(
             "Reconnect immediately after each capture")
         self.reconnect_after_capture_checkbox.setToolTip(
-            "Keeps a connection warm so the next dictation starts instantly. Turn "
-            "off to connect only when you dictate, which avoids loading a model "
-            "per capture on a server that does not share one.")
+            "Keep the connection warm so the next dictation starts instantly. "
+            "Off connects on demand instead.")
 
         self.vram_yield_apps_edit = QLineEdit()
         self.vram_yield_apps_edit.setPlaceholderText(
             "e.g. eldenring.exe, cs2.exe  —  leave empty to never stand down")
         self.vram_yield_apps_edit.setToolTip(
-            "While any of these are running, WhisperBoard stops the server so it "
-            "is not holding GPU memory, and starts it again when they exit.\n"
-            "The .exe is optional. Starting the server from the tray overrides "
-            "this until the app closes.")
+            "While any of these run, the server stops to free GPU memory, then "
+            "restarts when they close. The '.exe' is optional; starting the "
+            "server from the tray overrides this until the app closes.")
 
         # Apply commits without closing, so a change can be tried against a
         # real capture and then adjusted again; Save and Exit is the same

@@ -1,4 +1,4 @@
-# WhisperBoard - To-Do List
+# WhisperType - To-Do List
 
 Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for the mandate and the settings reference.
 
@@ -8,7 +8,7 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 
 - [x] **Project setup** — `src/` layout, `requirements.txt`, `main.py` entry point
 - [x] **System tray** — `QSystemTrayIcon`, four programmatically drawn state icons, context menu (Status / Settings / History / Exit)
-- [x] **Settings window** — server address, hotkey, model, connection mode, launch on startup; persisted to `%APPDATA%\WhisperBoard\config.json`; applied live on save
+- [x] **Settings window** — server address, hotkey, model, connection mode, launch on startup; persisted to `%APPDATA%\WhisperType\config.json`; applied live on save
 - [x] **Global hotkey listener** — `pynput`, configurable, reloads after settings save, validates against modifier-only combos
 - [x] **WebSocket client** — connect/disconnect/reconnect, EOS handling, status and message signals, clean thread shutdown via `asyncio.Event`
 - [x] **Audio capture** — 16 kHz mono float32, worker thread, client-side VAD gate with pre-roll and hangover
@@ -21,11 +21,11 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 - [x] **Focus routing for paste** — foreground window recorded at capture start, restored via `AttachThreadInput` before `Ctrl+V`
 - [x] **Fix: confirm was routed to cancel** — screen-vs-local coordinate mismatch in the click-away hit test, plus the app filter seeing the `QWindow` press before the widget's and eating the click
 - [x] **Fix: capture box never held keyboard focus** — `activateWindow()` is denied to a background process, so `Enter`/`Esc` went to the app underneath
-- [x] **Single-instance guard** — named mutex (`Local\WhisperBoard-SingleInstance`); a second launch explains itself and exits. This was not hypothetical: two copies were running, so both opened a box on the same hotkey and the paste landed in the *other* instance's read-only text area, which swallowed it silently
+- [x] **Single-instance guard** — named mutex (`Local\WhisperType-SingleInstance`); a second launch explains itself and exits. This was not hypothetical: two copies were running, so both opened a box on the same hotkey and the paste landed in the *other* instance's read-only text area, which swallowed it silently
 - [x] **Fix: paste did not reach the target app** — rewritten as a paced sequence in `win_input.py`: native `CF_UNICODETEXT` clipboard (Qt's delayed-rendering data object made the paste depend on our event loop), foreground restore verified by polling rather than assumed, held modifiers released so a stray Shift/Alt cannot turn the injected `Ctrl+V` into another shortcut, and `SendInput` return values checked so a refused injection is visible
 - [x] **Notify on paste failure** — tray balloon naming the reason, with the transcript left on the clipboard so `Ctrl+V` still recovers it
 - [x] **Input level meter in the capture box** — `signal_meter.py`: one auto-ranging, VU/PPM-ballistic signal chain (median de-spike, tracked noise floor and decaying peak ceiling, dB-domain normalisation) behind four interchangeable styles, in the space left of the Confirm button. Click the meter to cycle styles; the choice persists
-- [x] **Start the server, and report what it is doing** — `server_manager.py` starts Docker Desktop, pulls the image (with a download percentage), and runs the container; the tray shows a distinct state for each step with elapsed time, and the capture box says what it is waiting for instead of a permanent "Connecting...". WhisperBoard launched at login while the server did not, so the app spent its time looking ready with nothing listening on 9090
+- [x] **Start the server, and report what it is doing** — `server_manager.py` starts Docker Desktop, pulls the image (with a download percentage), and runs the container; the tray shows a distinct state for each step with elapsed time, and the capture box says what it is waiting for instead of a permanent "Connecting...". WhisperType launched at login while the server did not, so the app spent its time looking ready with nothing listening on 9090
 - [x] **Report server status, not just socket status** — `SERVER_READY` and `WAIT` are now read, so "Ready" means the model is loaded rather than that the socket opened; audio recorded during a cold model load is held and flushed instead of being streamed at a server that is not reading yet. Latency is still not measured
 - [x] **Fix: a saved hotkey with a named key would not load** — `_normalize_hotkey_string` stripped the angle brackets off every non-modifier key, so `<ctrl>+<alt>+<f9>` came back as `f9` and pynput refused it. Single-character hotkeys like the default `` <ctrl>+` `` hid this
 - [x] **Share one model across connections** — WhisperLive loads a model per *connection* and hangs up after each `END_OF_AUDIO`, so every dictation left another copy behind: 7.1 GB resident on an 8 GB card after ordinary use, after which the GPU is full, clocks drop and every model crawls (`tiny.en` 1.27s → 5.03s to first word, transcribing three words of a ten-second utterance). Its single-model mode is gated behind a custom model *path*, so the manager resolves the chosen model to its snapshot directory in the cache volume and passes `-fw`. Per-connection load went 0.4–3.3s → 0.0s and VRAM is flat across connections; `distil-large-v3` now matches `tiny.en` for latency
@@ -46,7 +46,7 @@ Reconciled 2026-08-29 against the actual state of the code. See `specs.md` for t
 - [ ] **Draw the VAD threshold on the level meter** — the meter itself is built (below), but the gate's cut-off is not marked on it, so a mic quiet enough to stream nothing still looks the same as one that is working
 - [ ] **Microphone device picker** in settings — the user cannot currently see or choose which mic was opened
 - [ ] **Expose the VAD threshold** as a setting instead of the hardcoded `0.012`
-- [ ] **Log to a file** at `%APPDATA%\WhisperBoard\whisperboard.log` — the packaged build is `console=False` and currently produces no diagnostics at all
+- [ ] **Log to a file** at `%APPDATA%\WhisperType\whispertype.log` — the packaged build is `console=False` and currently produces no diagnostics at all
 - [ ] **Tray left-click opens a status panel** — left-click now shows the current status as a notification balloon, which covers the "is this thing working" question; a real panel is still unbuilt
 - [ ] **Skip empty history entries** — cancelled captures with no text currently write blank lines
 - [ ] **Feedback when the history file is missing** — `open_history` currently `pass`es silently

@@ -1,8 +1,8 @@
-# AI Agent Prompt: Build the WhisperBoard Application
+# AI Agent Prompt: Build the WhisperType Application
 
 ## High-Level Objective
 
-You are an expert Python developer specializing in building sleek, modern Windows desktop applications. Your task is to build **WhisperBoard**, a hotkey-driven dictation utility. You will write the complete, runnable source code for this application based on the detailed specifications below.
+You are an expert Python developer specializing in building sleek, modern Windows desktop applications. Your task is to build **WhisperType**, a hotkey-driven dictation utility. You will write the complete, runnable source code for this application based on the detailed specifications below.
 
 ## Core User Story
 

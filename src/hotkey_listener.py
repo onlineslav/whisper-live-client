@@ -12,7 +12,7 @@ class HotkeyListener(QObject):
     def __init__(self, hotkey_str):
         super().__init__()
         self.hotkey_str = hotkey_str
-        self.logger = logging.getLogger("whisperboard.hotkey")
+        self.logger = logging.getLogger("whispertype.hotkey")
         self.listener_thread = None
         # Store listener so canonical uses same instance
         self._listener = None

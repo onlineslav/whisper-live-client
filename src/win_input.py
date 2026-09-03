@@ -1,7 +1,7 @@
 """Windows clipboard and synthetic-keystroke helpers for the paste step.
 
 Pasting the transcript into "whatever app was active" is the one part of
-WhisperBoard that has to work through the OS rather than through Qt, and each
+WhisperType that has to work through the OS rather than through Qt, and each
 of the pieces below exists because the obvious approach fails in practice:
 
   * The clipboard is written as a plain CF_UNICODETEXT block rather than via
@@ -33,7 +33,7 @@ import logging
 import time
 from ctypes import wintypes
 
-logger = logging.getLogger("whisperboard.input")
+logger = logging.getLogger("whispertype.input")
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002

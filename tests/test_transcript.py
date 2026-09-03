@@ -1,7 +1,7 @@
 r"""Regression tests for the transcript folder, built from real server traffic.
 
 Every fixture below is a trimmed recording of what WhisperLive actually sent
-during a capture, taken from `%APPDATA%\WhisperBoard\payload_capture.jsonl`.
+during a capture, taken from `%APPDATA%\WhisperType\payload_capture.jsonl`.
 The spans are the real ones, because the whole of `_rescue_abandoned` is a
 judgement about spans and inventing tidy ones would test nothing.
 
@@ -129,7 +129,7 @@ class RecordedSessions(unittest.TestCase):
     a recording rather than shipping seven megabytes of the author's dictation.
     """
 
-    LOG = os.path.join(os.getenv("APPDATA", ""), "WhisperBoard",
+    LOG = os.path.join(os.getenv("APPDATA", ""), "WhisperType",
                        "payload_capture.jsonl")
 
     # (words the capture lost, a phrase from the part it never lost)

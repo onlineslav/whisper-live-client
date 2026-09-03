@@ -38,7 +38,7 @@ class AudioCapture(QObject):
         # WhisperLive server reads float32 frames and treats b"END_OF_AUDIO" as EOS
         self.format = pyaudio.paFloat32  # 32-bit float PCM
         self.audio_format = "f32le"  # Handshake/metadata format string
-        self.logger = logging.getLogger("whisperboard.audio")
+        self.logger = logging.getLogger("whispertype.audio")
 
         # Client-side voice activity gating. Whisper hallucinates words when fed
         # near-silent audio, and the server's own VAD leaks. Gating here means

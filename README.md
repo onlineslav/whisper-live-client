@@ -1,6 +1,6 @@
-# WhisperBoard
+# WhisperType
 
-WhisperBoard is a sleek, hotkey-driven dictation utility for Windows. It captures your speech, transcribes it in real-time using a `whisper-live` server, and pastes the text directly at your cursor, integrating dictation into any application.
+WhisperType is a sleek, hotkey-driven dictation utility for Windows. It captures your speech, transcribes it in real-time using a `whisper-live` server, and pastes the text directly at your cursor, integrating dictation into any application.
 
 ## Features
 
@@ -18,10 +18,11 @@ WhisperBoard is a sleek, hotkey-driven dictation utility for Windows. It capture
 
 ## Run the WhisperLive server (Docker)
 
-**WhisperBoard can do this for you.** By default it starts the server itself at
+**WhisperType can do this for you.** By default it starts the server itself at
 launch: it checks whether anything is already listening, starts Docker Desktop
 if the daemon is down, pulls the image if it is missing, and runs the container
-as `whisperboard-server` with `--restart unless-stopped`. The tray icon reports
+as `whisperboard-server` (an internal name kept unchanged through the rename)
+with `--restart unless-stopped`. The tray icon reports
 each step, so a first run that spends ten minutes downloading a 3 GB image
 looks like progress rather than a hang.
 
@@ -37,7 +38,7 @@ of the container, so changing it in Settings rebuilds the container — a few
 seconds, with the weights already cached.
 
 **Release GPU for** takes a list of programs — your games, say. While any of
-them is running, WhisperBoard stops the server so it is not holding GPU memory,
+them is running, WhisperType stops the server so it is not holding GPU memory,
 and starts it again when they exit. Starting the server from the tray menu
 overrides this until that program closes.
 
@@ -65,7 +66,7 @@ To run the server by hand instead:
 
 ## Model selection
 
-WhisperBoard defaults to `distil-small.en`, which gives the best balance of accuracy, speed, and low hallucination rate for English dictation on a typical desktop CPU.
+WhisperType defaults to `distil-small.en`, which gives the best balance of accuracy, speed, and low hallucination rate for English dictation on a typical desktop CPU.
 
 Pick one from the **Settings → Model** dropdown — it is a list rather than a
 text field, because a mistyped model name fails silently: the server rejects it
@@ -115,7 +116,7 @@ Other good options:
     ```bash
     python src/main.py
     ```
-    - A **WhisperBoard** icon will appear in your system tray.
+    - A **WhisperType** icon will appear in your system tray.
     - Right-click the icon and select **Settings**.
     - In the **Server Address** field, enter the WebSocket URL of your running `whisper-live` server (e.g., `ws://localhost:9090`).
     - Click **Save**.
@@ -149,7 +150,7 @@ Other good options:
     - To **confirm** and paste the text, press the hotkey again, press `Enter`, or click the "✓" button.
     - To **cancel**, press `Esc`, click the "✗" button, or simply click away from the Capture Box.
 
-    The text in the box is a live preview. On confirm, WhisperBoard sends the
+    The text in the box is a live preview. On confirm, WhisperType sends the
     whole capture again in one piece and pastes that instead — which is why the
     pasted text is sometimes punctuated a little differently from what you
     watched appear. Live transcription reads a rolling buffer and discards
@@ -161,7 +162,7 @@ Other good options:
 
 ## Building the Executable (Optional)
 
-You can bundle WhisperBoard into a single `.exe` file for easy distribution using `PyInstaller`.
+You can bundle WhisperType into a single `.exe` file for easy distribution using `PyInstaller`.
 
 1.  **Install PyInstaller:**
     ```bash
@@ -169,10 +170,10 @@ You can bundle WhisperBoard into a single `.exe` file for easy distribution usin
     ```
 
 2.  **Build the Executable:**
-    A `WhisperBoard.spec` file is included in the repository. Run PyInstaller with this file:
+    A `WhisperType.spec` file is included in the repository. Run PyInstaller with this file:
     ```bash
-    pyinstaller WhisperBoard.spec
+    pyinstaller WhisperType.spec
     ```
 
 3.  **Find the Executable:**
-    The final executable, `WhisperBoard.exe`, will be located in the `dist` directory.
+    The final executable, `WhisperType.exe`, will be located in the `dist` directory.

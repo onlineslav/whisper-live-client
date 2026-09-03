@@ -62,12 +62,12 @@ class WebSocketClient(QObject):
         self.sample_rate = sample_rate
         self.channels = channels
         self.audio_format = audio_format
-        self.logger = logging.getLogger("whisperboard.websocket")
+        self.logger = logging.getLogger("whispertype.websocket")
         self.websocket = None
         self.thread = None
         self.loop = None
         self.is_running = False
-        self.uid = "whisperboard-client"
+        self.uid = "whispertype-client"
         self._eos_sent = False
         self._stop_event: asyncio.Event | None = None
         self._server_ready = False

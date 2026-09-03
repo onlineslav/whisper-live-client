@@ -1,4 +1,4 @@
-# Project Specification: WhisperBoard
+# Project Specification: WhisperType
 
 *A sleek, hotkey-driven dictation utility for Windows that captures speech, transcribes it via a `whisper-live` server, and inserts the text at your cursor.*
 
@@ -10,7 +10,7 @@ Last revised: 2026-08-29
 
 ### 1.1. What this is
 
-WhisperBoard is a **personal daily-driver dictation tool**, built to a standard that would let it be shared later without a rewrite. It is not a product yet; it is a tool that must be good enough to reach for a dozen times a day without friction.
+WhisperType is a **personal daily-driver dictation tool**, built to a standard that would let it be shared later without a rewrite. It is not a product yet; it is a tool that must be good enough to reach for a dozen times a day without friction.
 
 ### 1.2. Who it is for
 
@@ -98,7 +98,7 @@ Grouped into tabs rather than a single flat form. Full reference in §5.
 
 ## 5. Settings Reference
 
-Stored at `%APPDATA%\WhisperBoard\config.json`. Settings apply live on save; no restart.
+Stored at `%APPDATA%\WhisperType\config.json`. Settings apply live on save; no restart.
 
 ### 5.1. Connection
 
@@ -183,11 +183,11 @@ Clipboard + simulated `Ctrl+V`, preceded by an explicit focus restore to the win
 
 ### 6.5. Diagnostics
 
-Logging must go to a **file** at `%APPDATA%\WhisperBoard\whisperboard.log`, not only stdout: the packaged app is built with `console=False`, so a frozen build currently produces no diagnostics at all.
+Logging must go to a **file** at `%APPDATA%\WhisperType\whispertype.log`, not only stdout: the packaged app is built with `console=False`, so a frozen build currently produces no diagnostics at all.
 
 ### 6.6. Transcription history
 
-Appended to `%APPDATA%\WhisperBoard\transcription_history.log`, timestamped, recording both confirmed and cancelled captures. Empty captures are not logged. No rotation — the log is a permanent safety net.
+Appended to `%APPDATA%\WhisperType\transcription_history.log`, timestamped, recording both confirmed and cancelled captures. Empty captures are not logged. No rotation — the log is a permanent safety net.
 
 ---
 
@@ -199,7 +199,7 @@ Appended to `%APPDATA%\WhisperBoard\transcription_history.log`, timestamped, rec
 - **Audio** — pyaudio 0.2.14
 - **Hotkeys** — pynput 1.8.1
 - **Win32** — `ctypes` against `user32`/`kernel32` for focus control
-- **Packaging** — PyInstaller (`WhisperBoard.spec`)
+- **Packaging** — PyInstaller (`WhisperType.spec`)
 
 Versions are pinned in `requirements.txt`; PySide6 and websockets in particular have made breaking API changes.
 

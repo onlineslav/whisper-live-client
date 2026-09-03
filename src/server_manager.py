@@ -1,6 +1,6 @@
 r"""Brings the WhisperLive server up, and reports honestly on how far it got.
 
-WhisperBoard launches itself at login; the server it talks to does not. The
+WhisperType launches itself at login; the server it talks to does not. The
 result was an app that sat in the tray looking ready while nothing was
 listening on port 9090, and a capture box stuck on "Connecting..." forever.
 
@@ -41,6 +41,11 @@ STATE_RUNNING = "running"            # something is listening on the port
 STATE_FAILED = "failed"              # gave up; detail says why
 STATE_PAUSED = "paused"              # stopped on purpose, to free the GPU
 
+# These Docker object names keep the old "whisperboard-" prefix on purpose,
+# through the rename to WhisperType: renaming them would orphan a running
+# container (a second one then races it for port 9090) and abandon the model
+# cache volume, forcing gigabytes of re-download. They are internal identifiers
+# the user rarely sees, so the churn is not worth it.
 CONTAINER_NAME = "whisperboard-server"
 
 # Whisper weights are downloaded on first use of each model and cached here
@@ -148,7 +153,7 @@ def is_local_address(address: str) -> bool:
     """True if the address names this machine.
 
     Starting a container is only ever the right answer for a server that is
-    supposed to be here. Pointed at someone else's box, WhisperBoard has no
+    supposed to be here. Pointed at someone else's box, WhisperType has no
     business launching anything.
     """
     host, _ = parse_address(address)
@@ -277,7 +282,7 @@ class ServerManager(QObject):
 
     def __init__(self, settings: dict):
         super().__init__()
-        self.logger = logging.getLogger("whisperboard.server")
+        self.logger = logging.getLogger("whispertype.server")
         self.settings = settings
         self.state = STATE_DISABLED
         self.detail = ""
@@ -508,7 +513,7 @@ class ServerManager(QObject):
         self.model_progress.emit("")
 
     def stop_server(self):
-        """Stop the container WhisperBoard started. Non-blocking."""
+        """Stop the container WhisperType started. Non-blocking."""
         self._run_async(self._stop_blocking, "server-stop")
 
     def shutdown(self):
@@ -889,7 +894,7 @@ class ServerManager(QObject):
                    + (" (GPU)" if use_gpu else ""))
         args = ["run", "-d", "--name", CONTAINER_NAME,
                 # So a machine that reboots into Docker Desktop brings the
-                # server back without WhisperBoard having to ask.
+                # server back without WhisperType having to ask.
                 "--restart", "unless-stopped",
                 "-v", f"{MODEL_CACHE_VOLUME}:{MODEL_CACHE_PATH}",
                 "-p", f"{host_port}:{CONTAINER_PORT}"]

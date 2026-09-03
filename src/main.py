@@ -6,11 +6,10 @@ import os
 import logging
 import time
 from datetime import datetime
-from PySide6.QtGui import (
-    QIcon, QAction, QPixmap, QPainter, QColor, QFont, QPainterPath, QTransform,
-)
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QMessageBox
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
+from branding import wordmark_icon
 from settings_window import SettingsWindow, DEFAULT_SETTINGS, APP_DATA_DIR, CONFIG_FILE
 from hotkey_listener import HotkeyListener
 from websocket_client import WebSocketClient, VAD_PARAMETERS
@@ -57,18 +56,9 @@ FINAL_PASS_WATCHDOG_MS = FINAL_PASS_TIMEOUT_MS + 2500
 # is under 4 MB.
 MAX_CAPTURE_AUDIO_BYTES = BYTES_PER_SECOND * (MAX_REPLAY_SECONDS + 10)
 
-# Tray icon wordmark. "W" reads cleanly at the ~16px Windows renders the tray
-# at; "WL" is legible from about 24px up and turns to mush below it.
-TRAY_LETTER = "W"
-
-# Windows asks for the tray icon at a handful of sizes depending on DPI and
-# taskbar settings. Rendering each one rather than downscaling a single large
-# bitmap keeps the letterform crisp — downscaled type blurs badly.
-TRAY_ICON_SIZES = (16, 20, 24, 32, 48, 64)
-
 # One colour per thing the user can actually do something about. "starting"
 # is distinct from "connecting" because they fail differently: an amber icon
-# means WhisperBoard is bringing the server up and the wait is expected, while
+# means WhisperType is bringing the server up and the wait is expected, while
 # grey means nothing is running and nothing is being done about it.
 TRAY_STATE_COLORS = {
     "ready": "#2ecc71",
@@ -99,7 +89,7 @@ _instance_mutex = None
 def acquire_single_instance() -> bool:
     """Claim the one-instance-per-session lock. False if already running.
 
-    Two copies of WhisperBoard are actively broken, not merely wasteful: both
+    Two copies of WhisperType are actively broken, not merely wasteful: both
     listen for the same global hotkey, so both open a Capture Box stacked on
     the same spot, both stream the microphone to the server, and both fight
     over the foreground. The paste then lands in the *other* instance's box --
@@ -116,7 +106,7 @@ def acquire_single_instance() -> bool:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateMutexW.restype = ctypes.c_void_p
         kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
-        _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\WhisperBoard-SingleInstance")
+        _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\WhisperType-SingleInstance")
         ERROR_ALREADY_EXISTS = 183
         return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
     except (OSError, AttributeError):
@@ -124,11 +114,15 @@ def acquire_single_instance() -> bool:
         # than blocking startup over a guard.
         return True
 
-class WhisperBoardApp:
+class WhisperTypeApp:
     def __init__(self):
-        self.logger = logging.getLogger("whisperboard.app")
+        self.logger = logging.getLogger("whispertype.app")
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
+        # The title-bar / Alt-Tab / taskbar icon for every window the app
+        # opens (Settings, dialogs), so they match the tray's wordmark. The
+        # tray sets its own status-coloured variant on top of this.
+        self.app.setWindowIcon(wordmark_icon())
 
         self.is_capturing = False
         self._capture_waiting_for_connection = False
@@ -251,57 +245,9 @@ class WhisperBoardApp:
         self.menu.addAction(self.exit_action)
 
     def _build_state_icons(self):
-        """Builds the tray icons: a bold wordmark on a state-coloured disc."""
-
-        def render(size: int, base_color: str) -> QPixmap:
-            pixmap = QPixmap(size, size)
-            pixmap.fill(Qt.transparent)
-            painter = QPainter(pixmap)
-            painter.setRenderHint(QPainter.Antialiasing)
-
-            inset = max(1, round(size * 0.03))
-            diameter = size - 2 * inset
-            painter.setBrush(QColor(base_color))
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(inset, inset, diameter, diameter)
-
-            # The wordmark is filled as a vector path rather than drawn as text.
-            # Qt's Windows font engine applies ClearType subpixel antialiasing
-            # whatever the style strategy or paint device, which bakes coloured
-            # RGB fringes into the glyph edges — visible once the icon is
-            # composited over the taskbar. Path filling uses the plain
-            # antialiasing rasteriser, so the edges stay neutral.
-            font = QFont("Segoe UI")
-            font.setBold(True)
-            font.setPixelSize(100)  # reference size; scaled to fit below
-            path = QPainterPath()
-            path.addText(0, 0, font, TRAY_LETTER)
-            bounds = path.boundingRect()
-            if bounds.isEmpty():
-                painter.end()
-                return pixmap
-
-            # Scale to fit the disc, then centre on the glyph's own ink rather
-            # than the font's line box — capitals sit high in the line box and
-            # would look bottom-heavy inside a circle.
-            scale = min(diameter * 0.74 / bounds.width(),
-                        diameter * 0.56 / bounds.height())
-            transform = QTransform()
-            transform.translate(size / 2, size / 2)
-            transform.scale(scale, scale)
-            transform.translate(-bounds.center().x(), -bounds.center().y())
-
-            painter.fillPath(transform.map(path), QColor("#ffffff"))
-            painter.end()
-            return pixmap
-
-        def make_icon(base_color: str) -> QIcon:
-            icon = QIcon()
-            for size in TRAY_ICON_SIZES:
-                icon.addPixmap(render(size, base_color))
-            return icon
-
-        return {state: make_icon(color) for state, color in TRAY_STATE_COLORS.items()}
+        """The tray icons: the app wordmark on a disc, one colour per state."""
+        return {state: wordmark_icon(color)
+                for state, color in TRAY_STATE_COLORS.items()}
 
     def _set_tray_icon_state(self, state: str):
         icon = self.state_icons.get(state, self.state_icons.get("error"))
@@ -386,7 +332,7 @@ class WhisperBoardApp:
             self._update_capture_status_text(label, detail)
 
     def _tooltip_text(self, label: str, detail: str, icon_state: str) -> str:
-        text = f"WhisperBoard \u2014 {label}"
+        text = f"WhisperType \u2014 {label}"
         # Elapsed time only while something is in flight, and only once it has
         # gone on long enough to be worth watching. On a settled state, a
         # running counter would be noise.
@@ -492,7 +438,7 @@ class WhisperBoardApp:
         # to find out whether their dictation is going to work.
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             _, label, detail = self._status_summary()
-            self._notify(f"WhisperBoard \u2014 {label}", detail or "")
+            self._notify(f"WhisperType \u2014 {label}", detail or "")
 
     def on_start_server(self):
         self._server_failure_notified = False
@@ -657,11 +603,18 @@ class WhisperBoardApp:
             import winreg
             run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
+                # Drop the pre-rename entry whichever way this goes, so a box
+                # that had autostart on under the old name does not keep
+                # launching the old path alongside the new one.
+                try:
+                    winreg.DeleteValue(key, "WhisperBoard")
+                except FileNotFoundError:
+                    pass
                 if enabled:
-                    winreg.SetValueEx(key, "WhisperBoard", 0, winreg.REG_SZ, self._startup_command())
+                    winreg.SetValueEx(key, "WhisperType", 0, winreg.REG_SZ, self._startup_command())
                 else:
                     try:
-                        winreg.DeleteValue(key, "WhisperBoard")
+                        winreg.DeleteValue(key, "WhisperType")
                     except FileNotFoundError:
                         pass
         except Exception:
@@ -779,7 +732,7 @@ class WhisperBoardApp:
     def _record_paste_target(self):
         """Remember the window the transcript should be pasted into.
 
-        Anything belonging to WhisperBoard itself is refused: a leftover
+        Anything belonging to WhisperType itself is refused: a leftover
         Capture Box or the Settings window can hold the foreground when the
         hotkey fires, and routing the paste there throws the text away. In that
         case the previous target is kept, which is nearly always the window the
@@ -1129,7 +1082,7 @@ class WhisperBoardApp:
             # Should be unreachable now that _record_paste_target filters our
             # own windows, but pasting into our read-only box loses the text
             # silently, so it is worth refusing twice.
-            self._paste_unavailable("the target window belongs to WhisperBoard", text)
+            self._paste_unavailable("the target window belongs to WhisperType", text)
             return
 
         if not focus_window(hwnd):
@@ -1225,20 +1178,20 @@ def main():
     logging.getLogger("websockets").setLevel(logging.INFO)
 
     if not acquire_single_instance():
-        logging.getLogger("whisperboard.app").error(
-            "Another WhisperBoard instance is already running; exiting.")
+        logging.getLogger("whispertype.app").error(
+            "Another WhisperType instance is already running; exiting.")
         # A QApplication is needed for the message box, and it must be created
         # before any widget. This one is discarded with the process.
         QApplication(sys.argv)
         QMessageBox.warning(
-            None, "WhisperBoard",
-            "WhisperBoard is already running.\n\n"
+            None, "WhisperType",
+            "WhisperType is already running.\n\n"
             "Look for the tray icon near the clock. Running two copies breaks "
             "dictation: both open a capture box on the same hotkey and the "
             "paste lands in the wrong one.")
         sys.exit(0)
 
-    app = WhisperBoardApp()
+    app = WhisperTypeApp()
     app.run()
 
 if __name__ == "__main__":

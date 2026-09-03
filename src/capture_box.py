@@ -426,7 +426,7 @@ class CaptureBox(QWidget):
 
         # Never shown (the window is frameless), but it makes the box
         # identifiable in window lists and in logs when tracing a stray paste.
-        self.setWindowTitle("WhisperBoard Capture")
+        self.setWindowTitle("WhisperType Capture")
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint

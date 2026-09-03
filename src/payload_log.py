@@ -7,10 +7,10 @@ final, and how much a segment's text still moves before it gets there. Both
 vary between WhisperLive versions, so they are read off real sessions here
 rather than guessed at from the docs.
 
-Records to `%APPDATA%\WhisperBoard\payload_capture.jsonl`, one JSON object per
+Records to `%APPDATA%\WhisperType\payload_capture.jsonl`, one JSON object per
 line, timestamped from process start so a message can be placed against the
 capture it belongs to. On by default while the insertion model is being
-settled; set WHISPERBOARD_PAYLOAD_LOG=0 to silence it. Delete this module once
+settled; set WHISPERTYPE_PAYLOAD_LOG=0 to silence it. Delete this module once
 inline insertion is built.
 """
 
@@ -24,12 +24,12 @@ from settings_window import APP_DATA_DIR
 
 PAYLOAD_FILE = os.path.join(APP_DATA_DIR, "payload_capture.jsonl")
 
-_logger = logging.getLogger("whisperboard.payloads")
+_logger = logging.getLogger("whispertype.payloads")
 _start = time.monotonic()
 # Messages arrive on the WebSocket thread while capture events are emitted from
 # the GUI thread; without the lock their lines interleave mid-write.
 _lock = threading.Lock()
-_enabled = os.environ.get("WHISPERBOARD_PAYLOAD_LOG", "1") not in ("0", "", "false", "False")
+_enabled = os.environ.get("WHISPERTYPE_PAYLOAD_LOG", "1") not in ("0", "", "false", "False")
 _warned = False
 
 

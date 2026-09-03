@@ -93,7 +93,7 @@ class FinalPass(QObject):
         self.server_address = server_address
         self.model = model
         self.vad_parameters = vad_parameters
-        self.logger = logging.getLogger("whisperboard.finalpass")
+        self.logger = logging.getLogger("whispertype.finalpass")
         self._thread = None
         self._generation = 0
 
@@ -141,7 +141,7 @@ class FinalPass(QObject):
 
     def _handshake(self) -> str:
         options = {
-            "uid": "whisperboard-final-pass",
+            "uid": "whispertype-final-pass",
             "language": "en",
             "task": "transcribe",
             "model": self.model,

@@ -1,4 +1,4 @@
-# WhisperBoard.spec
+# WhisperType.spec
 # -*- mode: python ; coding: utf-8 -*-
 
 a = Analysis(
@@ -18,7 +18,7 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    name='WhisperBoard',
+    name='WhisperType',
     console=False, # Create a windowed app
     icon=None,
 )

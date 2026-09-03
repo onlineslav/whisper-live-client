@@ -275,7 +275,7 @@ class SignalMeter(QWidget):
         # entirely, so it opts out rather than drawing on top of a stray box.
         self.setStyleSheet("background: transparent; border: none;")
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("Input level - click to change the meter style")
+        self.setToolTip("Input level. Click to change the meter style.")
         self._accent = QColor(ACCENT)
 
         self._timer = QTimer(self)
