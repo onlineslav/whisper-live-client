@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QTextEdit,
     QGraphicsOpacityEffect,
+    QSizePolicy,
 )
 from PySide6.QtCore import (
     Qt,
@@ -133,6 +134,16 @@ FIELD_FOCUS_LIFT = 0.37
 # to bottom reads as adrift. Left-aligned instead, so its left edge lines up
 # with the transcript above it, the way the wide styles already fill out to.
 LEFT_ALIGNED_METER_STYLES = {"arc", "circle"}
+
+# The gap ahead of a left-aligned meter, in px. Flush against the row's own
+# edge lined the widget's bounding box up with the transcript field's, not
+# with the text inside it -- the field has a 1px border and 10px of padding
+# of its own, so the glyphs actually start about 11px in. Arc and circle
+# also draw a few px in from their own edges (see ARC_INSET_PX and circle's
+# stroke inset), which eats most of that gap on its own. What is left is one
+# of the app's own 8px spacing units, the same one everything else here is
+# built from -- not a bespoke nudge, just the grid the rest of the box uses.
+METER_LEFT_INSET = 8
 
 # Corner radius of the box, in px, and of the transcript field inside it.
 # The field's has to match the border-radius its stylesheet sets, or the
@@ -631,8 +642,17 @@ class CaptureBox(QWidget):
         right instead, flushing the meter to the left edge.
         """
         left = self.meter.style_name() in LEFT_ALIGNED_METER_STYLES
+        # The leading spacer keeps the Expanding policy addStretch() gave it,
+        # so it still collapses to nothing when both sides are meant to
+        # balance -- only its floor changes, from 0 (centred) to one inset
+        # (left-aligned), which a stretch factor of 0 cannot grow past while
+        # the trailing spacer has all the claim on whatever space is left.
+        self._button_row.itemAt(0).spacerItem().changeSize(
+            METER_LEFT_INSET if left else 0, 0,
+            QSizePolicy.Expanding, QSizePolicy.Minimum)
         self._button_row.setStretch(0, 0)
         self._button_row.setStretch(2, 1 if left else 0)
+        self._button_row.invalidate()
 
     def set_surface(self, color: str = None, opacity=None, frosted=None):
         """Set the box's background colour, how solid it is, and its backdrop.
