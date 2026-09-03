@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QCheckBox,
     QFormLayout,
+    QGroupBox,
     QMessageBox,
     QKeySequenceEdit,
     QSpinBox,
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QPoint, QTimer
 from PySide6.QtGui import QKeySequence, QColor, QFont
 
-from signal_meter import SignalMeter
+from signal_meter import SignalMeter, STYLE_LABELS
 
 from capture_box import (
     CaptureBox,
@@ -40,6 +41,8 @@ from capture_box import (
     DEFAULT_BG_COLOR,
     DEFAULT_FIELD_OPACITY,
     DEFAULT_FIELD_COLOR,
+    DEFAULT_TEXT_COLOR,
+    DEFAULT_ACCENT_COLOR,
     DEFAULT_PANEL_FROST,
     DEFAULT_FIELD_FROST,
     DEFAULT_BLUR_RADIUS,
@@ -108,6 +111,37 @@ def profile_path(name: str) -> str:
     return os.path.join(PROFILE_DIR, f"{safe}.json")
 
 
+# Everything a profile is made of, and nothing else: the Capture Box's
+# appearance, from the transcript typeface through to the level meter. A
+# profile is about how the box looks, so it deliberately leaves the server
+# address, the hotkey and the model alone -- switching from a dark box to a
+# light one should not quietly switch machines with it.
+#
+# The Settings window groups exactly these controls under the profile picker,
+# so what is inside that box is what is inside the file. An appearance setting
+# added to the group and not added here would be shown as part of a profile
+# and then not saved with it.
+APPEARANCE_KEYS = (
+    "capture_font_size",
+    "capture_font_family",
+    "capture_line_spacing",
+    "capture_grow_to_fit",
+    "capture_opacity",
+    "capture_bg_color",
+    "capture_panel_frost",
+    "capture_field_opacity",
+    "capture_field_color",
+    "capture_field_frost",
+    "capture_text_color",
+    "capture_accent_color",
+    "capture_blur_radius",
+    "capture_frost_saturation",
+    "capture_frost_brightness",
+    "capture_frost_levelling",
+    "capture_meter_style",
+)
+
+
 DEFAULT_SETTINGS = {
     "server_address": "ws://localhost:9090",
     "capture_hotkey": "ctrl+`",
@@ -146,7 +180,15 @@ DEFAULT_SETTINGS = {
     # it -- see capture_box.py for why the two are not one control.
     "capture_field_opacity": DEFAULT_FIELD_OPACITY,
     "capture_field_color": DEFAULT_FIELD_COLOR,
+    # The transcript's ink, and the colour the level meter and the Confirm
+    # button are drawn in. See capture_box.py.
+    "capture_text_color": DEFAULT_TEXT_COLOR,
+    "capture_accent_color": DEFAULT_ACCENT_COLOR,
     "capture_meter_style": METER_STYLES[0],
+    # Which profile the appearance in force came from, so closing the app and
+    # reopening it comes back to the same one rather than to "(none)" over
+    # settings that plainly are a profile. Empty means none.
+    "active_profile": "",
     # Server startup. WhisperBoard launches itself at login but the WhisperLive
     # server does not, which left the app looking ready with nothing to talk
     # to. These let it bring the server up itself -- only ever for a server
@@ -275,6 +317,22 @@ class SettingsWindow(QWidget):
         self.capture_field_color_button.setToolTip("The transcript inset's colour.")
         self.capture_field_color_button.clicked.connect(self._pick_field_color)
         self._field_color = DEFAULT_FIELD_COLOR
+        self.capture_text_color_button = QPushButton()
+        self.capture_text_color_button.setFixedWidth(90)
+        self.capture_text_color_button.setToolTip(
+            "The transcript's own colour. Set it against the field it sits "
+            "on, not against the desktop -- on a frosted box the field is "
+            "most of what is behind the text.")
+        self.capture_text_color_button.clicked.connect(self._pick_text_color)
+        self._text_color = DEFAULT_TEXT_COLOR
+        self.capture_accent_color_button = QPushButton()
+        self.capture_accent_color_button.setFixedWidth(90)
+        self.capture_accent_color_button.setToolTip(
+            "The one colour the box draws attention with: the level meter "
+            "and the Confirm button. Cancel stays grey, so the two buttons "
+            "do not compete.")
+        self.capture_accent_color_button.clicked.connect(self._pick_accent_color)
+        self._accent_color = DEFAULT_ACCENT_COLOR
         # What is currently on disk and in the app, to compare the form
         # against on the way out. None until load_settings has run.
         self._applied_settings = None
@@ -283,12 +341,13 @@ class SettingsWindow(QWidget):
         self._font_is_default = True
         self.profile_combo = QComboBox()
         self.profile_combo.setToolTip(
-            "A whole saved settings file, by name. Choosing one fills this "
-            "window in from it -- nothing reaches the app until Apply.")
+            "A saved Capture Box appearance, by name -- everything from the "
+            "transcript typeface down to the level meter. Choosing one fills "
+            "in the group below; nothing reaches the app until Apply.")
         self.profile_combo.setMinimumWidth(150)
         self.profile_save_button = QPushButton("Save as...")
         self.profile_save_button.setToolTip(
-            "Save everything in this window as a named profile.")
+            "Save every appearance setting in this group as a named profile.")
         self.profile_delete_button = QPushButton("Delete")
         self.profile_delete_button.setToolTip("Delete the selected profile.")
         self.capture_preview_button = QPushButton("Preview")
@@ -303,7 +362,11 @@ class SettingsWindow(QWidget):
         # to interfere with a capture that is genuinely in progress.
         self._preview_box = None
         self.capture_meter_style_combo = QComboBox()
-        self.capture_meter_style_combo.addItems(METER_STYLES)
+        for style in METER_STYLES:
+            # The label is shown; the style key is what is stored and sent to
+            # the box, so renaming a label in STYLE_LABELS never touches a
+            # saved profile.
+            self.capture_meter_style_combo.addItem(STYLE_LABELS.get(style, style), style)
         # A live preview, on the dark ground it will actually be seen against.
         # A meter can only be judged moving, so the alternative -- save, close,
         # start a capture, decide you dislike it, reopen settings -- is not a
@@ -412,6 +475,22 @@ class SettingsWindow(QWidget):
         server_start_column.addWidget(self.server_use_gpu_checkbox)
         server_start_column.addWidget(self.share_one_model_checkbox)
         form_layout.addRow(QLabel("Server Startup:"), server_start_column)
+        # Every control a profile covers, inside one titled box with the
+        # picker at the top of it. The grouping is the explanation: what a
+        # profile saves is the thing it is drawn around, so there is no
+        # guessing whether the meter style or the server address travels with
+        # it. Keep this box and APPEARANCE_KEYS in step.
+        appearance_group = QGroupBox("Capture Box appearance — saved as a profile")
+        appearance_form = QFormLayout(appearance_group)
+        profile_row = QHBoxLayout()
+        profile_row.setContentsMargins(0, 0, 0, 0)
+        profile_row.addWidget(self.profile_combo)
+        profile_row.addSpacing(8)
+        profile_row.addWidget(self.profile_save_button)
+        profile_row.addWidget(self.profile_delete_button)
+        profile_row.addStretch()
+        profile_row.addWidget(self.capture_preview_button)
+        appearance_form.addRow(QLabel("Profile:"), profile_row)
         type_row = QHBoxLayout()
         type_row.setContentsMargins(0, 0, 0, 0)
         type_row.addWidget(self.capture_font_family_combo, 1)
@@ -419,8 +498,10 @@ class SettingsWindow(QWidget):
         type_row.addWidget(self.capture_font_size_spin)
         type_row.addSpacing(8)
         type_row.addWidget(self.capture_line_spacing_spin)
-        form_layout.addRow(QLabel("Capture Text:"), type_row)
-        form_layout.addRow(QLabel(""), self.capture_grow_to_fit_checkbox)
+        type_row.addSpacing(8)
+        type_row.addWidget(self.capture_text_color_button)
+        appearance_form.addRow(QLabel("Capture Text:"), type_row)
+        appearance_form.addRow(QLabel(""), self.capture_grow_to_fit_checkbox)
         appearance_row = QHBoxLayout()
         appearance_row.setContentsMargins(0, 0, 0, 0)
         appearance_row.addWidget(self.capture_opacity_spin)
@@ -429,8 +510,7 @@ class SettingsWindow(QWidget):
         appearance_row.addSpacing(8)
         appearance_row.addWidget(self.capture_panel_frost_checkbox)
         appearance_row.addStretch()
-        appearance_row.addWidget(self.capture_preview_button)
-        form_layout.addRow(QLabel("Panel:"), appearance_row)
+        appearance_form.addRow(QLabel("Panel:"), appearance_row)
         field_row = QHBoxLayout()
         field_row.setContentsMargins(0, 0, 0, 0)
         field_row.addWidget(self.capture_field_opacity_spin)
@@ -439,7 +519,7 @@ class SettingsWindow(QWidget):
         field_row.addSpacing(8)
         field_row.addWidget(self.capture_field_frost_checkbox)
         field_row.addStretch()
-        form_layout.addRow(QLabel("Transcript Field:"), field_row)
+        appearance_form.addRow(QLabel("Transcript Field:"), field_row)
         frost_row = QHBoxLayout()
         frost_row.setContentsMargins(0, 0, 0, 0)
         for spin in (self.capture_blur_spin, self.capture_saturation_spin,
@@ -447,15 +527,21 @@ class SettingsWindow(QWidget):
             frost_row.addWidget(spin)
             frost_row.addSpacing(4)
         frost_row.addStretch()
-        form_layout.addRow(QLabel("Frost:"), frost_row)
-        profile_row = QHBoxLayout()
-        profile_row.setContentsMargins(0, 0, 0, 0)
-        profile_row.addWidget(self.profile_combo)
-        profile_row.addSpacing(8)
-        profile_row.addWidget(self.profile_save_button)
-        profile_row.addWidget(self.profile_delete_button)
-        profile_row.addStretch()
-        form_layout.addRow(QLabel("Profile:"), profile_row)
+        appearance_form.addRow(QLabel("Frost:"), frost_row)
+        accent_row = QHBoxLayout()
+        accent_row.setContentsMargins(0, 0, 0, 0)
+        accent_row.addWidget(self.capture_accent_color_button)
+        accent_row.addSpacing(8)
+        accent_row.addWidget(QLabel("Level meter and the Confirm button"))
+        accent_row.addStretch()
+        appearance_form.addRow(QLabel("Accent:"), accent_row)
+        meter_row = QHBoxLayout()
+        meter_row.setContentsMargins(0, 0, 0, 0)
+        meter_row.addWidget(self.capture_meter_style_combo)
+        meter_row.addWidget(self.meter_preview_panel)
+        meter_row.addWidget(self.meter_test_button)
+        meter_row.addStretch()
+        appearance_form.addRow(QLabel("Level Meter:"), meter_row)
         # Anything the box's appearance is made of, pushed straight at it.
         # The backdrop is the one that needs a new snapshot rather than a
         # repaint -- see _sync_preview.
@@ -480,17 +566,11 @@ class SettingsWindow(QWidget):
                        self.capture_brightness_spin.valueChanged,
                        self.capture_levelling_spin.valueChanged):
             signal.connect(lambda *_: self._sync_preview(regrab=True))
-        meter_row = QHBoxLayout()
-        meter_row.setContentsMargins(0, 0, 0, 0)
-        meter_row.addWidget(self.capture_meter_style_combo)
-        meter_row.addWidget(self.meter_preview_panel)
-        meter_row.addWidget(self.meter_test_button)
-        meter_row.addStretch()
-        form_layout.addRow(QLabel("Level Meter:"), meter_row)
 
         form_layout.addRow(QLabel("Release GPU for:"), self.vram_yield_apps_edit)
 
         layout.addLayout(form_layout)
+        layout.addWidget(appearance_group)
         layout.addWidget(self.launch_on_startup_checkbox)
 
         button_layout = QHBoxLayout()
@@ -502,10 +582,11 @@ class SettingsWindow(QWidget):
         layout.addLayout(button_layout)
 
         # Connections
-        self.capture_meter_style_combo.currentTextChanged.connect(self.meter_preview.set_style)
+        self.capture_meter_style_combo.currentIndexChanged.connect(
+            lambda _: self.meter_preview.set_style(self.capture_meter_style_combo.currentData()))
         # The preview is clickable like the real one; keep the dropdown in step
         # so the two never disagree about what is selected.
-        self.meter_preview.style_changed.connect(self.capture_meter_style_combo.setCurrentText)
+        self.meter_preview.style_changed.connect(self._select_meter_style)
         self.meter_test_button.toggled.connect(self._on_preview_toggled)
         self.auto_start_server_checkbox.toggled.connect(self._sync_server_startup_enabled)
         self.profile_combo.activated.connect(self._on_profile_chosen)
@@ -515,8 +596,13 @@ class SettingsWindow(QWidget):
         self.save_button.clicked.connect(self.save_settings)
         self.cancel_button.clicked.connect(self.close)
 
-        self._refresh_profiles()
         self.load_settings()
+
+    def _select_meter_style(self, style: str):
+        """Select `style` in the meter dropdown by its storage key, not its label."""
+        index = self.capture_meter_style_combo.findData(style)
+        if index >= 0:
+            self.capture_meter_style_combo.setCurrentIndex(index)
 
     def _select_model(self, model: str):
         """Select `model`, keeping a hand-edited one that is not on the list.
@@ -557,11 +643,15 @@ class SettingsWindow(QWidget):
         self.profile_delete_button.setEnabled(bool(self.profile_combo.currentData()))
 
     def _on_profile_chosen(self, _index: int):
-        """Fill the form in from the chosen profile.
+        """Fill the appearance group in from the chosen profile.
 
         Loaded into the window and no further: a profile that took effect the
         instant it was picked would give no way to look at one without
         adopting it. Apply is still what commits.
+
+        Only the appearance keys are read across, so a profile written by an
+        older build -- when a profile was the whole settings file -- cannot
+        reach in and change the server address or the hotkey on its way past.
         """
         name = self.profile_combo.currentData()
         self.profile_delete_button.setEnabled(bool(name))
@@ -579,9 +669,10 @@ class SettingsWindow(QWidget):
             return
         # Over the defaults, so a profile written by an older version is
         # missing keys rather than carrying stale ones.
-        merged = copy.deepcopy(DEFAULT_SETTINGS)
-        merged.update(settings)
-        self.load_settings(merged)
+        appearance = {key: DEFAULT_SETTINGS[key] for key in APPEARANCE_KEYS}
+        appearance.update({key: settings[key] for key in APPEARANCE_KEYS
+                           if key in settings})
+        self._load_appearance(appearance)
         self._sync_preview(regrab=True)
         self.status_label.setText(f"Loaded '{name}' -- not applied yet.")
         self._status_timer.start(4000)
@@ -593,9 +684,10 @@ class SettingsWindow(QWidget):
         name = (name or "").strip()
         if not ok or not name:
             return
-        settings = self._collect_settings()
-        if settings is None:
-            return
+        # validate=False: a profile carries no hotkey, so an invalid one is
+        # not this button's business to complain about.
+        settings = self._collect_settings(validate=False)
+        settings = {key: settings[key] for key in APPEARANCE_KEYS}
         path = profile_path(name)
         if os.path.exists(path) and QMessageBox.question(
                 self, "Save profile",
@@ -683,6 +775,18 @@ class SettingsWindow(QWidget):
         if chosen.isValid():
             self._set_field_color(chosen.name())
 
+    def _pick_text_color(self):
+        chosen = QColorDialog.getColor(
+            QColor(self._text_color), self, "Transcript colour")
+        if chosen.isValid():
+            self._set_text_color(chosen.name())
+
+    def _pick_accent_color(self):
+        chosen = QColorDialog.getColor(
+            QColor(self._accent_color), self, "Accent colour")
+        if chosen.isValid():
+            self._set_accent_color(chosen.name())
+
     def _set_bg_color(self, color: str):
         self._bg_color = self._paint_swatch(
             self.capture_bg_color_button, color, DEFAULT_BG_COLOR)
@@ -691,6 +795,19 @@ class SettingsWindow(QWidget):
     def _set_field_color(self, color: str):
         self._field_color = self._paint_swatch(
             self.capture_field_color_button, color, DEFAULT_FIELD_COLOR)
+        self._sync_preview()
+
+    def _set_text_color(self, color: str):
+        self._text_color = self._paint_swatch(
+            self.capture_text_color_button, color, DEFAULT_TEXT_COLOR)
+        self._sync_preview()
+
+    def _set_accent_color(self, color: str):
+        self._accent_color = self._paint_swatch(
+            self.capture_accent_color_button, color, DEFAULT_ACCENT_COLOR)
+        # The settings window's own meter is the thing most likely to be
+        # looked at while choosing this, so it follows immediately.
+        self.meter_preview.set_accent_color(self._accent_color)
         self._sync_preview()
 
     @staticmethod
@@ -763,13 +880,15 @@ class SettingsWindow(QWidget):
         box.set_font_family(self._font_family())
         box.set_line_spacing(self.capture_line_spacing_spin.value())
         box.set_grow_to_fit(self.capture_grow_to_fit_checkbox.isChecked())
-        box.set_meter_style(self.capture_meter_style_combo.currentText())
+        box.set_meter_style(self.capture_meter_style_combo.currentData())
         box.set_surface(self._bg_color,
                         self.capture_opacity_spin.value() / 100.0,
                         self.capture_panel_frost_checkbox.isChecked())
         box.set_field(self._field_color,
                       self.capture_field_opacity_spin.value() / 100.0,
                       self.capture_field_frost_checkbox.isChecked())
+        box.set_text_color(self._text_color)
+        box.set_accent_color(self._accent_color)
         box.set_frost(self.capture_blur_spin.value(),
                       self.capture_saturation_spin.value(),
                       self.capture_brightness_spin.value(),
@@ -838,6 +957,29 @@ class SettingsWindow(QWidget):
         self._server_docker_image = settings.get(
             "server_docker_image", DEFAULT_SETTINGS["server_docker_image"])
         self._sync_server_startup_enabled()
+        self._load_appearance(settings)
+
+        # The clean state to measure edits against. Read back off the form
+        # rather than kept from the file: a config missing a key, or holding
+        # one this window does not edit, would otherwise read as dirty the
+        # moment it opened.
+        if from_disk:
+            # The profile the appearance in force came from, re-selected
+            # before the clean state is taken -- otherwise reopening the
+            # window would read as an unapplied change. A profile deleted
+            # from disk in the meantime simply leaves "(none)" showing.
+            self._refresh_profiles(
+                select=settings.get("active_profile",
+                                    DEFAULT_SETTINGS["active_profile"]))
+            self._applied_settings = self._collect_settings(validate=False)
+
+    def _load_appearance(self, settings: dict):
+        """Fill in the Capture Box appearance group, and only that group.
+
+        Separate from load_settings because a profile is exactly this much of
+        a settings dict -- see APPEARANCE_KEYS -- and choosing one must not
+        disturb the server or hotkey controls above it.
+        """
         self.capture_font_size_spin.setValue(
             int(settings.get("capture_font_size", DEFAULT_SETTINGS["capture_font_size"])))
         self._set_font_family(settings.get(
@@ -854,6 +996,10 @@ class SettingsWindow(QWidget):
                          DEFAULT_SETTINGS["capture_field_opacity"])) * 100)))
         self._set_field_color(
             settings.get("capture_field_color", DEFAULT_SETTINGS["capture_field_color"]))
+        self._set_text_color(
+            settings.get("capture_text_color", DEFAULT_SETTINGS["capture_text_color"]))
+        self._set_accent_color(
+            settings.get("capture_accent_color", DEFAULT_SETTINGS["capture_accent_color"]))
         # capture_backdrop was one setting for the whole box, before the two
         # surfaces were frosted separately. Carry it onto the panel, which is
         # what it used to mean.
@@ -873,14 +1019,7 @@ class SettingsWindow(QWidget):
         meter_style = settings.get("capture_meter_style", DEFAULT_SETTINGS["capture_meter_style"])
         if meter_style not in METER_STYLES:
             meter_style = DEFAULT_SETTINGS["capture_meter_style"]
-        self.capture_meter_style_combo.setCurrentText(meter_style)
-
-        # The clean state to measure edits against. Read back off the form
-        # rather than kept from the file: a config missing a key, or holding
-        # one this window does not edit, would otherwise read as dirty the
-        # moment it opened.
-        if from_disk:
-            self._applied_settings = self._collect_settings(validate=False)
+        self._select_meter_style(meter_style)
 
     def _collect_settings(self, validate: bool = True):
         """Everything the form is currently saying, as a settings dict.
@@ -937,7 +1076,13 @@ class SettingsWindow(QWidget):
             "capture_frost_levelling": self.capture_levelling_spin.value(),
             "capture_field_opacity": self.capture_field_opacity_spin.value() / 100.0,
             "capture_field_color": self._field_color,
-            "capture_meter_style": self.capture_meter_style_combo.currentText(),
+            "capture_text_color": self._text_color,
+            "capture_accent_color": self._accent_color,
+            "capture_meter_style": (self.capture_meter_style_combo.currentData()
+                                    or DEFAULT_SETTINGS["capture_meter_style"]),
+            # Not a setting so much as a bookmark: which profile the
+            # appearance above came from, so the next launch reopens on it.
+            "active_profile": self.profile_combo.currentData() or "",
         }
         return settings
 

@@ -13,7 +13,8 @@ normalising between them -- silence is 0.0 and your loudest recent speech is
 1.0, whoever you are and however your gain is set.
 
 Adding a style means writing a `_paint_<name>` method, listing its name in
-STYLES and giving it a size in STYLE_SIZES; everything else is shared.
+STYLES, giving it a size in STYLE_SIZES, and a label in STYLE_LABELS for the
+Settings dropdown; everything else is shared.
 """
 
 import math
@@ -32,8 +33,22 @@ from PySide6.QtGui import (
     QLinearGradient,
 )
 
-# Style names in cycle order. The first is the default.
-STYLES = ("waveform", "mirror", "bars", "arc", "circle")
+# Style names in cycle order -- clicking the meter steps through this list.
+# The first is the default.
+STYLES = ("waveform", "mirror", "bars", "mirror_bars", "arc", "circle")
+
+# What each style is called in the Settings dropdown. The internal name is a
+# storage key, saved in every profile, so it can't just be prettied up in
+# place the way the model list's labels can -- a display string here is
+# derived from it instead, never stored back over it.
+STYLE_LABELS = {
+    "waveform": "Waveform",
+    "mirror": "Mirror waveform",
+    "bars": "Bars",
+    "mirror_bars": "Mirror bars",
+    "arc": "Arc",
+    "circle": "Circle",
+}
 
 # Each style gets the room it needs rather than a shared box: a scrolling
 # waveform is unreadable squeezed into a square, and a ring padded out to
@@ -42,6 +57,7 @@ STYLE_SIZES = {
     "waveform": (168, 26),
     "mirror": (168, 26),
     "bars": (168, 26),
+    "mirror_bars": (168, 26),
     "arc": (52, 28),
     "circle": (26, 26),
 }
@@ -57,7 +73,11 @@ FEATHER = {"waveform": 0.16, "mirror": 0.14}
 # widget redraws faster than that and eases between readings.
 FRAME_MS = 16
 
-ACCENT = QColor("#4fa2f0")
+# The one colour the meter draws itself in. A module default rather than a
+# constant: every style below asks the instance for it, so a box can be given
+# an accent of its own without four painters having to be told about it.
+DEFAULT_ACCENT = "#4fa2f0"
+ACCENT = QColor(DEFAULT_ACCENT)
 
 
 # -- signal chain ---------------------------------------------------------
@@ -220,6 +240,9 @@ def smooth_path(points) -> QPainterPath:
 HISTORY_MS = 45
 HISTORY_POINTS = 44
 BAR_COUNT = 24
+# Bars per side in Mirror bars -- half of BAR_COUNT, so the two styles read
+# as the same density of bars rather than one looking sparser than the other.
+MIRROR_BAR_COUNT = BAR_COUNT // 2
 
 # Points per arm of the mirrored style. Half the width, so roughly half the
 # history of the scrolling one -- about a second and a quarter either side.
@@ -253,6 +276,7 @@ class SignalMeter(QWidget):
         self.setStyleSheet("background: transparent; border: none;")
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip("Input level - click to change the meter style")
+        self._accent = QColor(ACCENT)
 
         self._timer = QTimer(self)
         self._timer.setInterval(FRAME_MS)
@@ -283,6 +307,19 @@ class SignalMeter(QWidget):
         self._history = deque([0.0] * HISTORY_POINTS, maxlen=HISTORY_POINTS)
         self._timer.stop()
         self._last_frame = None
+        self.update()
+
+    def set_accent_color(self, color: str):
+        """The colour every style paints itself in. Invalid input is ignored.
+
+        A bad value here would repaint the meter in Qt's default black on a
+        dark box, which is indistinguishable from a meter that has stopped
+        working -- so the last good colour is kept instead.
+        """
+        chosen = QColor(color)
+        if not chosen.isValid() or chosen == self._accent:
+            return
+        self._accent = chosen
         self.update()
 
     def style_name(self) -> str:
@@ -460,7 +497,7 @@ class SignalMeter(QWidget):
         Drawn under the wave rather than instead of it, so there is no visible
         switch between the resting and speaking states.
         """
-        rest = QColor(ACCENT)
+        rest = QColor(self._accent)
         rest.setAlphaF(0.35)
         painter.setPen(QPen(rest, 1.0))
         painter.drawLine(QPointF(1.5, mid), QPointF(self.width() - 1.5, mid))
@@ -483,7 +520,7 @@ class SignalMeter(QWidget):
 
         fade = QLinearGradient(0.0, 0.0, width, 0.0)
         for stop, alpha in fill:
-            soft = QColor(ACCENT)
+            soft = QColor(self._accent)
             soft.setAlphaF(alpha)
             fade.setColorAt(stop, soft)
         painter.setPen(Qt.NoPen)
@@ -492,7 +529,7 @@ class SignalMeter(QWidget):
 
         outline = QLinearGradient(0.0, 0.0, width, 0.0)
         for stop, alpha in edge:
-            line = QColor(ACCENT)
+            line = QColor(self._accent)
             line.setAlphaF(alpha)
             outline.setColorAt(stop, line)
         pen = QPen(QBrush(outline), 1.4)
@@ -526,13 +563,50 @@ class SignalMeter(QWidget):
             x = i * slot + (slot - bar_width) / 2.0
             rect = QRectF(x, mid - bar_height / 2.0, bar_width, bar_height)
 
-            colour = QColor(ACCENT)
+            colour = QColor(self._accent)
             # Older bars sit further back. The ramp is squared so the fade is
             # concentrated at the tail rather than dimming the whole row.
             age = (i + 1) / len(values)
             colour.setAlphaF(0.18 + 0.82 * (age ** 2))
             painter.setBrush(QBrush(colour))
             painter.drawRoundedRect(rect, bar_width / 2.0, bar_width / 2.0)
+
+    def _paint_mirror_bars(self, painter: QPainter, level: float):
+        """Bars, folded the way Mirror folds the waveform.
+
+        The newest bar sits on the centre line and pushes a twin out to
+        either side of it, so the row grows outward from the middle on each
+        syllable instead of scrolling past a fixed right edge.
+        """
+        width = self.width()
+        height = self.height()
+        mid_y = height / 2.0
+        centre = width / 2.0
+        slot = centre / MIRROR_BAR_COUNT
+        bar_width = max(2.0, slot * 0.52)
+        gap = (slot - bar_width) / 2.0
+        # Newest first, walking outward -- the same order _paint_mirror reads
+        # its history in.
+        outward = list(self._history)[-MIRROR_BAR_COUNT:][::-1]
+
+        painter.setPen(Qt.NoPen)
+        for i, value in enumerate(outward):
+            bar_height = max(bar_width, value * (height - 2.0))
+            y = mid_y - bar_height / 2.0
+            colour = QColor(self._accent)
+            # Distance from the centre, 0 at the newest bar and 1 at the
+            # oldest -- the mirror-image of _paint_bars' left-to-right ramp.
+            age = (i + 1) / len(outward)
+            colour.setAlphaF(0.18 + 0.82 * (1.0 - age) ** 2)
+            painter.setBrush(QBrush(colour))
+            x_right = centre + i * slot + gap
+            painter.drawRoundedRect(
+                QRectF(x_right, y, bar_width, bar_height),
+                bar_width / 2.0, bar_width / 2.0)
+            x_left = centre - (i + 1) * slot + gap
+            painter.drawRoundedRect(
+                QRectF(x_left, y, bar_width, bar_height),
+                bar_width / 2.0, bar_width / 2.0)
 
     def _paint_arc(self, painter: QPainter, level: float):
         """A sweep gauge with a peak-hold tick: a VU needle's read, modernised.
@@ -553,7 +627,7 @@ class SignalMeter(QWidget):
         start = 180 * 16
         span = -180 * 16
 
-        track = QColor(ACCENT)
+        track = QColor(self._accent)
         track.setAlphaF(0.18)
         pen = QPen(track, stroke)
         pen.setCapStyle(Qt.RoundCap)
@@ -561,7 +635,7 @@ class SignalMeter(QWidget):
         painter.drawArc(box, start, span)
 
         if level > REST_LEVEL:
-            live = QColor(ACCENT)
+            live = QColor(self._accent)
             live.setAlphaF(0.95)
             pen = QPen(live, stroke)
             pen.setCapStyle(Qt.RoundCap)
@@ -596,7 +670,7 @@ class SignalMeter(QWidget):
         stroke = max(1.4, self.width() * 0.07)
         rect = QRectF(self.rect()).adjusted(stroke, stroke, -stroke, -stroke)
 
-        fill = QColor(ACCENT)
+        fill = QColor(self._accent)
         # A floor under the alpha keeps the ring from reading as empty glass
         # at rest. No curve on top of it: the level arriving here has already
         # been through a dB scale and the auto-range, so it is perceptual
@@ -604,7 +678,7 @@ class SignalMeter(QWidget):
         fill.setAlphaF(0.06 + 0.88 * level)
         painter.setBrush(QBrush(fill))
 
-        ring = QColor(ACCENT)
+        ring = QColor(self._accent)
         ring.setAlphaF(0.75)
         painter.setPen(QPen(ring, stroke))
         painter.drawEllipse(rect)

@@ -109,11 +109,30 @@ DEFAULT_BG_COLOR = "#12141a"
 DEFAULT_FIELD_OPACITY = 0.08
 DEFAULT_FIELD_COLOR = "#ffffff"
 
+# The transcript's ink, and the one colour the box uses to draw the eye: the
+# level meter and the Confirm button. Kept apart from the surfaces because
+# they are read *against* them -- a scheme that lightens the panel has to
+# darken the ink in the same breath or the text goes with it.
+DEFAULT_TEXT_COLOR = "#ffffff"
+DEFAULT_ACCENT_COLOR = "#4fa2f0"
+
+# How far the Confirm button's hover state moves from the accent, as a
+# percentage for QColor.lighter/darker. Away from the surface it sits on
+# rather than always brighter: a pale accent hovering brighter is a button
+# that vanishes under the cursor.
+ACCENT_HOVER_SHIFT = 115
+
 # The field's border, relative to its fill. Derived rather than set: an edge
 # that always sits a little above the fill it surrounds is what makes the
 # inset read as an inset, at any fill.
 FIELD_BORDER_LIFT = 0.17
 FIELD_FOCUS_LIFT = 0.37
+
+# Styles small enough to leave the button row's meter slot mostly empty --
+# a ring or a dot centred in the same width a scrolling waveform fills top
+# to bottom reads as adrift. Left-aligned instead, so its left edge lines up
+# with the transcript above it, the way the wide styles already fill out to.
+LEFT_ALIGNED_METER_STYLES = {"arc", "circle"}
 
 # Corner radius of the box, in px, and of the transcript field inside it.
 # The field's has to match the border-radius its stylesheet sets, or the
@@ -410,7 +429,9 @@ class CaptureBox(QWidget):
         # it. What read as the box was its children's own backgrounds, with
         # the gaps between them showing the screen straight through -- which
         # is why the transcript was unreadable over a page of text.
-        self.setStyleSheet("color: white; font-size: 14px;")
+        self._text_color = DEFAULT_TEXT_COLOR
+        self._accent_color = DEFAULT_ACCENT_COLOR
+        self._apply_text_color()
         self._bg_color = DEFAULT_BG_COLOR
         self._opacity_level = DEFAULT_OPACITY
         self._panel_frost = DEFAULT_PANEL_FROST
@@ -452,7 +473,7 @@ class CaptureBox(QWidget):
                 background-color: rgba(%(r)d, %(g)d, %(b)d, %(fill).3f);
                 border: 1px solid rgba(%(r)d, %(g)d, %(b)d, %(edge).3f);
                 border-radius: 8px;
-                color: white;
+                color: %(ink)s;
                 padding: 10px;
                 font-size: %(size)dpx;
                 %(family)s
@@ -489,26 +510,28 @@ class CaptureBox(QWidget):
         self.confirm_button = BusyButton("Confirm")
         self.cancel_button = QPushButton("Cancel")
 
-        button_style = """
+        # Cancel stays grey whatever the accent is: two coloured buttons
+        # side by side is two things asking to be pressed, and only one of
+        # them is the one you want.
+        self._button_style = """
             QPushButton {
-                background-color: #4fa2f0;
-                color: white;
+                background-color: %(accent)s;
+                color: %(ink)s;
                 border: none;
                 padding: 8px 14px;
                 border-radius: 8px;
             }
             QPushButton:hover {
-                background-color: #6bb1f2;
+                background-color: %(hover)s;
             }
             QPushButton#cancel {
                 background-color: #555;
+                color: #ffffff;
             }
             QPushButton#cancel:hover {
                 background-color: #666;
             }
         """
-        self.confirm_button.setStyleSheet(button_style)
-        self.cancel_button.setStyleSheet(button_style)
         self.cancel_button.setObjectName("cancel")
 
         # The meter lives in the otherwise empty stretch to the left of the
@@ -516,10 +539,14 @@ class CaptureBox(QWidget):
         # transcript, without taking any room from either.
         self.meter = SignalMeter(self)
         self.meter.style_changed.connect(self.meter_style_changed)
+        # Both buttons and the meter at once -- it is one colour, and the
+        # only reason it is applied here rather than beside the buttons is
+        # that the meter has to exist first.
+        self._apply_accent_color()
 
         # A stretch on each side centres the meter in the space left over by
-        # the buttons, rather than pinning it to the left edge with all the
-        # slack pooled on one side of it.
+        # the buttons; _sync_meter_alignment reweights them for a style too
+        # small to fill that space on its own.
         button_row.addStretch()
         button_row.addWidget(self.meter, 0, Qt.AlignVCenter)
         button_row.addStretch()
@@ -527,6 +554,11 @@ class CaptureBox(QWidget):
         button_row.addSpacing(8)
         button_row.addWidget(self.cancel_button)
         layout.addLayout(button_row)
+        self._button_row = button_row
+        # Cycling by clicking the meter bypasses set_meter_style, so it needs
+        # its own hook to keep the alignment in step with what is now showing.
+        self.meter.style_changed.connect(self._sync_meter_alignment)
+        self._sync_meter_alignment(self.meter.style_name())
 
         self.setMinimumWidth(420)
         self.setMaximumWidth(720)
@@ -586,6 +618,21 @@ class CaptureBox(QWidget):
 
     def set_meter_style(self, style: str):
         self.meter.set_style(style)
+        self._sync_meter_alignment(self.meter.style_name())
+
+    def _sync_meter_alignment(self, _style: str = None):
+        """Flush a small style to the left; let a wide one stay centred.
+
+        Button row indices: 0 is the leading stretch, 1 the meter, 2 the
+        trailing stretch. Two bare addStretch() calls default to equal, zero
+        stretch factors, which Qt splits evenly -- that is the centring the
+        wide scrolling styles want. Zeroing the leading one and giving the
+        trailing one the only nonzero factor sends all the slack to its
+        right instead, flushing the meter to the left edge.
+        """
+        left = self.meter.style_name() in LEFT_ALIGNED_METER_STYLES
+        self._button_row.setStretch(0, 0)
+        self._button_row.setStretch(2, 1 if left else 0)
 
     def set_surface(self, color: str = None, opacity=None, frosted=None):
         """Set the box's background colour, how solid it is, and its backdrop.
@@ -740,6 +787,59 @@ class CaptureBox(QWidget):
         self._sync_frost_timer()
         self.update()
 
+    def set_text_color(self, color: str):
+        """Set the transcript's ink.
+
+        Separate from the field it sits on: the two move together in a scheme
+        but not in a ratio, and pale text on a pale field is a combination
+        someone has to be able to make and then see is wrong.
+        """
+        chosen = QColor(color)
+        if not chosen.isValid():
+            return
+        self._text_color = chosen.name()
+        self._apply_text_color()
+        self._apply_field_style()
+        # Confirm's caption is this colour too, so it moves with it.
+        self._apply_accent_color()
+
+    def set_accent_color(self, color: str):
+        """Set the one colour the box draws attention with.
+
+        The level meter and the Confirm button, which are the two things the
+        eye is meant to find while dictating -- am I being heard, and where
+        do I press. Cancel is deliberately not included.
+        """
+        chosen = QColor(color)
+        if not chosen.isValid():
+            return
+        self._accent_color = chosen.name()
+        self._apply_accent_color()
+
+    def _apply_text_color(self):
+        """The box-wide ink. Children with a stylesheet of their own win."""
+        self.setStyleSheet(f"color: {self._text_color}; font-size: 14px;")
+
+    def _apply_accent_color(self):
+        accent = QColor(self._accent_color)
+        if not accent.isValid():
+            accent = QColor(DEFAULT_ACCENT_COLOR)
+        # Away from the surface behind it, so hover reads as a lift whether
+        # the accent is a deep blue or a pale sand.
+        hover = (accent.darker(ACCENT_HOVER_SHIFT)
+                 if accent.lightness() > 140 else accent.lighter(ACCENT_HOVER_SHIFT))
+        style = self._button_style % {
+            "accent": accent.name(),
+            "hover": hover.name(),
+            # The transcript's colour rather than one derived from the
+            # accent: it is the box's ink, and a caption that picks its own
+            # is a second opinion nobody asked for.
+            "ink": self._text_color,
+        }
+        self.confirm_button.setStyleSheet(style)
+        self.cancel_button.setStyleSheet(style)
+        self.meter.set_accent_color(accent.name())
+
     def set_font_family(self, family: str):
         """Set the transcript's typeface, and resize the box to match it.
 
@@ -769,6 +869,7 @@ class CaptureBox(QWidget):
             "focus": min(1.0, fill + FIELD_FOCUS_LIFT),
             "size": self._font_size or DEFAULT_FONT_SIZE_PX,
             "family": family,
+            "ink": self._text_color,
         })
 
     def _surface_color(self) -> QColor:

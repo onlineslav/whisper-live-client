@@ -1047,6 +1047,12 @@ class WhisperBoardApp:
             self.settings.get("capture_field_color", DEFAULT_SETTINGS["capture_field_color"]),
             self.settings.get("capture_field_opacity", DEFAULT_SETTINGS["capture_field_opacity"]),
             self.settings.get("capture_field_frost", DEFAULT_SETTINGS["capture_field_frost"]))
+        self.capture_box.set_text_color(
+            self.settings.get("capture_text_color",
+                              DEFAULT_SETTINGS["capture_text_color"]))
+        self.capture_box.set_accent_color(
+            self.settings.get("capture_accent_color",
+                              DEFAULT_SETTINGS["capture_accent_color"]))
         self.capture_box.set_frost(
             self.settings.get("capture_blur_radius",
                               DEFAULT_SETTINGS["capture_blur_radius"]),
