@@ -814,20 +814,37 @@ class WhisperBoardApp:
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
         payload_log.log_event("capture_confirmed")
-        # Hide the capture UI to return focus to the previous app.
-        self.capture_box.hide()
+        # The box stays up with Confirm spinning until the paste is actually
+        # on its way, which is not the same moment the button was clicked:
+        # re-transcribing the capture takes up to a second or so, and with the
+        # box already gone that is a second of nothing happening after a
+        # click -- which reads as a hang rather than as work. Set before the
+        # work below rather than after, so a slow shutdown of the audio thread
+        # is inside the spinner too; nothing is repainted in between, so on
+        # the quick path it costs a flag and no frame.
+        self.capture_box.set_busy(True)
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
         self._schedule_on_demand_disconnect()
         self._sync_icon_state()
         self.logger.debug("Capture confirmed.")
-        # processEvents() flushes the hide/focus-change events so the OS can
-        # start handing the foreground back. _do_paste reads the final box text,
-        # capturing any last-moment transcript, then paces the rest itself.
-        QApplication.processEvents()
         if self._start_final_pass():
+            # _dismiss_capture_box() takes the box down when the pass reports
+            # back, or when the watchdog gives up on it.
             return
+        self._dismiss_capture_box()
         QTimer.singleShot(PASTE_START_DELAY_MS, self._do_paste)
+
+    def _dismiss_capture_box(self):
+        """Take the box down, on the way to pasting what it was holding.
+
+        processEvents() flushes the hide and the focus change that follows it,
+        so the OS can start handing the foreground back to the app being
+        dictated into while the paste is still being set up.
+        """
+        self.capture_box.set_busy(False)
+        self.capture_box.hide()
+        QApplication.processEvents()
 
     def _buffer_capture_audio(self, chunk: bytes):
         """Keep the capture's audio for the final pass."""
@@ -891,9 +908,12 @@ class WhisperBoardApp:
         if not self._paste_pending:
             return
         self._paste_pending = False
-        # Empty means the pass produced nothing usable; _do_paste falls back
-        # to whatever the streamed session left in the box.
-        self._do_paste(text or None)
+        # Read before the box goes: without a re-transcription the streamed
+        # text in the box is what gets pasted, and hiding it first would mean
+        # reading it back out of a window that is on its way out.
+        text = text or self.capture_box.text_area.toPlainText()
+        self._dismiss_capture_box()
+        QTimer.singleShot(PASTE_START_DELAY_MS, lambda: self._do_paste(text))
 
     def _on_final_pass_timeout(self, token=None):
         if not self._paste_pending:
@@ -904,7 +924,9 @@ class WhisperBoardApp:
         self.logger.warning("Final pass did not report back; pasting the streamed text.")
         if self._final_pass:
             self._final_pass.abandon()
-        self._do_paste()
+        text = self.capture_box.text_area.toPlainText()
+        self._dismiss_capture_box()
+        QTimer.singleShot(PASTE_START_DELAY_MS, lambda: self._do_paste(text))
 
     def on_capture_cancelled(self):
         if not self.is_capturing:

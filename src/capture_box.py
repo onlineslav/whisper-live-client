@@ -20,6 +20,7 @@ from PySide6.QtCore import (
     Signal,
     QEvent,
     QPoint,
+    QTimer,
     QPropertyAnimation,
     QAbstractAnimation,
 )
@@ -34,6 +35,7 @@ from PySide6.QtGui import (
     QTextCursor,
     QTextBlockFormat,
     QPainter,
+    QPen,
     QColor,
     QPainterPath,
     QPixmap,
@@ -272,6 +274,83 @@ def _rgb(color: str):
         return _rgb(DEFAULT_BG_COLOR)
 
 
+class BusyButton(QPushButton):
+    """A button that spins in place of its own label while it is waiting.
+
+    The Confirm button doubles as the progress indicator rather than a
+    separate spinner appearing next to it. The wait belongs to the action
+    that started it, and anything new appearing in the row would shift the
+    buttons sideways at the exact moment the user has just clicked one.
+    """
+
+    # Fast enough to read as motion rather than as a stutter, and slow enough
+    # not to spend a repaint every frame on a window that is also being faded.
+    SPIN_INTERVAL_MS = 40
+    SPIN_STEP_DEG = 26
+    ARC_SPAN_DEG = 100
+    ARC_INSET_PX = 7
+    # Qt's own "no maximum", for undoing the fixed width below. Spelled out
+    # rather than imported: QWIDGETSIZE_MAX is not exported by every PySide
+    # build, and it has never been anything but this.
+    _NO_MAX = 16777215
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._label = text
+        self._busy = False
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.SPIN_INTERVAL_MS)
+        self._timer.timeout.connect(self._advance)
+
+    def is_busy(self) -> bool:
+        return self._busy
+
+    def set_busy(self, busy: bool):
+        busy = bool(busy)
+        if busy == self._busy:
+            return
+        self._busy = busy
+        if busy:
+            # Pinned to the width it had with its label in it, before the
+            # label goes: a button that shrinks to spinner width would drag
+            # Cancel and the meter across the row with it.
+            self.setFixedWidth(self.width())
+            self.setText("")
+            self._angle = 0
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self.setText(self._label)
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(self._NO_MAX)
+        self.update()
+
+    def _advance(self):
+        self._angle = (self._angle + self.SPIN_STEP_DEG) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._busy:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(QColor(255, 255, 255, 235))
+        pen.setWidthF(2.0)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        side = min(self.width(), self.height()) - 2 * self.ARC_INSET_PX
+        if side <= 0:
+            return
+        arc = QRectF((self.width() - side) / 2.0, (self.height() - side) / 2.0,
+                     side, side)
+        # Qt measures arcs in sixteenths of a degree, anticlockwise from three
+        # o'clock; negated so the gap chases the arc the way round every other
+        # spinner on the machine turns.
+        painter.drawArc(arc, int(-self._angle * 16), int(self.ARC_SPAN_DEG * 16))
+
+
 class CaptureBox(QWidget):
     """
     A borderless, semi-transparent window for live transcription display.
@@ -383,7 +462,7 @@ class CaptureBox(QWidget):
         # to the right-hand one only -- leaving the meter a few pixels off
         # centre for no visible reason.
         button_row.setSpacing(0)
-        self.confirm_button = QPushButton("Confirm")
+        self.confirm_button = BusyButton("Confirm")
         self.cancel_button = QPushButton("Cancel")
 
         button_style = """
@@ -436,17 +515,46 @@ class CaptureBox(QWidget):
         if self._preview_mode:
             self.hide()
             return
+        if self.confirm_button.is_busy():
+            # Already confirmed and waiting on the paste. A second confirm has
+            # nothing left to do and would emit the transcript twice.
+            return
         self._closing = True
         self.confirmed.emit(self.text_area.toPlainText())
-        self._fade_out_and_hide()
+        # Whoever is listening may have asked the box to stay up and spin --
+        # set_busy() is called from inside the emit above, synchronously --
+        # in which case they will take it down when the paste is on its way.
+        if not self.confirm_button.is_busy():
+            self._fade_out_and_hide()
 
     def on_cancel(self):
         if self._preview_mode:
             self.hide()
             return
+        if self.confirm_button.is_busy():
+            # The transcript is already committed and the paste is in flight;
+            # there is nothing here left to cancel.
+            return
         self._closing = True
         self.cancelled.emit()
         self._fade_out_and_hide()
+
+    def set_busy(self, busy: bool):
+        """Show the box as still working on the transcript it handed over.
+
+        Confirming can be followed by a second or more of nothing -- the
+        final pass re-transcribes the whole capture before the text is pasted
+        -- and with the box already gone that gap reads as a hang. So the box
+        stays up with the Confirm button spinning until whoever asked for the
+        wait takes it down.
+        """
+        if busy:
+            # This capture is already settled, whether it was confirmed from
+            # the button or from the hotkey. Saying so here is what stops a
+            # click in another window, or the box losing activation to the
+            # app the paste is heading for, from being read as a cancel.
+            self._closing = True
+        self.confirm_button.set_busy(busy)
 
     def set_level_db(self, db: float):
         """Feed the meter a raw chunk level in dBFS."""
@@ -793,6 +901,7 @@ class CaptureBox(QWidget):
         """
         self._preview_mode = True
         self._closing = False
+        self.set_busy(False)
         self.meter.reset()
         self.adjustSize()
         if at is not None:
@@ -826,6 +935,7 @@ class CaptureBox(QWidget):
     def show_at_cursor(self):
         self._preview_mode = False
         self._closing = False
+        self.set_busy(False)
         self.meter.reset()
         self._shown_at = time.monotonic()
         self.adjustSize()
@@ -913,6 +1023,11 @@ class CaptureBox(QWidget):
             # Confirming or cancelling a sample would mean pasting it.
             super().keyPressEvent(event)
             return
+        if self.confirm_button.is_busy():
+            # Waiting on the paste. Both keys are no-ops at this point, and
+            # swallowing them stops one landing in the app underneath.
+            event.accept()
+            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             event.accept()
             self.on_confirm()
@@ -971,6 +1086,7 @@ class CaptureBox(QWidget):
         # hotkey-to-confirm path). Marking it closing here stops the
         # deactivation that follows from being read as a click-away cancel.
         self._closing = True
+        self.set_busy(False)
         self.meter.reset()
         app = QApplication.instance()
         if app:
