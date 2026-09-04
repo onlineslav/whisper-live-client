@@ -1293,6 +1293,17 @@ class WhisperTypeApp:
         # is a paste-time affordance, not part of what was said.
         text += " "
 
+        # Before the clipboard: when live typing already put exactly this text
+        # in the document, the whole delete-and-paste is a round trip back to
+        # where the document already is -- and the one window in the capture
+        # where the words exist nowhere but the clipboard. Keeping them is
+        # both safer and cheaper. See live_type.finish_if_matches.
+        if self.live_typer.finish_if_matches(text):
+            self.logger.info(
+                "The live-typed text is already the transcript; kept it in "
+                "place rather than pasting over it.")
+            return
+
         # The clipboard is written first and left alone from here on. Whatever
         # happens to the keystroke afterwards, the transcript is recoverable
         # with a manual Ctrl+V.

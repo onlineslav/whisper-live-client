@@ -286,6 +286,57 @@ class LiveTyper:
         except Exception:
             return None
 
+    def finish_if_matches(self, text: str) -> bool:
+        """Keep the preview where it is when it is already the finished text.
+
+        The confirm path's default is to take the preview back out and paste
+        the finished transcript in its place, because the final pass usually
+        re-punctuates what the running preview guessed. With the final pass
+        off, or on a capture it declined to re-transcribe, the two strings are
+        the same -- and the document is then backspaced over character by
+        character only to have the identical text pasted back.
+
+        That round trip is all cost. It doubles the marks left on the target's
+        undo stack, it spends a paste on a document that is already correct,
+        and it is the one moment in the whole capture where the user's words
+        exist nowhere but the clipboard: if the paste half fails -- a target
+        that will not take an injected Ctrl+V, a clipboard another application
+        is holding -- the delete has already happened and the dictation is
+        gone from the screen.
+
+        So when the finished text merely continues what is already there --
+        which is what the paste's trailing space makes it -- the tail is
+        posted and the preview keeps its place. True means the document now
+        says `text` and the caller has nothing left to deliver.
+
+        Verification is settled first, exactly as clear() settles it, so an
+        application that only appeared to accept the preview still falls
+        through to the paste rather than being credited with text it never
+        took.
+        """
+        self._settle_verification()
+        if not self._active or not self._typed:
+            return False
+        if not text.startswith(self._typed):
+            # The finished text is not the preview plus more -- the final pass
+            # rewrote it. It has to come out and be replaced.
+            return False
+        if not self._target_is_ready():
+            return False
+        remainder = text[len(self._typed):]
+        if remainder and not win_input.post_text(self._focus_hwnd, remainder):
+            logger.warning("Could not post the last %d characters; "
+                           "falling back to the paste.", len(remainder))
+            return False
+        self._typed += remainder
+        logger.debug("Kept %d live-typed characters in place, plus %d more.",
+                     len(self._typed) - len(remainder), len(remainder))
+        # Nothing left to take back: what is in the document is what was
+        # wanted, and reset() is what stops anything later trying to remove
+        # it.
+        self.reset()
+        return True
+
     def clear(self) -> bool:
         """Remove everything typed so far. True if the document is clean again.
 
