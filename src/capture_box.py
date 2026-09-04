@@ -145,6 +145,13 @@ LEFT_ALIGNED_METER_STYLES = {"arc", "circle"}
 # built from -- not a bespoke nudge, just the grid the rest of the box uses.
 METER_LEFT_INSET = 8
 
+# The least room between the meter and the Confirm button. In the full box
+# this never came up: the box is held at its 420px minimum, which is wider
+# than the row needs, so the spacer between them always had slack to sit in.
+# A strip has no such minimum -- it is exactly as wide as its contents -- so
+# the spacer collapsed to nothing and the meter ran right into the button.
+METER_BUTTON_GAP = 16
+
 # Corner radius of the box, in px, and of the transcript field inside it.
 # The field's has to match the border-radius its stylesheet sets, or the
 # frost drawn behind it will not line up with the edge drawn over it.
@@ -683,6 +690,15 @@ class CaptureBox(QWidget):
         # transcript above has nothing left to balance against.
         self._sync_meter_alignment()
         self._settle_layout()
+        # Slimming and un-slimming both happen to a box that is already on
+        # screen -- a status message needs the transcript area back, and
+        # _begin_streaming takes it away again. The frost was photographed for
+        # the size the box had before, so without re-taking it the strip's
+        # snapshot sits in the corner of the full box with flat tint around
+        # it, and the full box's sits behind a strip that is no longer that
+        # shape.
+        if self.isVisible() and self.wants_frost():
+            self.refresh_backdrop()
 
     def _settle_layout(self):
         """Re-measure the box now, rather than at the next event loop turn.
@@ -773,8 +789,13 @@ class CaptureBox(QWidget):
         # (left-aligned), which a stretch factor of 0 cannot grow past while
         # the trailing spacer has all the claim on whatever space is left.
         self._button_row.itemAt(0).spacerItem().changeSize(
-            METER_LEFT_INSET if left else 0, 0,
+            METER_LEFT_INSET if left else METER_BUTTON_GAP, 0,
             QSizePolicy.Expanding, QSizePolicy.Minimum)
+        # The trailing spacer keeps a floor of its own for the same reason the
+        # leading one does -- see METER_BUTTON_GAP. Centring survives it
+        # because a centred meter gets the same floor on both sides.
+        self._button_row.itemAt(2).spacerItem().changeSize(
+            METER_BUTTON_GAP, 0, QSizePolicy.Expanding, QSizePolicy.Minimum)
         self._button_row.setStretch(0, 0)
         self._button_row.setStretch(2, 1 if left else 0)
         self._button_row.invalidate()
@@ -1060,7 +1081,13 @@ class CaptureBox(QWidget):
             painter.restore()
         painter.fillPath(path, self._surface_color())
 
-        if self._frost is not None and self._field_frost:
+        # The second sheet of glass only exists where the field does. A
+        # hidden widget keeps whatever geometry it last had, so a slimmed box
+        # asking text_area for its rectangle gets the full box's -- and paints
+        # a pane of frost the shape of a transcript that is not there. That
+        # was the ghost rectangle hanging in the middle of the strip.
+        if (self._frost is not None and self._field_frost
+                and self.text_area.isVisible()):
             # A second sheet of glass, over the panel's tint rather than
             # under it -- which is what makes the field read as its own
             # surface rather than as a lighter patch of the panel. The crop
@@ -1173,7 +1200,7 @@ class CaptureBox(QWidget):
         scrolls past it. With it, the ceiling is the room itself, less
         everything in the box that is not the field.
         """
-        if self._grow_to_fit and self._grow_room:
+        if self._grow_to_fit and self._grow_room and not self._compact:
             chrome = self.height() - self.text_area.height()
             return max(self._min_field_height, self._grow_room - chrome)
         return int(self._line_height() * MAX_LINES + FIELD_CHROME_PX)
@@ -1215,7 +1242,10 @@ class CaptureBox(QWidget):
         the backdrop it was given.
         """
         self._grow_room = 0
-        if not self._grow_to_fit:
+        if not self._grow_to_fit or self._compact:
+            # A strip has no transcript to grow for. Reserving anyway left the
+            # frost being photographed -- and gaussian-blurred -- a thousand
+            # pixels tall for a fifty-pixel window.
             return
         screen = (QGuiApplication.screenAt(self.geometry().center())
                   or QApplication.primaryScreen())
