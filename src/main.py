@@ -507,6 +507,11 @@ class WhisperTypeApp:
 
             self.hotkey_listener = HotkeyListener(hotkey_str)
             self.hotkey_listener.hotkey_activated.connect(self.on_hotkey_activated)
+            # Enter and Escape, for the captures the box cannot hear them in
+            # itself. Reconnected here rather than once at startup because the
+            # listener is rebuilt whenever the hotkey changes.
+            self.hotkey_listener.confirm_requested.connect(self.on_capture_confirm_key)
+            self.hotkey_listener.cancel_requested.connect(self.on_capture_cancel_key)
             self.hotkey_listener.run()
         except Exception as e:
             self.logger.exception("Failed to initialize hotkey listener.")
@@ -745,6 +750,9 @@ class WhisperTypeApp:
             self._ghosting = self._start_live_typing()
             self.capture_box.set_compact(self._ghosting)
             self.capture_box.set_passive(self._ghosting)
+            # A passive box never receives a keystroke, so the two keys this
+            # interaction ends with are taken from the desktop instead.
+            self._claim_capture_keys(self._ghosting)
             # Before the box, so the flash is already running when the box
             # fades in over it rather than starting after it has settled.
             self._show_target_marker()
@@ -770,6 +778,38 @@ class WhisperTypeApp:
                 self.on_capture_cancelled()
             else:
                 self.on_capture_confirmed(self.capture_box.text_area.toPlainText())
+
+    def _claim_capture_keys(self, claimed: bool):
+        """Take Enter and Escape from the desktop for this capture, or return them."""
+        listener = getattr(self, "hotkey_listener", None)
+        if listener is None:
+            return
+        try:
+            listener.claim_capture_keys(claimed)
+        except Exception:
+            self.logger.exception("Could not change the capture key claim.")
+
+    def on_capture_confirm_key(self):
+        """Enter, pressed while a passive box was holding the capture.
+
+        The box has no keyboard of its own to hear it with, so it arrives here
+        instead -- and does exactly what clicking Confirm does. The one
+        exception is a box that is still reporting on the connection: there is
+        no transcript in it yet, only a status message, and confirming would
+        paste that. The hotkey answers the same case the same way.
+        """
+        if not self.is_capturing or not self.capture_box.isVisible():
+            return
+        if self._capture_waiting_for_connection:
+            self.capture_box.on_cancel()
+        else:
+            self.capture_box.on_confirm()
+
+    def on_capture_cancel_key(self):
+        """Escape, pressed while a passive box was holding the capture."""
+        if not self.is_capturing or not self.capture_box.isVisible():
+            return
+        self.capture_box.on_cancel()
 
     def _record_paste_target(self):
         """Remember the window the transcript should be pasted into, and where.
@@ -931,6 +971,7 @@ class WhisperTypeApp:
     def on_capture_confirmed(self, text):
         if not self.is_capturing:
             return
+        self._claim_capture_keys(False)
         self.is_capturing = False
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
@@ -1058,6 +1099,7 @@ class WhisperTypeApp:
     def on_capture_cancelled(self):
         if not self.is_capturing:
             return
+        self._claim_capture_keys(False)
         self.is_capturing = False
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
