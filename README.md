@@ -169,9 +169,12 @@ Other good options:
     work. The caret stays in your document the whole time; the box never takes
     the keyboard.
 
-    Cancelling removes everything it typed. On confirm it is replaced by the
-    finished transcript, which is usually punctuated a little differently — see
-    the note about the final pass below.
+    Cancelling removes everything it typed. On confirm, if the finished
+    transcript is just what is already on screen plus the trailing space, the
+    typed words stay exactly where they are and only the tail is added —
+    nothing is deleted, and the text never passes through the clipboard. When
+    the final pass has actually re-punctuated the capture, the preview comes
+    out and the finished transcript is pasted in its place, as before.
 
     Two things to know. **Undo works, in one press**: `Ctrl+Z` after a
     dictation puts the document back exactly as it was. Pressing it a second
@@ -190,6 +193,15 @@ Other good options:
 6.  **Confirm or Cancel**:
     - To **confirm** and paste the text, press the hotkey again, press `Enter`, or click the "✓" button.
     - To **cancel**, press `Esc`, click the "✗" button, or simply click away from the Capture Box.
+
+    While live typing is running the box deliberately does not hold the
+    keyboard — your document does — so `Enter` and `Esc` are claimed from the
+    desktop for the length of the capture and are swallowed rather than
+    reaching the document. Held modifiers hand the key back, so `Shift+Enter`
+    is still a newline. Clicking away does not cancel then either: you are
+    meant to be clicking around in your own document while it types there.
+    `Enter` pressed while the box is still reporting on the connection cancels
+    rather than confirms, since there is no transcript in it yet.
 
     The text in the box is a live preview. On confirm, WhisperType sends the
     whole capture again in one piece and pastes that instead — which is why the
