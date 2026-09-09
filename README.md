@@ -23,10 +23,14 @@ WhisperType is a sleek, hotkey-driven dictation utility for Windows. It captures
 **WhisperType can do this for you.** By default it starts the server itself at
 launch: it checks whether anything is already listening, starts Docker Desktop
 if the daemon is down, pulls the image if it is missing, and runs the container
-as `whisperboard-server` (an internal name kept unchanged through the rename)
-with `--restart unless-stopped`. The tray icon reports
+as `whispertype-server` with `--restart unless-stopped`. The tray icon reports
 each step, so a first run that spends ten minutes downloading a 3 GB image
 looks like progress rather than a hang.
+
+Upgrading from the old name: the container it used to create is removed on
+the first start, because it would otherwise still be holding the port. The
+cache of downloaded model weights is kept and reused where it is, so nothing
+is downloaded twice.
 
 By default it also passes the chosen model to the server as a local path,
 which switches WhisperLive into **single model mode**: one model, loaded once

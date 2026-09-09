@@ -41,12 +41,19 @@ STATE_RUNNING = "running"            # something is listening on the port
 STATE_FAILED = "failed"              # gave up; detail says why
 STATE_PAUSED = "paused"              # stopped on purpose, to free the GPU
 
-# These Docker object names keep the old "whisperboard-" prefix on purpose,
-# through the rename to WhisperType: renaming them would orphan a running
-# container (a second one then races it for port 9090) and abandon the model
-# cache volume, forcing gigabytes of re-download. They are internal identifiers
-# the user rarely sees, so the churn is not worth it.
-CONTAINER_NAME = "whisperboard-server"
+# Docker object names. They carried the pre-rename "whisperboard-" prefix for
+# a while, because renaming them naively orphans a running container -- which
+# keeps port 9090 and is restarted by Docker on every boot -- and abandons a
+# model cache holding gigabytes of downloaded weights.
+#
+# So the rename is done, and each hazard is handled where it lives: the stale
+# container is removed on the first start under the new name (see
+# _retire_legacy_objects), and the cache volume, which cannot be renamed at
+# all, is adopted where it already exists rather than replaced (see
+# _model_cache_volume). A machine that has never run the old name never sees
+# either path.
+CONTAINER_NAME = "whispertype-server"
+LEGACY_CONTAINER_NAME = "whisperboard-server"
 
 # Whisper weights are downloaded on first use of each model and cached here
 # inside the container. Held in a named volume because the alternative is
@@ -54,7 +61,8 @@ CONTAINER_NAME = "whisperboard-server"
 # container *is* recreated whenever the image or port changes, or the GPU
 # image falls back to the CPU one. Switching models in Settings costs one
 # download instead of one per container lifetime.
-MODEL_CACHE_VOLUME = "whisperboard-models"
+MODEL_CACHE_VOLUME = "whispertype-models"
+LEGACY_MODEL_CACHE_VOLUME = "whisperboard-models"
 MODEL_CACHE_PATH = "/root/.cache/huggingface"
 
 # WhisperLive loads a *separate* model for every client connection, and it
@@ -78,7 +86,8 @@ MODEL_CACHE_PATH = "/root/.cache/huggingface"
 # later than a game's splash screen costs nothing.
 APP_POLL_S = 20.0
 
-MODEL_FETCH_CONTAINER = "whisperboard-modelfetch"
+MODEL_FETCH_CONTAINER = "whispertype-modelfetch"
+LEGACY_MODEL_FETCH_CONTAINER = "whisperboard-modelfetch"
 SERVER_BASE_COMMAND = ["python", "run_server.py"]
 # Model names we will interpolate into a python -c inside the container.
 _SAFE_MODEL = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -302,6 +311,10 @@ class ServerManager(QObject):
         self._yield_override = False
         self._app_thread = None
         self._app_stop = threading.Event()
+        # Both pre-rename lookups are asked of Docker once per run and then
+        # remembered: neither answer changes while we are the one changing it.
+        self._legacy_retired = False
+        self._cache_volume = None
 
     # -- configuration -----------------------------------------------------
 
@@ -645,6 +658,16 @@ class ServerManager(QObject):
         # what the settings now ask for -- a model change alters the command it
         # must run, and short-circuiting here on "something answered" is how a
         # configuration change silently never takes effect.
+        # A pre-rename container is still ours, even though it no longer
+        # answers to our name -- and it is the thing holding the port. Retiring
+        # it here, before the check below, is what stops "something is
+        # listening" being read as somebody else's server for the rest of the
+        # run: the settings would then never reach the container, and Stop
+        # Server would have nothing to stop. A no-op once there is nothing
+        # left under the old name, and while the daemon is still coming up.
+        if self._docker_exe():
+            self._retire_legacy_objects()
+
         ours = self._docker_exe() and self._container_field("{{.State.Running}}") is not None
         if is_port_open(host, port) and not ours:
             # Worded identically to the probe's and _await_port's success, so
@@ -705,11 +728,66 @@ class ServerManager(QObject):
         self._emit(STATE_FAILED, "Docker Desktop did not finish starting")
         return False
 
+    def _retire_legacy_objects(self):
+        """Remove the pre-rename containers, once, before we make our own.
+
+        The server container was named "whisperboard-server" until the rename
+        to WhisperType. It publishes the host port and is created with
+        --restart unless-stopped, so left alone it is still listening when the
+        new container is created -- and the new one then fails with the port
+        already allocated, on a machine where dictation had been working.
+
+        A container is safe to remove because it holds nothing: the weights
+        live in the cache volume, which is adopted rather than deleted. The
+        throwaway fetch container goes too, in case a crashed run left one.
+        """
+        if self._legacy_retired:
+            return
+        if not self._daemon_ready():
+            # A failed inspect with the daemon down means "cannot tell", not
+            # "not there". Remembering that as done would leave the old
+            # container in place for the rest of the run.
+            return
+        self._legacy_retired = True
+        for name in (LEGACY_CONTAINER_NAME, LEGACY_MODEL_FETCH_CONTAINER):
+            ok, _, _ = self._docker("inspect", "-f", "{{.Id}}", name, timeout=20)
+            if not ok:
+                continue
+            self.logger.info("Removing the pre-rename container %s.", name)
+            self._docker("rm", "-f", name, timeout=60)
+
+    def _model_cache_volume(self) -> str:
+        """The named volume the downloaded weights are cached in.
+
+        A fresh machine gets "whispertype-models". One that already cached
+        gigabytes under the pre-rename "whisperboard-models" keeps using it:
+        Docker cannot rename a volume, and the alternatives are copying the
+        cache or re-downloading every model the user already has. Adopting it
+        costs nothing and is invisible.
+        """
+        if self._cache_volume is None:
+            if not self._daemon_ready():
+                # Undecided rather than wrong: answering "the new one" because
+                # Docker was unreachable would mount a second, empty cache
+                # beside the full one and re-download every model.
+                return MODEL_CACHE_VOLUME
+            ok, _, _ = self._docker(
+                "volume", "inspect", LEGACY_MODEL_CACHE_VOLUME, timeout=20)
+            self._cache_volume = LEGACY_MODEL_CACHE_VOLUME if ok else MODEL_CACHE_VOLUME
+            if ok:
+                self.logger.info("Using the pre-rename model cache volume %s.",
+                                 LEGACY_MODEL_CACHE_VOLUME)
+        return self._cache_volume
+
     def _container_field(self, template: str):
         ok, out, _ = self._docker("inspect", "-f", template, CONTAINER_NAME, timeout=20)
         return out if ok else None
 
     def _ensure_container(self, host_port: int) -> bool:
+        # Before our own container is looked for: a leftover under the old
+        # name still holds the port, and would fail the run below.
+        self._retire_legacy_objects()
+
         # Resolved before anything is torn down, so a model that still has to
         # be downloaded is fetched while the old container is up and its
         # progress is visible.
@@ -780,7 +858,7 @@ class ServerManager(QObject):
         self._emit(STATE_PULLING, f"Preparing the {model} model")
         ok, _, err = self._docker(
             "run", "-d", "--name", MODEL_FETCH_CONTAINER,
-            "-v", f"{MODEL_CACHE_VOLUME}:{MODEL_CACHE_PATH}",
+            "-v", f"{self._model_cache_volume()}:{MODEL_CACHE_PATH}",
             self.image, "python", "-c", snippet, timeout=120)
         if not ok:
             self.logger.warning("Could not start the model fetch container: %s", err)
@@ -896,7 +974,7 @@ class ServerManager(QObject):
                 # So a machine that reboots into Docker Desktop brings the
                 # server back without WhisperType having to ask.
                 "--restart", "unless-stopped",
-                "-v", f"{MODEL_CACHE_VOLUME}:{MODEL_CACHE_PATH}",
+                "-v", f"{self._model_cache_volume()}:{MODEL_CACHE_PATH}",
                 "-p", f"{host_port}:{CONTAINER_PORT}"]
         if use_gpu:
             args += ["--gpus", "all"]
