@@ -168,7 +168,7 @@ DEFAULT_SETTINGS = {
     # of the capture. See target_overlay.py. Not a profile setting: it is
     # about whether the marker is shown at all, not about how the box looks,
     # so switching appearance profiles must not turn it on or off.
-    "capture_show_target": True,
+    "capture_show_target": False,
     # Open the Capture Box beside the caret it found rather than beside the
     # mouse. Only possible now that the caret is located at all, and only
     # takes effect when it was found -- see caret_target.py.

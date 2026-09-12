@@ -842,9 +842,12 @@ class WhisperTypeApp:
         if not (self.settings.get("capture_show_target",
                                   DEFAULT_SETTINGS["capture_show_target"])
                 or self.settings.get("capture_follow_caret",
-                                     DEFAULT_SETTINGS["capture_follow_caret"])):
-            # Neither the marker nor caret-following is wanted, so there is
-            # nothing to spend a UI Automation round trip on.
+                                     DEFAULT_SETTINGS["capture_follow_caret"])
+                or self.settings.get("capture_live_typing",
+                                     DEFAULT_SETTINGS["capture_live_typing"])):
+            # Nothing that needs the caret is wanted -- no marker, no
+            # caret-following, no live typing -- so there is nothing to spend
+            # a UI Automation round trip on.
             return
         try:
             # The font at the caret is only worth a COM call when something is
