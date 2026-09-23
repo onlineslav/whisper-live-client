@@ -153,6 +153,10 @@ class WhisperTypeApp:
         # pass it was set for, so without this one left over from a capture
         # that already pasted would cut the next capture's pass short.
         self._paste_token = 0
+        # The same for the on-demand disconnect: only the newest one scheduled
+        # may fire, or one left over from the previous capture hangs up on the
+        # server while it is still sending this one's last words.
+        self._disconnect_token = 0
         self.connection_status = "Disconnected"
         self.connection_detail = ""
         # What the tray is currently saying, and since when -- the elapsed
@@ -1126,7 +1130,26 @@ class WhisperTypeApp:
         if not self.settings.get("connect_on_demand", False):
             return
         # Delay disconnect slightly so the server can deliver final transcripts after EOS.
-        QTimer.singleShot(1200, self.websocket_client.disconnect)
+        self._disconnect_token += 1
+        token = self._disconnect_token
+        QTimer.singleShot(1200, lambda: self._on_demand_disconnect(token))
+
+    def _on_demand_disconnect(self, token: int):
+        """The delayed half of _schedule_on_demand_disconnect.
+
+        Skipped when another capture has started in the meantime. The client
+        redials the moment the server hangs up on END_OF_AUDIO, so a hotkey
+        pressed within this delay finds a fresh "Ready" connection and starts
+        streaming into it -- and disconnecting here would cut that capture off
+        a second in, leaving the box on "Listening..." over a dead socket.
+        That capture schedules its own disconnect when it ends.
+        """
+        if token != self._disconnect_token:
+            return
+        if self.is_capturing:
+            self.logger.debug("On-demand disconnect skipped: a capture is running.")
+            return
+        self.websocket_client.disconnect()
 
     def write_to_history(self, text, status="CONFIRMED"):
         try:
