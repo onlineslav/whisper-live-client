@@ -42,6 +42,11 @@ PASTE_START_DELAY_MS = 60
 # and hand the foreground on.
 PASTE_FOCUS_DELAY_MS = 120
 
+# How often a running capture checks which window is in front. Polled rather
+# than hooked: it only runs while a capture is up, and a user switching
+# windows does not notice a sixth of a second.
+FOREGROUND_POLL_MS = 150
+
 # Milliseconds between releasing held modifiers and injecting Ctrl+V. The
 # target processes the keyups in order, but a chord arriving in the same
 # instant as its own activation is dropped by some apps (Chromium especially).
@@ -222,6 +227,12 @@ class WhisperTypeApp:
         self.capture_box.confirmed.connect(self.on_capture_confirmed)
         self.capture_box.cancelled.connect(self.on_capture_cancelled)
         self.capture_box.meter_style_changed.connect(self.on_meter_style_changed)
+        # Which window is in front, for as long as a capture is up. Decides
+        # whether the box is faded (the user is elsewhere) and whether Enter
+        # and Escape belong to the capture -- see _check_capture_foreground.
+        self._foreground_timer = QTimer()
+        self._foreground_timer.setInterval(FOREGROUND_POLL_MS)
+        self._foreground_timer.timeout.connect(self._check_capture_foreground)
         # Straight from the audio thread, so the meter moves even while the
         # speech gate is holding chunks back from the server.
         self.audio_capture.level_changed.connect(self.capture_box.set_level_db)
@@ -827,13 +838,15 @@ class WhisperTypeApp:
             self._ghosting = self._start_live_typing()
             self.capture_box.set_compact(self._ghosting)
             self.capture_box.set_passive(self._ghosting)
-            # A passive box never receives a keystroke, so the two keys this
-            # interaction ends with are taken from the desktop instead.
-            self._claim_capture_keys(self._ghosting)
             # Before the box, so the flash is already running when the box
             # fades in over it rather than starting after it has settled.
             self._show_target_marker()
             self.capture_box.show_at_cursor(self._capture_anchor())
+            # Enter and Escape are claimed from here on whenever the target is
+            # in front -- a passive box never receives a keystroke, and either
+            # kind of box can be left for another window and come back to.
+            self._check_capture_foreground()
+            self._foreground_timer.start()
             # The client's own answer, not the last status it reported: once
             # the previous capture sent END_OF_AUDIO its session is spent, but
             # "Ready" stands until the socket actually closes.
@@ -865,11 +878,64 @@ class WhisperTypeApp:
         except Exception:
             self.logger.exception("Could not change the capture key claim.")
 
-    def on_capture_confirm_key(self):
-        """Enter, pressed while a passive box was holding the capture.
+    def _check_capture_foreground(self):
+        """Fade the box, and hand Enter/Escape back, by which window is in front.
 
-        The box has no keyboard of its own to hear it with, so it arrives here
-        instead -- and does exactly what clicking Confirm does. The one
+        Three cases, by what the user is looking at:
+
+        * The target -- where the text is going. Enter and Escape belong to
+          the capture: a passive box cannot hear them, and a box the user has
+          clicked back past cannot either. Enter here ends in a paste into
+          this same window, so claiming it costs the document nothing.
+        * The box itself (or any other window of ours). It hears the keys
+          itself, so nothing is claimed.
+        * Anything else -- the browser opened to check a fact. The capture
+          keeps recording, but the keys are the user's, the box fades, and
+          it says the hotkey is how to finish.
+        """
+        if not self.is_capturing:
+            # Ended some way that did not stop the timer on its own.
+            self._foreground_timer.stop()
+            self._claim_capture_keys(False)
+            return
+        if not self.capture_box.isVisible():
+            # Hidden for a moment by the frost fallback (refresh_backdrop),
+            # not closed: that is what is_capturing is for.
+            return
+        hwnd = get_foreground_window()
+        if not hwnd:
+            # Mid-switch, or the desktop has the foreground for a moment.
+            # Nothing to learn from it; the next tick will know.
+            return
+        at_target = bool(self._prev_foreground_hwnd) and hwnd == self._prev_foreground_hwnd
+        away = not at_target and not is_own_window(hwnd)
+        self._claim_capture_keys(at_target)
+        self.capture_box.set_away(
+            away, f"Still listening · {self._hotkey_label()} to paste")
+
+    def _hotkey_label(self) -> str:
+        """The capture hotkey the way a person would write it: "F13", "Ctrl+`"."""
+        names = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "cmd": "Win"}
+        parts = []
+        for token in self.settings.get("hotkey", "").split("+"):
+            key = token.strip().strip("<>").lower()
+            if not key:
+                continue
+            if key in names:
+                parts.append(names[key])
+            elif key[0] == "f" and key[1:].isdigit():
+                parts.append(key.upper())
+            else:
+                parts.append(key.capitalize())
+        return "+".join(parts) or "the hotkey"
+
+    def on_capture_confirm_key(self):
+        """Enter, pressed while the capture had claimed it from the desktop.
+
+        That is, while a passive box was up or the target window was in front
+        -- see _check_capture_foreground. The box has no keyboard of its own to
+        hear it with, so it arrives here instead -- and does exactly what
+        clicking Confirm does. The one
         exception is a box that is still reporting on the connection: there is
         no transcript in it yet, only a status message, and confirming would
         paste that. The hotkey answers the same case the same way.
@@ -882,7 +948,7 @@ class WhisperTypeApp:
             self.capture_box.on_confirm()
 
     def on_capture_cancel_key(self):
-        """Escape, pressed while a passive box was holding the capture."""
+        """Escape, pressed while the capture had claimed it from the desktop."""
         if not self.is_capturing or not self.capture_box.isVisible():
             return
         self.capture_box.on_cancel()
@@ -1099,6 +1165,7 @@ class WhisperTypeApp:
     def on_capture_confirmed(self, text):
         if not self.is_capturing:
             return
+        self._foreground_timer.stop()
         self._claim_capture_keys(False)
         self.is_capturing = False
         self._capture_waiting_for_connection = False
@@ -1227,6 +1294,7 @@ class WhisperTypeApp:
     def on_capture_cancelled(self):
         if not self.is_capturing:
             return
+        self._foreground_timer.stop()
         self._claim_capture_keys(False)
         self.is_capturing = False
         self._capture_waiting_for_connection = False
@@ -1552,6 +1620,8 @@ class WhisperTypeApp:
         # a dropped connection and dial a new one.
         self.is_capturing = False
         self._paste_pending = False
+        self._foreground_timer.stop()
+        self._claim_capture_keys(False)
         self._hide_target_marker()
         caret_target.shutdown()
         if getattr(self, "_final_pass", None):

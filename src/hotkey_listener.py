@@ -27,8 +27,8 @@ class HotkeyListener(QObject):
     """
     Listens for a global hotkey press in a separate thread and emits a signal.
 
-    It also claims Enter and Escape from the desktop for the length of a
-    capture that cannot take the keyboard for itself. A capture typing into
+    It also claims Enter and Escape from the desktop while a capture is up
+    and its target window is in front. A capture typing into
     the target application has to leave the keyboard where it is -- see
     CaptureBox.set_passive -- and a box without the keyboard never sees Enter,
     which is the key the whole interaction is documented to end with.
@@ -76,9 +76,11 @@ class HotkeyListener(QObject):
     def claim_capture_keys(self, claimed: bool):
         """Take Enter and Escape from the desktop, or give them back.
 
-        Only ever on while a capture is up that cannot take the keyboard
-        itself, and off at every other moment -- these are two keys the rest
-        of the desktop very much wants.
+        Only ever on while a capture is up and the window it will paste into
+        is in front -- see WhisperTypeApp._check_capture_foreground -- and off
+        at every other moment, including while the user has gone to another
+        window mid-capture. These are two keys the rest of the desktop very
+        much wants.
         """
         claimed = bool(claimed)
         if claimed == self._claiming:

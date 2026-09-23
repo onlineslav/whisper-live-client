@@ -49,7 +49,7 @@ Follow the detailed checklist in the `todo.md` file. The general order of operat
 - **Style:** Adhere to modern Windows UI principles. Use `PySide6` to create borderless, semi-transparent windows (e.g., `Qt.FramelessWindowHint`, `setAttribute(Qt.WA_TranslucentBackground)`).
 - **Responsiveness:** The application must feel fast. The Capture Box should appear instantly.
 - **User Feedback:** Use the tray icon's state to clearly communicate the application's status. Provide clear error messages if the server connection fails.
-- **Intuitive Controls:** The `Enter` for confirm, `Esc` for cancel, and click-away to cancel behaviors are critical for a smooth user experience.
+- **Intuitive Controls:** The `Enter` for confirm and `Esc` for cancel behaviors are critical for a smooth user experience. Clicking away must *not* cancel: the capture keeps recording (the box fades and says so) so the user can glance at another window mid-dictation, and the hotkey finishes it from anywhere.
 
 ## Final Deliverable
 

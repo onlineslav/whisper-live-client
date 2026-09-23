@@ -196,14 +196,20 @@ Other good options:
     accept the text.
 6.  **Confirm or Cancel**:
     - To **confirm** and paste the text, press the hotkey again, press `Enter`, or click the "✓" button.
-    - To **cancel**, press `Esc`, click the "✗" button, or simply click away from the Capture Box.
+    - To **cancel**, press `Esc` or click the "✗" button.
 
-    While live typing is running the box deliberately does not hold the
-    keyboard — your document does — so `Enter` and `Esc` are claimed from the
-    desktop for the length of the capture and are swallowed rather than
-    reaching the document. Held modifiers hand the key back, so `Shift+Enter`
-    is still a newline. Clicking away does not cancel then either: you are
-    meant to be clicking around in your own document while it types there.
+    **Clicking away does not cancel.** Go and read a web page mid-sentence and
+    the capture keeps recording: the box fades and says *Still listening · F13
+    to paste* (your hotkey), and pressing the hotkey from anywhere pastes into
+    the window you started in. Click back into that window and the box
+    brightens again, with `Enter` and `Esc` working as before.
+
+    While the window you are dictating into is in front, `Enter` and `Esc` are
+    claimed from the desktop and are swallowed rather than reaching the
+    document — the box does not always hold the keyboard itself (while live
+    typing it deliberately never does), so this is how it hears them. Held
+    modifiers hand the key back, so `Shift+Enter` is still a newline. In any
+    other window both keys are left alone.
     `Enter` pressed while the box is still reporting on the connection cancels
     rather than confirms, since there is no transcript in it yet.
 

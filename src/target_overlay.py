@@ -26,9 +26,9 @@ The window itself has three properties that are all load-bearing:
   * Transparent for input. It sits over another application's text field, so
     a click has to go straight through it. Qt.WindowTransparentForInput is
     WS_EX_TRANSPARENT, which is what makes the desktop underneath usable.
-  * Never activated. The Capture Box cancels itself when it loses activation
-    (see capture_box.changeEvent), so an overlay that took the foreground on
-    show would cancel every capture the instant it appeared.
+  * Never activated. An overlay that took the foreground on show would take
+    the keyboard from the Capture Box -- or, for live typing, from the very
+    text field the words are being typed into.
   * Excluded from screen capture. The Capture Box frosts its backdrop by
     photographing the screen behind it; without this the photograph would
     include the marker, and a stale copy of it would sit frozen in the

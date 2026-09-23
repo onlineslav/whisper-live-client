@@ -1,6 +1,5 @@
 import ctypes
 import sys
-import time
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -13,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QTextEdit,
     QGraphicsOpacityEffect,
+    QLabel,
     QSizePolicy,
 )
 from PySide6.QtCore import (
@@ -20,7 +20,6 @@ from PySide6.QtCore import (
     QRect,
     QRectF,
     Signal,
-    QEvent,
     QPoint,
     QTimer,
     QPropertyAnimation,
@@ -31,7 +30,6 @@ from PySide6.QtGui import (
     QFont,
     QFontMetrics,
     QKeyEvent,
-    QFocusEvent,
     QTextOption,
     QGuiApplication,
     QTextCursor,
@@ -52,6 +50,13 @@ from win_focus import focus_window
 # mouse pointer's own bitmap so the box never opens underneath it.
 ANCHOR_OFFSET_X = 16
 ANCHOR_OFFSET_Y = 18
+
+# How opaque the box is while the user is working in some other window. The
+# capture carries on -- clicking away no longer cancels it -- so the box stays
+# up, but faded enough to read what is underneath it, and to say at a glance
+# that it is still listening rather than in the way.
+AWAY_OPACITY = 0.6
+AWAY_FADE_MS = 180
 
 DEFAULT_FONT_SIZE_PX = 14
 # Empty means whatever Qt would have used, which is the system UI font. Kept
@@ -435,7 +440,10 @@ class CaptureBox(QWidget):
         super().__init__()
         self._closing = False
         self._fade_duration_ms = 140
-        self._shown_at = 0.0
+        # True while the user is in a window other than the box and the
+        # target -- see set_away. The capture is still running.
+        self._away = False
+        self._away_animation = None
         # Set before anything builds the layout: _sync_meter_alignment runs
         # during construction and asks whether the box is slimmed.
         #
@@ -447,9 +455,8 @@ class CaptureBox(QWidget):
         self._compact = False
         self._passive = False
         # A preview box stands in the Settings window rather than over the
-        # app being dictated into, so every way a real capture ends -- losing
-        # activation, a click outside it, the keyboard -- would close it the
-        # moment the user went back to the control they are adjusting. It is
+        # app being dictated into, so the ways a real capture ends -- the
+        # keyboard, the buttons -- must not paste or cancel a sample. It is
         # the same widget otherwise, which is the point of previewing it.
         self._preview_mode = False
 
@@ -539,6 +546,13 @@ class CaptureBox(QWidget):
         self._min_field_height = 0
         self.set_font_size(DEFAULT_FONT_SIZE_PX)
         layout.addWidget(self.text_area)
+
+        # "Still listening", shown only while the user is in another window.
+        # Without it a faded box reads as one that has stopped -- which is the
+        # very thing that made click-away cancelling easy to miss.
+        self.away_hint = QLabel()
+        self.away_hint.setVisible(False)
+        layout.addWidget(self.away_hint)
 
         # Buttons
         button_row = QHBoxLayout()
@@ -646,9 +660,7 @@ class CaptureBox(QWidget):
         """
         if busy:
             # This capture is already settled, whether it was confirmed from
-            # the button or from the hotkey. Saying so here is what stops a
-            # click in another window, or the box losing activation to the
-            # app the paste is heading for, from being read as a cancel.
+            # the button or from the hotkey.
             self._closing = True
         self.confirm_button.set_busy(busy)
 
@@ -760,6 +772,84 @@ class CaptureBox(QWidget):
             # Not fatal: without it the box takes focus and live typing is
             # degraded, which main.py notices and reports.
             pass
+
+    def set_away(self, away: bool, hint: str = ""):
+        """Fade the box while the user works in another window.
+
+        Clicking away used to cancel the capture, which lost whatever was said
+        next whenever the user went to look something up mid-sentence -- and
+        with the box gone there was nothing to say it had happened. Now the
+        capture carries on: the box stays where it is, fades so the window
+        underneath can be read through it, and says how to finish.
+
+        Driven from main.py, which watches the foreground window. Qt's own
+        activation state cannot tell "the user is back in the document" from
+        "the user is in a browser" -- the box is inactive for both -- and a
+        passive box is never active at all.
+        """
+        away = bool(away)
+        # Not gated on _closing: the fallback in refresh_backdrop hides and
+        # re-shows the box, and hideEvent sets it on the way through.
+        if self._preview_mode or not self.isVisible():
+            return
+        if hint:
+            self.away_hint.setText(hint)
+        if away == self._away:
+            return
+        self._away = away
+
+        ink = QColor(self._text_color)
+        self.away_hint.setStyleSheet(
+            "QLabel { color: rgba(%d, %d, %d, 0.8); background: transparent;"
+            " font-size: 12px; padding: 0 2px; }"
+            % (ink.red(), ink.green(), ink.blue()))
+        self.away_hint.setVisible(away)
+        self._settle_layout()
+        self._keep_on_screen()
+        # The frost was photographed for the old size, and with the user off
+        # in another window what is behind the box has likely moved on anyway.
+        if self.wants_frost():
+            self.refresh_backdrop()
+
+        self._stop_away_animation()
+        animation = QPropertyAnimation(self._opacity, b"opacity", self)
+        animation.setDuration(AWAY_FADE_MS)
+        animation.setStartValue(self._opacity.opacity())
+        animation.setEndValue(AWAY_OPACITY if away else 1.0)
+        animation.finished.connect(self._forget_away_animation)
+        self._away_animation = animation
+        animation.start(QAbstractAnimation.DeleteWhenStopped)
+
+    def _forget_away_animation(self):
+        self._away_animation = None
+
+    def _stop_away_animation(self):
+        # stop() deletes it (DeleteWhenStopped) without emitting finished, so
+        # the reference is dropped here rather than by the slot.
+        if self._away_animation is not None:
+            self._away_animation.stop()
+            self._away_animation = None
+
+    def _reset_away(self):
+        """Back to a box the user is looking at, for the next time it opens."""
+        self._stop_away_animation()
+        self._away = False
+        self.away_hint.setVisible(False)
+
+    def is_away(self) -> bool:
+        return self._away
+
+    def _keep_on_screen(self):
+        """Pull the box back inside its screen after it has grown."""
+        screen = (QGuiApplication.screenAt(self.geometry().center())
+                  or QApplication.primaryScreen())
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        x = max(available.left(), min(self.x(), available.right() - self.width()))
+        y = max(available.top(), min(self.y(), available.bottom() - self.height()))
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
 
     def set_level_db(self, db: float):
         """Feed the meter a raw chunk level in dBFS."""
@@ -1265,6 +1355,7 @@ class CaptureBox(QWidget):
         """
         self._preview_mode = True
         self._closing = False
+        self._reset_away()
         self.set_busy(False)
         self.meter.reset()
         self.adjustSize()
@@ -1315,17 +1406,13 @@ class CaptureBox(QWidget):
         """
         self._preview_mode = False
         self._closing = False
+        self._reset_away()
         self.set_busy(False)
         self.meter.reset()
-        self._shown_at = time.monotonic()
         # Activated rather than merely requested, so the geometry measured
         # below -- and photographed for the frost -- is the one the box will
         # actually have when it appears.
         self._settle_layout()
-
-        app = QApplication.instance()
-        if app:
-            app.installEventFilter(self)
 
         self._move_near(anchor if anchor is not None else self._anchor_point())
         # Before the snapshot: the reservation decides how much of the screen
@@ -1426,70 +1513,13 @@ class CaptureBox(QWidget):
         else:
             super().keyPressEvent(event)
 
-    def focusOutEvent(self, event: QFocusEvent):
-        super().focusOutEvent(event)
-
-    def changeEvent(self, event):
-        """Cancel when the user clicks away to another window.
-
-        A QApplication event filter only sees events delivered to our own
-        process, so it can never observe a click in Notepad or the browser —
-        losing window activation is the only reliable signal that the user
-        switched away. Deactivations in the first moments after show() are
-        ignored: taking the foreground is itself a burst of activation changes.
-        """
-        if (
-            event.type() == QEvent.ActivationChange
-            and not self._preview_mode
-            # A passive box is never the active window by design, so "lost
-            # activation" is its normal state rather than a signal that the
-            # user went elsewhere. Without this it cancels itself the instant
-            # it appears.
-            and not self._passive
-            and not self._closing
-            and self.isVisible()
-            and not self.isActiveWindow()
-            and time.monotonic() - self._shown_at > 0.35
-        ):
-            self.on_cancel()
-        super().changeEvent(event)
-
-    def eventFilter(self, obj, event):
-        # Click-away cancel is off for a passive box: the user is meant to be
-        # clicking around in their own document while it types into it, and
-        # every one of those clicks arrives here as a press outside the box.
-        if (event.type() == QEvent.MouseButtonPress
-                and not self._preview_mode and not self._passive
-                and not self._closing):
-            # An app-wide filter sees every press twice: first on the receiving
-            # QWindow, then on the QWidget under it. The QWindow is not a
-            # widget, so an isWidgetType()-only check misses our own window and
-            # cancels the capture before the Confirm button ever sees the click.
-            if obj is self.windowHandle():
-                return super().eventFilter(obj, event)
-            if obj.isWidgetType() and (obj is self or self.isAncestorOf(obj)):
-                return super().eventFilter(obj, event)
-
-            # geometry() is in screen coordinates for a top-level window, so it
-            # must be tested against the global click position. Mapping the
-            # point to widget-local coords first made every click read as
-            # "outside", cancelling the capture wherever the user clicked.
-            if not self.geometry().contains(event.globalPosition().toPoint()):
-                self.on_cancel()
-                return True
-        return super().eventFilter(obj, event)
-
     def hideEvent(self, event):
         # Any hide ends this capture — including one driven from main.py (the
-        # hotkey-to-confirm path). Marking it closing here stops the
-        # deactivation that follows from being read as a click-away cancel.
+        # hotkey-to-confirm path).
         self._closing = True
         self.set_busy(False)
         self._frost_timer.stop()
         self.meter.reset()
-        app = QApplication.instance()
-        if app:
-            app.removeEventFilter(self)
         super().hideEvent(event)
 
     def _animate_opacity(self, start: float, end: float, on_finished=None):
@@ -1502,6 +1532,9 @@ class CaptureBox(QWidget):
         animation.start(QAbstractAnimation.DeleteWhenStopped)
 
     def _fade_out_and_hide(self):
+        # An away fade still running would fight this one for the opacity.
+        self._stop_away_animation()
+
         def _finish():
             self.hide()
             self._opacity.setOpacity(0.0)
