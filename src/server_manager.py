@@ -36,6 +36,7 @@ STATE_DISABLED = "disabled"          # not managing this server at all
 STATE_CHECKING = "checking"          # probing the port / asking Docker
 STATE_STARTING_DOCKER = "docker"     # waiting for the Docker daemon
 STATE_PULLING = "pulling"            # downloading the server image
+STATE_FETCHING_MODEL = "model"      # downloading Whisper weights into the cache
 STATE_STARTING = "starting"          # docker run / docker start
 STATE_RUNNING = "running"            # something is listening on the port
 STATE_FAILED = "failed"              # gave up; detail says why
@@ -855,7 +856,11 @@ class ServerManager(QObject):
         self._docker("rm", "-f", MODEL_FETCH_CONTAINER, timeout=60)
         snippet = ("from faster_whisper.utils import download_model; "
                    "print(download_model('%s'))" % model)
-        self._emit(STATE_PULLING, f"Preparing the {model} model")
+        # Checking rather than downloading: with the model already cached --
+        # every launch but the first -- this finishes in seconds having
+        # fetched nothing. The state only turns into a download once there
+        # are bytes arriving to show for it, below.
+        self._emit(STATE_CHECKING, f"Checking the {model} model")
         ok, _, err = self._docker(
             "run", "-d", "--name", MODEL_FETCH_CONTAINER,
             "-v", f"{self._model_cache_volume()}:{MODEL_CACHE_PATH}",
@@ -874,7 +879,7 @@ class ServerManager(QObject):
                 sample = self._download_bytes(MODEL_FETCH_CONTAINER)
                 if sample:
                     done, total = sample
-                    self._emit(STATE_PULLING,
+                    self._emit(STATE_FETCHING_MODEL,
                                f"Downloading {model} — {_format_bytes(done)} of "
                                f"{_format_bytes(total)} ({done / total:.0%})")
                 if running != "true":

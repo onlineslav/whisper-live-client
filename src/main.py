@@ -330,6 +330,8 @@ class WhisperTypeApp:
         # more informative answer -- it is the reason there is no connection.
         if server_state == server_manager.STATE_PULLING:
             return "starting", "Downloading server", server_detail
+        if server_state == server_manager.STATE_FETCHING_MODEL:
+            return "starting", "Downloading model", server_detail
         if server_state == server_manager.STATE_STARTING_DOCKER:
             return "starting", "Starting Docker", server_detail
         if server_state in (server_manager.STATE_STARTING, server_manager.STATE_CHECKING):
