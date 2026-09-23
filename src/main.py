@@ -140,6 +140,13 @@ class WhisperTypeApp:
         # The capture's text so far. The server only ever sends the tail
         # of it -- see transcript.py -- so it is assembled here.
         self._transcript = Transcript()
+        # Text from earlier sessions of this same capture. A connection that
+        # drops mid-capture is replaced, and the replacement's timestamps
+        # start again at zero, so what the old one said is set aside here
+        # rather than folded into a Transcript that would alias the two.
+        self._banked_text = ""
+        # True from a mid-capture drop until the replacement is ready.
+        self._capture_interrupted = False
         # The capture's audio, kept so it can be re-transcribed in one piece
         # once the user confirms -- see final_pass.py. The streamed text is a
         # preview; this is what actually gets pasted when the replay works.
@@ -352,7 +359,14 @@ class WhisperTypeApp:
         self.tray_icon.setToolTip(self._tooltip_text(label, detail, icon_state))
         self._sync_menu_actions()
         if self._capture_waiting_for_connection:
+            if self.connection_status == "Ready":
+                # "Ready" from a session the last capture just ended -- it is
+                # already closing, and this capture is waiting on its
+                # replacement.
+                label, detail = "Connecting", ""
             self._update_capture_status_text(label, detail)
+        elif self.is_capturing and self._capture_interrupted:
+            self._show_interruption()
 
     def _tooltip_text(self, label: str, detail: str, icon_state: str) -> str:
         text = f"WhisperType \u2014 {label}"
@@ -396,6 +410,37 @@ class WhisperTypeApp:
             self.capture_box.set_text(f"{label}\u2026\n{detail}")
         else:
             self.capture_box.set_text(f"{label}\u2026")
+
+    def _show_interruption(self):
+        """Say the connection went, under the words that made it through.
+
+        The text shown is never what gets pasted -- that is _capture_text() --
+        so the status lines here cannot end up in the document.
+        """
+        status = self.connection_status
+        if status == "Loading":
+            headline = "Reconnecting \u2014 loading the model\u2026"
+        elif status == "Waiting":
+            headline = "Reconnecting \u2014 the server is busy\u2026"
+        elif status == "Connecting":
+            headline = "Connection lost \u2014 reconnecting\u2026"
+        else:
+            headline = "Connection lost \u2014 retrying\u2026"
+        lines = [headline]
+        # Connecting and Loading details only restate the headline.
+        if self.connection_detail and status not in ("Connecting", "Loading"):
+            lines.append(self.connection_detail)
+        lines.append("Keep talking: it catches up once reconnected. "
+                     "Confirm keeps what you have so far.")
+        text = self._capture_text()
+        status_block = "\n".join(lines)
+        # A slimmed box has no room for this; see _update_capture_status_text.
+        self.capture_box.set_compact(False)
+        self.capture_box.set_text(f"{text}\n\n{status_block}" if text else status_block)
+
+    def _capture_text(self) -> str:
+        """Everything this capture has heard, across any reconnects."""
+        return " ".join(part for part in (self._banked_text, self._transcript.text()) if part)
 
     def _init_status_timers(self):
         # Drives the elapsed counter in the tooltip.
@@ -668,6 +713,22 @@ class WhisperTypeApp:
         if status == "Ready" and self.is_capturing and self._capture_waiting_for_connection:
             self._capture_waiting_for_connection = False
             self._begin_streaming()
+        elif self.is_capturing and not self._capture_waiting_for_connection:
+            # Streaming, so any news about the connection is news about this
+            # capture. Only a fresh session reports "Ready" -- SERVER_READY
+            # comes once per connection -- so anything else means the one
+            # being streamed into has gone.
+            if status == "Ready":
+                if self._capture_interrupted:
+                    self._resume_streaming()
+            elif not self._capture_interrupted:
+                self._interrupt_capture()
+
+        if self.is_capturing and status in ("Disconnected", "Error"):
+            # The client redials on its own while it is running, but a thread
+            # that stopped -- told to, or failed outright -- does not come
+            # back by itself, and a capture is waiting on it either way.
+            self.websocket_client.connect()
 
         # Only a model load can be waiting on a download; anything else means
         # there is nothing to watch and the poller should not be running.
@@ -712,8 +773,14 @@ class WhisperTypeApp:
                     self.logger.warning("Failed to decode binary message of len %d", len(message_str))
                     return
             message = json.loads(message_str)
+            if self._capture_interrupted:
+                # Whatever still arrives from the session that dropped was
+                # already banked with the rest of its text; folding it in
+                # again would duplicate it.
+                self.logger.debug("Dropping message from an interrupted session.")
+                return
             self._transcript.update(message)
-            full_text = self._transcript.text()
+            full_text = self._capture_text()
 
             # An empty transcript leaves the box on its "Listening..."
             # placeholder rather than blanking it, and leaves toPlainText()
@@ -745,6 +812,12 @@ class WhisperTypeApp:
         if not self.is_capturing:
             self.is_capturing = True
             self._capture_waiting_for_connection = False
+            self._capture_interrupted = False
+            # Cleared here and not only once streaming starts, so that the
+            # text of a capture that never got a connection is empty rather
+            # than the previous capture's.
+            self._transcript.reset()
+            self._banked_text = ""
             payload_log.log_event("capture_start")
             # Record the target window now, before the Capture Box steals focus.
             self._record_paste_target()
@@ -761,7 +834,10 @@ class WhisperTypeApp:
             # fades in over it rather than starting after it has settled.
             self._show_target_marker()
             self.capture_box.show_at_cursor(self._capture_anchor())
-            if self.connection_status == "Ready":
+            # The client's own answer, not the last status it reported: once
+            # the previous capture sent END_OF_AUDIO its session is spent, but
+            # "Ready" stands until the socket actually closes.
+            if self.websocket_client.is_ready:
                 self._begin_streaming()
             else:
                 # Not ready yet: connect-on-demand, a connection still warming
@@ -769,11 +845,7 @@ class WhisperTypeApp:
                 # reports which of those it is, refreshed as the state moves;
                 # on_connection_status_changed() starts streaming once ready.
                 self._capture_waiting_for_connection = True
-                if (self.server_manager.manages_server()
-                        and self.server_manager.state != server_manager.STATE_RUNNING
-                        and not self.server_manager.is_busy()):
-                    # Dictating is as clear a request for a server as there is.
-                    self.server_manager.ensure_running()
+                self._request_server()
                 self.websocket_client.connect()
             self._sync_icon_state()
             self.logger.debug("Capture started via hotkey.")
@@ -781,7 +853,7 @@ class WhisperTypeApp:
             if self._capture_waiting_for_connection:
                 self.on_capture_cancelled()
             else:
-                self.on_capture_confirmed(self.capture_box.text_area.toPlainText())
+                self.on_capture_confirmed(self._capture_text())
 
     def _claim_capture_keys(self, claimed: bool):
         """Take Enter and Escape from the desktop for this capture, or return them."""
@@ -970,10 +1042,59 @@ class WhisperTypeApp:
         self.capture_box.set_compact(self._ghosting)
         # Drop the last capture's words before any of this one arrive.
         self._transcript.reset()
+        self._banked_text = ""
+        self._capture_interrupted = False
         self._capture_audio.clear()
         payload_log.log_event("streaming_start")
         self.websocket_client.reset_eos()
         self.audio_capture.start_streaming()
+
+    def _interrupt_capture(self):
+        """The session this capture was streaming into has gone.
+
+        The words it produced are banked, the box says what happened, and a
+        replacement is dialled. The microphone keeps running: the client holds
+        what is said meanwhile and sends it once the replacement is ready (see
+        WebSocketClient.send_audio), so speaking through a reconnect loses
+        nothing that the server would have heard.
+        """
+        self._capture_interrupted = True
+        # The in-progress segment is included -- it is the server's best
+        # reading of that audio, and the audio is not coming back.
+        self._banked_text = self._capture_text()
+        self._transcript.reset()
+        payload_log.log_event("connection_lost", status=self.connection_status)
+        self.logger.warning("Connection lost mid-capture (%s: %s); %d characters kept.",
+                            self.connection_status, self.connection_detail,
+                            len(self._banked_text))
+        self._request_server()
+        self.websocket_client.connect()
+        self._show_interruption()
+
+    def _resume_streaming(self):
+        """A replacement session is ready; carry on with the same capture.
+
+        Deliberately not _begin_streaming: that starts a capture over, and
+        clearing the client's held audio (reset_eos) would throw away exactly
+        what was said during the reconnect.
+        """
+        self._capture_interrupted = False
+        # New session, new timeline: nothing of the old one may alias it.
+        self._transcript.reset()
+        payload_log.log_event("streaming_resumed")
+        self.logger.info("Reconnected mid-capture; resuming.")
+        self.capture_box.set_compact(self._ghosting)
+        self.capture_box.set_text(self._capture_text())
+
+    def _request_server(self):
+        """Start the local server if it is ours to start and is not up.
+
+        Dictating is as clear a request for a server as there is.
+        """
+        if (self.server_manager.manages_server()
+                and self.server_manager.state != server_manager.STATE_RUNNING
+                and not self.server_manager.is_busy()):
+            self.server_manager.ensure_running()
 
     def on_capture_confirmed(self, text):
         if not self.is_capturing:
@@ -1086,7 +1207,7 @@ class WhisperTypeApp:
         # Read before the box goes: without a re-transcription the streamed
         # text in the box is what gets pasted, and hiding it first would mean
         # reading it back out of a window that is on its way out.
-        text = text or self.capture_box.text_area.toPlainText()
+        text = text or self._capture_text()
         self._dismiss_capture_box()
         QTimer.singleShot(PASTE_START_DELAY_MS, lambda: self._do_paste(text))
 
@@ -1099,7 +1220,7 @@ class WhisperTypeApp:
         self.logger.warning("Final pass did not report back; pasting the streamed text.")
         if self._final_pass:
             self._final_pass.abandon()
-        text = self.capture_box.text_area.toPlainText()
+        text = self._capture_text()
         self._dismiss_capture_box()
         QTimer.singleShot(PASTE_START_DELAY_MS, lambda: self._do_paste(text))
 
@@ -1123,7 +1244,7 @@ class WhisperTypeApp:
         self.websocket_client.send_eos()
         self._schedule_on_demand_disconnect()
         self._sync_icon_state()
-        self.write_to_history(self.capture_box.text_area.toPlainText(), status="CANCELLED")
+        self.write_to_history(self._capture_text(), status="CANCELLED")
         self.logger.debug("Capture cancelled.")
 
     def _schedule_on_demand_disconnect(self):
@@ -1299,7 +1420,7 @@ class WhisperTypeApp:
         # Read the final transcription now -- the box may have updated between
         # confirm and here -- and log it before anything else can fail.
         if text is None:
-            text = self.capture_box.text_area.toPlainText()
+            text = self._capture_text()
         text = text.strip()
         self.write_to_history(text, status="CONFIRMED")
         if not text:
@@ -1427,6 +1548,9 @@ class WhisperTypeApp:
             self.logger.exception("Failed to show tray notification.")
 
     def _shutdown(self):
+        # A capture still open at quit must not read the disconnect below as
+        # a dropped connection and dial a new one.
+        self.is_capturing = False
         self._paste_pending = False
         self._hide_target_marker()
         caret_target.shutdown()
