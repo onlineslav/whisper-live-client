@@ -24,7 +24,7 @@ MAX_PENDING_AUDIO_BYTES = 16000 * 4 * 60
 # leave over a second of a three-second pause in the clip, which is enough for
 # Whisper to break the sentence on its own. Cutting sooner and padding less
 # collapses the pause before it can. Lower than this starts clipping soft word
-# onsets. Shared with final_pass.py so the replay hears what the stream heard.
+# onsets.
 VAD_PARAMETERS = {
     "onset": 0.5,
     "min_silence_duration_ms": 400,

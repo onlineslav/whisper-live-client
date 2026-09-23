@@ -131,7 +131,7 @@ class KeepingThePreview(unittest.TestCase):
         self.assertFalse(typer.active)
         self.assertEqual(typer.typed, "")
 
-    def test_not_kept_when_the_final_pass_rewrote_the_text(self):
+    def test_not_kept_when_the_server_revised_the_text(self):
         typer = self.typer("hello there")
         self.assertFalse(self.run_with(typer, "Hello, there. "))
         self.assertEqual(typer.posted, [])

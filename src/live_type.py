@@ -32,8 +32,8 @@ Two more things keep it honest while it runs:
     next update carries on from where it left off.
 
   * Everything typed is remembered exactly, so it can be removed exactly.
-    Cancelling a capture, or confirming one where the final pass produced
-    better text, erases precisely what was put in and no more.
+    Cancelling a capture, or confirming one whose finished text differs from
+    the preview, erases precisely what was put in and no more.
 
 The text goes in as posted window messages rather than as synthesised
 keystrokes, and that is the difference between this working and not.
@@ -290,11 +290,10 @@ class LiveTyper:
         """Keep the preview where it is when it is already the finished text.
 
         The confirm path's default is to take the preview back out and paste
-        the finished transcript in its place, because the final pass usually
-        re-punctuates what the running preview guessed. With the final pass
-        off, or on a capture it declined to re-transcribe, the two strings are
-        the same -- and the document is then backspaced over character by
-        character only to have the identical text pasted back.
+        the finished transcript in its place, because the last segments can
+        still firm up after the preview typed them. Usually, though, the two
+        strings are the same -- and the document is then backspaced over
+        character by character only to have the identical text pasted back.
 
         That round trip is all cost. It doubles the marks left on the target's
         undo stack, it spends a paste on a document that is already correct,
@@ -318,8 +317,8 @@ class LiveTyper:
         if not self._active or not self._typed:
             return False
         if not text.startswith(self._typed):
-            # The finished text is not the preview plus more -- the final pass
-            # rewrote it. It has to come out and be replaced.
+            # The finished text is not the preview plus more -- the server
+            # revised it. It has to come out and be replaced.
             return False
         if not self._target_is_ready():
             return False
@@ -340,10 +339,9 @@ class LiveTyper:
     def clear(self) -> bool:
         """Remove everything typed so far. True if the document is clean again.
 
-        Called on cancel, and before the real paste on confirm -- the final
-        pass re-transcribes the whole clip and usually produces something a
-        little different from the running preview, so the preview comes out
-        and the finished text goes in.
+        Called on cancel, and before the real paste on confirm when the
+        finished text differs from the running preview, so the preview comes
+        out and the finished text goes in.
         """
         # Never backspace over text that may not be ours: if the first
         # insertion turns out never to have arrived, this empties the model

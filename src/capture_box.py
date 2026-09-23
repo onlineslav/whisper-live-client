@@ -648,11 +648,8 @@ class CaptureBox(QWidget):
     def set_busy(self, busy: bool):
         """Show the box as still working on the transcript it handed over.
 
-        Confirming can be followed by a second or more of nothing -- the
-        final pass re-transcribes the whole capture before the text is pasted
-        -- and with the box already gone that gap reads as a hang. So the box
-        stays up with the Confirm button spinning until whoever asked for the
-        wait takes it down.
+        The box stays up with the Confirm button spinning until whoever asked
+        for the wait takes it down.
         """
         if busy:
             # This capture is already settled, whether it was confirmed from

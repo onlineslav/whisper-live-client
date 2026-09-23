@@ -161,9 +161,6 @@ DEFAULT_SETTINGS = {
     "launch_on_startup": False,
     "model": "distil-small.en",
     "connect_on_demand": True,
-    # Re-transcribe the whole capture in one piece when it is confirmed, and
-    # paste that instead of the text assembled live. See final_pass.py.
-    "final_pass": True,
     # Mark the place the transcript is going to be pasted into for the length
     # of the capture. See target_overlay.py. Not a profile setting: it is
     # about whether the marker is shown at all, not about how the box looks,
@@ -411,12 +408,6 @@ class SettingsWindow(QWidget):
         )
         self.launch_on_startup_checkbox = QCheckBox("Launch WhisperType on system startup")
         self.connect_on_demand_checkbox = QCheckBox("Connect to server only when capture starts (on-demand)")
-        self.final_pass_checkbox = QCheckBox(
-            "Re-transcribe the whole capture before pasting")
-        self.final_pass_checkbox.setToolTip(
-            "On Confirm, re-send the whole clip for one transcription read in "
-            "context. Fixes pauses split into two sentences; adds up to a "
-            "second before the paste.")
         self.capture_show_target_checkbox = QCheckBox(
             "Mark where the text will be pasted")
         self.capture_show_target_checkbox.setToolTip(
@@ -499,7 +490,6 @@ class SettingsWindow(QWidget):
         connection_column.setContentsMargins(0, 0, 0, 0)
         connection_column.addWidget(self.connect_on_demand_checkbox)
         connection_column.addWidget(self.reconnect_after_capture_checkbox)
-        connection_column.addWidget(self.final_pass_checkbox)
         form_layout.addRow(QLabel("Connection Mode:"), connection_column)
         # Where the capture happens, as opposed to how it looks: both of these
         # are about the target window, which is why they sit apart from the
@@ -980,7 +970,6 @@ class SettingsWindow(QWidget):
         self._select_model(settings.get("model", DEFAULT_SETTINGS["model"]))
         self.launch_on_startup_checkbox.setChecked(settings.get("launch_on_startup", DEFAULT_SETTINGS["launch_on_startup"]))
         self.connect_on_demand_checkbox.setChecked(settings.get("connect_on_demand", DEFAULT_SETTINGS["connect_on_demand"]))
-        self.final_pass_checkbox.setChecked(settings.get("final_pass", DEFAULT_SETTINGS["final_pass"]))
         self.capture_show_target_checkbox.setChecked(bool(settings.get(
             "capture_show_target", DEFAULT_SETTINGS["capture_show_target"])))
         self.capture_follow_caret_checkbox.setChecked(bool(settings.get(
@@ -1097,7 +1086,6 @@ class SettingsWindow(QWidget):
             "launch_on_startup": self.launch_on_startup_checkbox.isChecked(),
             "model": self.model_combo.currentData() or DEFAULT_SETTINGS["model"],
             "connect_on_demand": self.connect_on_demand_checkbox.isChecked(),
-            "final_pass": self.final_pass_checkbox.isChecked(),
             "capture_show_target": self.capture_show_target_checkbox.isChecked(),
             "capture_follow_caret": self.capture_follow_caret_checkbox.isChecked(),
             "capture_live_typing": self.capture_live_typing_checkbox.isChecked(),

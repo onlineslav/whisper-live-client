@@ -12,7 +12,7 @@ from PySide6.QtCore import QTimer
 from branding import wordmark_icon
 from settings_window import SettingsWindow, DEFAULT_SETTINGS, APP_DATA_DIR, CONFIG_FILE
 from hotkey_listener import HotkeyListener
-from websocket_client import WebSocketClient, VAD_PARAMETERS
+from websocket_client import WebSocketClient
 from audio_capture import AudioCapture
 from capture_box import CaptureBox
 import win_input
@@ -24,7 +24,6 @@ from target_overlay import TargetOverlay
 from live_type import LiveTyper
 from server_manager import ServerManager
 from transcript import Transcript
-from final_pass import FinalPass, BYTES_PER_SECOND, MAX_REPLAY_SECONDS, TIMEOUT_MS as FINAL_PASS_TIMEOUT_MS
 from win_focus import (
     get_foreground_window, focus_window, is_own_window, is_window,
     get_window_title,
@@ -51,19 +50,6 @@ FOREGROUND_POLL_MS = 150
 # target processes the keyups in order, but a chord arriving in the same
 # instant as its own activation is dropped by some apps (Chromium especially).
 PASTE_KEY_DELAY_MS = 40
-
-# How long to wait for the final pass before pasting the streamed text
-# regardless. FinalPass budgets its own round trip and always reports back, so
-# this only covers it failing to report at all -- a thread that never returns
-# would otherwise swallow the capture silently, which is the one outcome the
-# user cannot recover from.
-FINAL_PASS_WATCHDOG_MS = FINAL_PASS_TIMEOUT_MS + 2500
-
-# Ceiling on the audio kept for the final pass. Past MAX_REPLAY_SECONDS the
-# replay is refused anyway; this just stops a capture left running all
-# afternoon from growing the buffer with it. 16 kHz float32 mono, so a minute
-# is under 4 MB.
-MAX_CAPTURE_AUDIO_BYTES = BYTES_PER_SECOND * (MAX_REPLAY_SECONDS + 10)
 
 # One colour per thing the user can actually do something about. "starting"
 # is distinct from "connecting" because they fail differently: an amber icon
@@ -152,19 +138,6 @@ class WhisperTypeApp:
         self._banked_text = ""
         # True from a mid-capture drop until the replacement is ready.
         self._capture_interrupted = False
-        # The capture's audio, kept so it can be re-transcribed in one piece
-        # once the user confirms -- see final_pass.py. The streamed text is a
-        # preview; this is what actually gets pasted when the replay works.
-        self._capture_audio = bytearray()
-        self._final_pass = None
-        # True between confirming and pasting, while a final pass is in
-        # flight. Guards against pasting twice when the pass and its watchdog
-        # both come back.
-        self._paste_pending = False
-        # Which capture that pending paste belongs to. A watchdog outlives the
-        # pass it was set for, so without this one left over from a capture
-        # that already pasted would cut the next capture's pass short.
-        self._paste_token = 0
         # The same for the on-demand disconnect: only the newest one scheduled
         # may fire, or one left over from the previous capture hangs up on the
         # server while it is still sending this one's last words.
@@ -235,10 +208,6 @@ class WhisperTypeApp:
         # Straight from the audio thread, so the meter moves even while the
         # speech gate is holding chunks back from the server.
         self.audio_capture.level_changed.connect(self.capture_box.set_level_db)
-        # Kept alongside the stream rather than instead of it: the server gets
-        # the audio live so the box can show something immediately, and the
-        # copy here is what the final pass replays.
-        self.audio_capture.audio_chunk_ready.connect(self._buffer_capture_audio)
         self.app.aboutToQuit.connect(self._shutdown)
 
     def _init_tray_icon(self):
@@ -814,13 +783,6 @@ class WhisperTypeApp:
         if self.settings_window and self.settings_window.isVisible():
             self.logger.debug("Hotkey pressed while settings window open; ignoring.")
             return
-        if self._paste_pending:
-            # Dictating again before the last capture pasted. Settle it now,
-            # with the streamed text, rather than let it land in the middle of
-            # this one -- the box is about to be cleared, so waiting any
-            # longer would lose it outright.
-            self.logger.debug("New capture while a paste was pending; settling it first.")
-            self._on_final_pass_timeout()
         if not self.is_capturing:
             self.is_capturing = True
             self._capture_waiting_for_connection = False
@@ -1111,7 +1073,6 @@ class WhisperTypeApp:
         self._transcript.reset()
         self._banked_text = ""
         self._capture_interrupted = False
-        self._capture_audio.clear()
         payload_log.log_event("streaming_start")
         self.websocket_client.reset_eos()
         self.audio_capture.start_streaming()
@@ -1172,24 +1133,14 @@ class WhisperTypeApp:
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
         payload_log.log_event("capture_confirmed")
-        # The box stays up with Confirm spinning until the paste is actually
-        # on its way, which is not the same moment the button was clicked:
-        # re-transcribing the capture takes up to a second or so, and with the
-        # box already gone that is a second of nothing happening after a
-        # click -- which reads as a hang rather than as work. Set before the
-        # work below rather than after, so a slow shutdown of the audio thread
-        # is inside the spinner too; nothing is repainted in between, so on
-        # the quick path it costs a flag and no frame.
+        # Marks the box settled before the work below, so nothing it does in
+        # the meantime can treat this capture as still open.
         self.capture_box.set_busy(True)
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
         self._schedule_on_demand_disconnect()
         self._sync_icon_state()
         self.logger.debug("Capture confirmed.")
-        if self._start_final_pass():
-            # _dismiss_capture_box() takes the box down when the pass reports
-            # back, or when the watchdog gives up on it.
-            return
         self._dismiss_capture_box()
         QTimer.singleShot(PASTE_START_DELAY_MS, self._do_paste)
 
@@ -1200,97 +1151,13 @@ class WhisperTypeApp:
         so the OS can start handing the foreground back to the app being
         dictated into while the paste is still being set up.
 
-        The marker goes with it. It is deliberately kept up for the whole of
-        the final pass -- the box spinning is exactly when someone wonders
-        where the text is about to go -- and taken down here, one moment
-        before it actually goes there.
+        The marker goes with it, one moment before the text actually goes
+        where it pointed.
         """
         self._hide_target_marker()
         self.capture_box.set_busy(False)
         self.capture_box.hide()
         QApplication.processEvents()
-
-    def _buffer_capture_audio(self, chunk: bytes):
-        """Keep the capture's audio for the final pass."""
-        if not self.is_capturing:
-            return
-        if len(self._capture_audio) >= MAX_CAPTURE_AUDIO_BYTES:
-            return
-        self._capture_audio.extend(chunk)
-
-    def _start_final_pass(self) -> bool:
-        """Re-transcribe the capture in one piece. True if the paste now waits.
-
-        False means paste the streamed text as before -- the setting is off,
-        there is no server to ask, or the clip is too short or too long to
-        replay (final_pass.py explains both bounds). None of those are errors;
-        the streamed text is what would have been pasted anyway.
-        """
-        if not self.settings.get("final_pass", True):
-            return False
-        if self.connection_status != "Ready":
-            self.logger.debug("No final pass: connection is %s.", self.connection_status)
-            return False
-        if (self.server_manager.manages_server()
-                and not self.settings.get("share_one_model", True)):
-            # Without a shared model the server loads a fresh copy of it for
-            # every connection, so the replay would spend the whole budget
-            # waiting for a load and cost the VRAM of a second copy to do it.
-            # Only checked for a server we start ourselves -- it is the only
-            # one this setting actually describes.
-            self.logger.debug("No final pass: the server loads a model per connection.")
-            return False
-        audio = bytes(self._capture_audio)
-        if not FinalPass.is_replayable(audio):
-            self.logger.debug("No final pass: %.1fs of audio is outside the replayable range.",
-                              len(audio) / BYTES_PER_SECOND)
-            return False
-
-        if self._final_pass is None:
-            self._final_pass = FinalPass(
-                self.settings["server_address"], self.settings["model"], VAD_PARAMETERS)
-            self._final_pass.finished.connect(self._on_final_pass_finished)
-        else:
-            # Server address and model can have changed in Settings since the
-            # last capture. (A pass still in flight from that capture is
-            # disowned by run() below, so it cannot come back and overwrite
-            # this one.)
-            self._final_pass.server_address = self.settings["server_address"]
-            self._final_pass.model = self.settings["model"]
-
-        self._paste_pending = True
-        self._paste_token += 1
-        token = self._paste_token
-        self._final_pass.run(audio)
-        QTimer.singleShot(FINAL_PASS_WATCHDOG_MS,
-                          lambda: self._on_final_pass_timeout(token))
-        self.logger.debug("Final pass started over %.1fs of audio.",
-                          len(audio) / BYTES_PER_SECOND)
-        return True
-
-    def _on_final_pass_finished(self, text: str):
-        if not self._paste_pending:
-            return
-        self._paste_pending = False
-        # Read before the box goes: without a re-transcription the streamed
-        # text in the box is what gets pasted, and hiding it first would mean
-        # reading it back out of a window that is on its way out.
-        text = text or self._capture_text()
-        self._dismiss_capture_box()
-        QTimer.singleShot(PASTE_START_DELAY_MS, lambda: self._do_paste(text))
-
-    def _on_final_pass_timeout(self, token=None):
-        if not self._paste_pending:
-            return
-        if token is not None and token != self._paste_token:
-            return
-        self._paste_pending = False
-        self.logger.warning("Final pass did not report back; pasting the streamed text.")
-        if self._final_pass:
-            self._final_pass.abandon()
-        text = self._capture_text()
-        self._dismiss_capture_box()
-        QTimer.singleShot(PASTE_START_DELAY_MS, lambda: self._do_paste(text))
 
     def on_capture_cancelled(self):
         if not self.is_capturing:
@@ -1306,9 +1173,6 @@ class WhisperTypeApp:
         # preview back possible at all.
         self._undo_live_typing()
         self._hide_target_marker()
-        self._paste_pending = False
-        if self._final_pass:
-            self._final_pass.abandon()
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
         self._schedule_on_demand_disconnect()
@@ -1459,23 +1323,17 @@ class WhisperTypeApp:
             self.settings.get("capture_frost_levelling",
                               DEFAULT_SETTINGS["capture_frost_levelling"]))
 
-    def _do_paste(self, text=None):
+    def _do_paste(self):
         """Put the transcript on the clipboard and paste it into the target.
 
         Split across timer hops rather than run straight through: each stage
         gives Windows and the target application a chance to process the one
         before it, and returning to the event loop in between keeps the app
         responsive while the foreground changes hands.
-
-        `text` is the final pass's re-transcription when there is one. Without
-        it the streamed text in the box is used, which is the same text a
-        moment less polished -- see final_pass.py for what the difference is.
         """
         # Read the final transcription now -- the box may have updated between
         # confirm and here -- and log it before anything else can fail.
-        if text is None:
-            text = self._capture_text()
-        text = text.strip()
+        text = self._capture_text().strip()
         self.write_to_history(text, status="CONFIRMED")
         if not text:
             self.logger.debug("Nothing transcribed; skipping paste.")
@@ -1534,9 +1392,9 @@ class WhisperTypeApp:
             return
 
         # Focus is confirmed on the target, so the live-typed preview can be
-        # taken back. It goes out before the finished text goes in: the final
-        # pass re-reads the whole clip and usually punctuates it differently
-        # from the running preview, so the two must not be concatenated.
+        # taken back. It goes out before the finished text goes in: the last
+        # segments can still firm up after the preview typed them, so the two
+        # must not be concatenated.
         self._undo_live_typing()
 
         # Clear anything the user is still holding. Confirming with the hotkey
@@ -1605,13 +1463,10 @@ class WhisperTypeApp:
         # A capture still open at quit must not read the disconnect below as
         # a dropped connection and dial a new one.
         self.is_capturing = False
-        self._paste_pending = False
         self._foreground_timer.stop()
         self._claim_capture_keys(False)
         self._hide_target_marker()
         caret_target.shutdown()
-        if getattr(self, "_final_pass", None):
-            self._final_pass.abandon()
         self.audio_capture.shutdown()
         if getattr(self, "websocket_client", None):
             self.websocket_client.disconnect()

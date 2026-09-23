@@ -177,8 +177,8 @@ Other good options:
     transcript is just what is already on screen plus the trailing space, the
     typed words stay exactly where they are and only the tail is added —
     nothing is deleted, and the text never passes through the clipboard. When
-    the final pass has actually re-punctuated the capture, the preview comes
-    out and the finished transcript is pasted in its place, as before.
+    the server has revised the last words since they were typed, the preview
+    comes out and the finished transcript is pasted in its place, as before.
 
     Two things to know. **Undo works, in one press**: `Ctrl+Z` after a
     dictation puts the document back exactly as it was. Pressing it a second
@@ -212,16 +212,6 @@ Other good options:
     other window both keys are left alone.
     `Enter` pressed while the box is still reporting on the connection cancels
     rather than confirms, since there is no transcript in it yet.
-
-    The text in the box is a live preview. On confirm, WhisperType sends the
-    whole capture again in one piece and pastes that instead — which is why the
-    pasted text is sometimes punctuated a little differently from what you
-    watched appear. Live transcription reads a rolling buffer and discards
-    audio as it goes, so a pause mid-sentence can come out as two sentences;
-    reading the capture whole does not have that problem. It costs up to a
-    second before the paste lands. Turn it off with **Settings → Connection
-    Mode → Re-transcribe the whole capture before pasting** if you would rather
-    have the text immediately.
 
 ## Building the Executable (Optional)
 
