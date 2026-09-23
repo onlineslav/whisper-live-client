@@ -59,6 +59,43 @@ class AbandonedPendingSegment(unittest.TestCase):
         self.assertLess(text.index("longer piece of text"),
                         text.index("nothing is committed"))
 
+    def test_clip_that_commits_past_the_gap(self):
+        """Capture of 2026-09-23 ~09:20: the clip landed in the same message
+        as a completed segment from beyond it. Measured against a frontier
+        that segment had already moved, the abandoned passage read as
+        covered and 270 characters vanished from mid-paragraph."""
+        before = (31.66, 44.27, " uh swiped the app away and well okay i "
+                                "would say like the the the first problem is "
+                                "that um", True)
+        lost = (44.27, 68.7, " I think it's probably a problem with, like, "
+                             "bedtime mode, because I have, on my, like, lock "
+                             "screen, uh, I could see a bunch of "
+                             "notifications, it's set on a schedule, but I "
+                             "don't want it to be. I want it to be like, when "
+                             "I,", False)
+        committed = (64.312, 66.312, " It's set on a schedule, but I don't "
+                                     "want it to be.", True)
+        after = (66.392, 69.272, " I want it to be like when I want to "
+                                 "initiate.", False)
+        text = fold(message(before, lost),
+                    message(before, committed, after))
+        self.assertIn("bedtime mode", text)
+        self.assertLess(text.index("first problem"), text.index("bedtime mode"))
+        self.assertLess(text.index("bedtime mode"),
+                        text.index("It's set on a schedule, but I don't want"))
+
+    def test_second_clip_in_one_capture(self):
+        """The segment after a rescue starts inside the rescued span. That
+        overlap must not count as committed, or the next clip loses it."""
+        first_after = (28.242, 50.0, " and then a second long passage that "
+                                     "also gets clipped", False)
+        second_after = (46.0, 48.0, " tail.", False)
+        text = fold(message(self.OPENING, self.LOST),
+                    message(self.OPENING, first_after),
+                    message(self.OPENING, second_after))
+        self.assertIn("nothing is committed", text)
+        self.assertIn("second long passage", text)
+
     def test_nothing_is_rescued_before_the_clip(self):
         """While the segment is merely growing it stays out of the transcript,
         so the box does not show the same words twice as they are revised."""
@@ -137,6 +174,7 @@ class RecordedSessions(unittest.TestCase):
         ("depends on how it feels with long pauses", "10 items long"),
         ("verified frost lightness", "It got cut off randomly"),
         ("just going to keep talking", "It cut off some text"),
+        ("problem with, like, bedtime mode", "swiped the app away"),
     ]
 
     def captures(self):

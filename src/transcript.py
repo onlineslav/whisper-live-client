@@ -111,6 +111,9 @@ class Transcript:
     def _merge(self, segments):
         pending = ""
         pending_span = None
+        # Completed segments this message is the first to carry, in order.
+        # Held back until the rescue below has run -- see there.
+        fresh: list[tuple[tuple[float, float], str]] = []
         for seg in segments:
             if not isinstance(seg, dict):
                 continue
@@ -128,19 +131,31 @@ class Transcript:
                 continue
             index = self._placed.get(span)
             if index is None:
-                self._placed[span] = len(self._done)
-                self._done.append(text)
+                fresh.append((span, text))
             else:
                 self._done[index] = text
+        # Before the new segments go in, for two reasons. The frontier has to
+        # be the one the outgoing pending segment was measured against: when
+        # `clip_audio` skips ahead, the server can commit a segment from the
+        # far side of the gap in the same message, and a frontier already
+        # moved past it reads the abandoned passage as covered. And anything
+        # rescued came before those segments, so it is appended ahead of them.
+        starts = [span[0] for span, _ in fresh]
+        if pending_span is not None:
+            starts.append(pending_span[0])
+        self._rescue_abandoned(min(starts, default=None))
+        for span, text in fresh:
+            self._placed[span] = len(self._done)
+            self._done.append(text)
             self._frontier = max(self._frontier, span[1])
-        # After the completed segments, so the frontier is up to date: whether
-        # the outgoing pending segment was committed is most of the question.
-        self._rescue_abandoned(pending_span)
         self._pending = pending
         self._pending_span = pending_span
 
-    def _rescue_abandoned(self, new_span):
+    def _rescue_abandoned(self, next_start):
         """Keep the outgoing pending text if the server dropped its audio.
+
+        `next_start` is where the earliest new text in this message begins,
+        committed or not -- whatever the server moved on to.
 
         Everything here is a reason not to: the words are already committed,
         the segment is merely still growing, or the span is about to be
@@ -153,19 +168,21 @@ class Transcript:
         cannot be typed back from memory.
         """
         old_span = self._pending_span
-        if old_span is None or new_span is None or not self._pending.strip():
+        if old_span is None or next_start is None or not self._pending.strip():
             # Nothing to compare against. A pending segment that vanishes
             # without a replacement was almost always committed or judged
             # silence, and rescuing on that would duplicate half the capture.
             return
         start, end = old_span
-        new_start = new_span[0]
+        new_start = next_start
         if old_span in self._placed:
             return  # Committed under its own span: already accumulated.
         if start < self._frontier - COVERED_SLACK_SECONDS:
             return  # Committed text already covers where this began.
         if new_start - start < JUMP_SECONDS:
-            return  # The same segment, still growing.
+            # The same segment, still growing -- or committed under a span
+            # that starts where it did.
+            return
         # What the server skipped, against what the new segment will cover
         # again. The audio under the overlap is still in its buffer, so those
         # words are coming back either way.
@@ -178,7 +195,12 @@ class Transcript:
         # land beside it.
         self._placed[old_span] = len(self._done)
         self._done.append(self._pending)
-        self._frontier = max(self._frontier, end)
+        # Only as far as the new text begins, not to the rescued segment's
+        # end. The overlap is exactly what the next segment covers again, and
+        # counting it as committed would make that segment look covered when
+        # a later clip abandons it in turn -- losing the next passage the way
+        # this one nearly was.
+        self._frontier = max(self._frontier, min(end, new_start))
 
     @staticmethod
     def _span(seg):
