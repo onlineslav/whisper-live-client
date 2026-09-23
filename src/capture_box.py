@@ -432,13 +432,13 @@ class CaptureBox(QWidget):
 
     confirmed = Signal(str)
     cancelled = Signal()
-    # Emitted when the user clicks the meter to try a different style, so the
-    # choice can be written back to the config file.
-    meter_style_changed = Signal(str)
 
     def __init__(self):
         super().__init__()
         self._closing = False
+        # Where in the box a drag was picked up, relative to its top-left
+        # corner; None while nothing is being dragged. See mousePressEvent.
+        self._drag_offset = None
         self._fade_duration_ms = 140
         # True while the user is in a window other than the box and the
         # target -- see set_away. The capture is still running.
@@ -592,7 +592,6 @@ class CaptureBox(QWidget):
         # buttons: it is in view while the user is speaking and reading the
         # transcript, without taking any room from either.
         self.meter = SignalMeter(self)
-        self.meter.style_changed.connect(self.meter_style_changed)
         # Both buttons and the meter at once -- it is one colour, and the
         # only reason it is applied here rather than beside the buttons is
         # that the meter has to exist first.
@@ -609,9 +608,6 @@ class CaptureBox(QWidget):
         button_row.addWidget(self.cancel_button)
         layout.addLayout(button_row)
         self._button_row = button_row
-        # Cycling by clicking the meter bypasses set_meter_style, so it needs
-        # its own hook to keep the alignment in step with what is now showing.
-        self.meter.style_changed.connect(self._sync_meter_alignment)
         self._sync_meter_alignment(self.meter.style_name())
 
         self.setMinimumWidth(self._full_min_width)
@@ -1513,10 +1509,50 @@ class CaptureBox(QWidget):
         else:
             super().keyPressEvent(event)
 
+    # Dragging. The box is frameless, so it has no title bar to be moved by;
+    # instead, anywhere that is not a control moves it -- the margins, the gaps
+    # between the buttons, the meter, the "Still listening" line. The buttons
+    # and the transcript take their own presses, so a press only arrives here
+    # when it landed on nothing that wanted it.
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = (event.globalPosition().toPoint()
+                                 - self.frameGeometry().topLeft())
+            self.setCursor(Qt.SizeAllCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_offset is not None and event.button() == Qt.LeftButton:
+            self._drag_offset = None
+            self.unsetCursor()
+            event.accept()
+            # The frost is a photograph of where the box used to be, and the
+            # room it may grow into was measured from there too.
+            if self.wants_frost():
+                self.refresh_backdrop()
+            else:
+                self._reserve_grow_room()
+            return
+        super().mouseReleaseEvent(event)
+
     def hideEvent(self, event):
         # Any hide ends this capture — including one driven from main.py (the
         # hotkey-to-confirm path).
         self._closing = True
+        if self._drag_offset is not None:
+            # Hidden mid-drag (Esc, or the hotkey): the release goes nowhere.
+            self._drag_offset = None
+            self.unsetCursor()
         self.set_busy(False)
         self._frost_timer.stop()
         self.meter.reset()

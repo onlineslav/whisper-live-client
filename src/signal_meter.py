@@ -22,7 +22,7 @@ import time
 from collections import deque
 
 from PySide6.QtWidgets import QWidget, QSizePolicy
-from PySide6.QtCore import Qt, QTimer, Signal, QRectF, QPointF
+from PySide6.QtCore import Qt, QTimer, QRectF, QPointF
 from PySide6.QtGui import (
     QPainter,
     QColor,
@@ -33,8 +33,8 @@ from PySide6.QtGui import (
     QLinearGradient,
 )
 
-# Style names in cycle order -- clicking the meter steps through this list.
-# The first is the default.
+# Style names, in the order the Settings dropdown lists them. The first is the
+# default.
 STYLES = ("waveform", "mirror", "bars", "mirror_bars", "arc", "circle")
 
 # What each style is called in the Settings dropdown. The internal name is a
@@ -256,9 +256,12 @@ HEADROOM = 0.86
 
 
 class SignalMeter(QWidget):
-    """A live input-level indicator, drawn in one of several styles."""
+    """A live input-level indicator, drawn in one of several styles.
 
-    style_changed = Signal(str)
+    Not clickable: a press on it falls through to the window it sits in, which
+    for the Capture Box is how the box is dragged. The style is chosen in
+    Settings.
+    """
 
     def __init__(self, parent=None, style: str = STYLES[0]):
         super().__init__(parent)
@@ -274,8 +277,6 @@ class SignalMeter(QWidget):
         # corners) that every child inherits. This widget paints itself
         # entirely, so it opts out rather than drawing on top of a stray box.
         self.setStyleSheet("background: transparent; border: none;")
-        self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("Input level. Click to change the meter style.")
         self._accent = QColor(ACCENT)
 
         self._timer = QTimer(self)
@@ -332,17 +333,6 @@ class SignalMeter(QWidget):
         self._apply_style_size()
         self.update()
 
-    def cycle_style(self) -> str:
-        """Step to the next style. Clicking the meter is the fastest way to
-        compare them against a live signal, which is the only way to judge one."""
-        nxt = STYLES[(STYLES.index(self._style) + 1) % len(STYLES)]
-        if nxt != self._style:
-            self._style = nxt
-            self._apply_style_size()
-            self.update()
-            self.style_changed.emit(nxt)
-        return self._style
-
     def _apply_style_size(self):
         self.setFixedSize(*STYLE_SIZES[self._style])
 
@@ -368,13 +358,6 @@ class SignalMeter(QWidget):
         self.update()
 
     # -- events -----------------------------------------------------------
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            event.accept()
-            self.cycle_style()
-            return
-        super().mousePressEvent(event)
 
     def hideEvent(self, event):
         self._timer.stop()

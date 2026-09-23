@@ -226,7 +226,6 @@ class WhisperTypeApp:
         # Connect signals
         self.capture_box.confirmed.connect(self.on_capture_confirmed)
         self.capture_box.cancelled.connect(self.on_capture_cancelled)
-        self.capture_box.meter_style_changed.connect(self.on_meter_style_changed)
         # Which window is in front, for as long as a capture is up. Decides
         # whether the box is faded (the user is elsewhere) and whether Enter
         # and Escape belong to the capture -- see _check_capture_foreground.
@@ -1457,21 +1456,6 @@ class WhisperTypeApp:
                               DEFAULT_SETTINGS["capture_frost_brightness"]),
             self.settings.get("capture_frost_levelling",
                               DEFAULT_SETTINGS["capture_frost_levelling"]))
-
-    def on_meter_style_changed(self, style: str):
-        """Persist a style picked by clicking the meter itself.
-
-        Written straight to the config file rather than through the Settings
-        window: the window is usually closed while a capture is running, and a
-        style tried out mid-capture is worth nothing if it is forgotten by the
-        next one.
-        """
-        self.settings["capture_meter_style"] = style
-        try:
-            with open(CONFIG_FILE, "w") as f:
-                json.dump(self.settings, f, indent=4)
-        except Exception:
-            self.logger.exception("Failed to save meter style.")
 
     def _do_paste(self, text=None):
         """Put the transcript on the clipboard and paste it into the target.

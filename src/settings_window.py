@@ -626,9 +626,6 @@ class SettingsWindow(QWidget):
         # Connections
         self.capture_meter_style_combo.currentIndexChanged.connect(
             lambda _: self.meter_preview.set_style(self.capture_meter_style_combo.currentData()))
-        # The preview is clickable like the real one; keep the dropdown in step
-        # so the two never disagree about what is selected.
-        self.meter_preview.style_changed.connect(self._select_meter_style)
         self.meter_test_button.toggled.connect(self._on_preview_toggled)
         self.auto_start_server_checkbox.toggled.connect(self._sync_server_startup_enabled)
         self.profile_combo.activated.connect(self._on_profile_chosen)
