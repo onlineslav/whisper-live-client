@@ -51,6 +51,13 @@ FOREGROUND_POLL_MS = 150
 # instant as its own activation is dropped by some apps (Chromium especially).
 PASTE_KEY_DELAY_MS = 40
 
+# Milliseconds after Ctrl+V before the user's own clipboard is put back. The
+# target reads the clipboard whenever it gets round to handling the keystroke,
+# not when it is sent, so restoring too early pastes the old contents instead
+# of the transcript. Generous on purpose: nobody copies and pastes again
+# within a second of dictating.
+CLIPBOARD_RESTORE_DELAY_MS = 1000
+
 # One colour per thing the user can actually do something about. "starting"
 # is distinct from "connecting" because they fail differently: an amber icon
 # means WhisperType is bringing the server up and the wait is expected, while
@@ -205,6 +212,15 @@ class WhisperTypeApp:
         self._foreground_timer = QTimer()
         self._foreground_timer.setInterval(FOREGROUND_POLL_MS)
         self._foreground_timer.timeout.connect(self._check_capture_foreground)
+        # The paste borrows the clipboard: what the user had copied is saved
+        # here and put back once the target has read the transcript. The
+        # sequence number is the clipboard as we left it, so a copy the user
+        # makes in the meantime is never overwritten -- see _restore_clipboard.
+        self._saved_clipboard = None
+        self._clipboard_seq = None
+        self._clipboard_restore_timer = QTimer()
+        self._clipboard_restore_timer.setSingleShot(True)
+        self._clipboard_restore_timer.timeout.connect(self._restore_clipboard)
         # Straight from the audio thread, so the meter moves even while the
         # speech gate is holding chunks back from the server.
         self.audio_capture.level_changed.connect(self.capture_box.set_level_db)
@@ -1363,13 +1379,18 @@ class WhisperTypeApp:
                 "place rather than pasting over it.")
             return
 
-        # The clipboard is written first and left alone from here on. Whatever
-        # happens to the keystroke afterwards, the transcript is recoverable
-        # with a manual Ctrl+V.
+        # The clipboard is written first and left alone until the paste has
+        # landed. Whatever happens to the keystroke afterwards, the transcript
+        # is recoverable with a manual Ctrl+V.
+        self._save_user_clipboard()
         if not win_input.set_clipboard_text(text):
             self.logger.warning("Clipboard write failed; falling back to typing.")
+            # The write may have got as far as emptying it.
+            self._clipboard_seq = win_input.clipboard_sequence()
+            self._restore_clipboard()
             self._paste_by_typing(text)
             return
+        self._clipboard_seq = win_input.clipboard_sequence()
 
         QTimer.singleShot(PASTE_FOCUS_DELAY_MS, lambda: self._restore_focus_and_paste(text))
 
@@ -1427,6 +1448,33 @@ class WhisperTypeApp:
 
         self.logger.info("Pasted %d chars into 0x%X '%s'.",
                          len(text), hwnd, get_window_title(hwnd))
+        self._clipboard_restore_timer.start(CLIPBOARD_RESTORE_DELAY_MS)
+
+    def _save_user_clipboard(self):
+        """Snapshot what the user has copied, before the transcript replaces it.
+
+        A restore still pending from the previous dictation means the
+        clipboard currently holds that transcript, not anything of the user's,
+        so the older snapshot is kept -- unless the user has copied something
+        since, in which case that is theirs and is what gets saved.
+        """
+        self._clipboard_restore_timer.stop()
+        if (self._saved_clipboard is not None
+                and win_input.clipboard_sequence() == self._clipboard_seq):
+            return
+        self._saved_clipboard = win_input.save_clipboard()
+
+    def _restore_clipboard(self):
+        """Put the user's clipboard back, if nobody has touched it since."""
+        self._clipboard_restore_timer.stop()
+        saved, self._saved_clipboard = self._saved_clipboard, None
+        if saved is None:
+            return
+        if win_input.clipboard_sequence() != self._clipboard_seq:
+            self.logger.debug("Clipboard changed after the paste; not restoring.")
+            return
+        if win_input.restore_clipboard(saved):
+            self.logger.debug("Restored the clipboard (%d formats).", len(saved))
 
     def _paste_by_typing(self, text):
         """Last resort when the clipboard is unusable: type the text out."""
@@ -1449,6 +1497,9 @@ class WhisperTypeApp:
         is what made the previous silent failures so confusing.
         """
         self.logger.warning("Paste not delivered: %s.", reason)
+        # The transcript stays on the clipboard for that manual Ctrl+V; the
+        # user's earlier copy is given up rather than yanked back from under it.
+        self._saved_clipboard = None
         preview = text if len(text) <= 60 else text[:57] + "..."
         self._notify("Transcript copied to clipboard",
                      f"Press Ctrl+V to paste it — {reason}.\n{preview}")
@@ -1466,6 +1517,8 @@ class WhisperTypeApp:
         self._foreground_timer.stop()
         self._claim_capture_keys(False)
         self._hide_target_marker()
+        if self._clipboard_restore_timer.isActive():
+            self._restore_clipboard()
         caret_target.shutdown()
         self.audio_capture.shutdown()
         if getattr(self, "websocket_client", None):

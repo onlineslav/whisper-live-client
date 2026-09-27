@@ -37,6 +37,11 @@ logger = logging.getLogger("whispertype.input")
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
+# CF_BITMAP, CF_METAFILEPICT, CF_PALETTE, CF_ENHMETAFILE: handles, not memory.
+_GDI_FORMATS = {2, 3, 9, 14}
+# Past this the user's clipboard is left to be overwritten rather than copied
+# into our process on every paste -- a huge Excel range or a raw screenshot.
+CLIPBOARD_SAVE_LIMIT = 64 * 1024 * 1024
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_EXTENDEDKEY = 0x0001
@@ -116,6 +121,12 @@ try:
     _user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
     _user32.GetClipboardData.restype = wintypes.HANDLE
     _user32.GetClipboardData.argtypes = [wintypes.UINT]
+    _user32.EnumClipboardFormats.restype = wintypes.UINT
+    _user32.EnumClipboardFormats.argtypes = [wintypes.UINT]
+    _user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+    _user32.GetClipboardSequenceNumber.argtypes = []
+    _user32.RegisterClipboardFormatW.restype = wintypes.UINT
+    _user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
 
     _kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
     _kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
@@ -125,6 +136,8 @@ try:
     _kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
     _kernel32.GlobalUnlock.restype = wintypes.BOOL
     _kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    _kernel32.GlobalSize.restype = ctypes.c_size_t
+    _kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
 
     _user32.SendInput.restype = wintypes.UINT
     _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
@@ -208,6 +221,101 @@ def get_clipboard_text():
             return ctypes.c_wchar_p(pointer).value
         finally:
             _kernel32.GlobalUnlock(handle)
+    finally:
+        _user32.CloseClipboard()
+
+
+def clipboard_sequence() -> int:
+    """Windows' counter of clipboard changes; any write by anyone bumps it."""
+    if not _AVAILABLE:
+        return 0
+    return _user32.GetClipboardSequenceNumber()
+
+
+def _is_memory_format(fmt: int) -> bool:
+    """True for formats whose handle is an HGLOBAL that can be copied as bytes.
+
+    The rest hold GDI handles (bitmaps, palettes, metafiles) or are private to
+    the owning process. Skipping them loses nothing in practice: an image is
+    also offered as CF_DIB/CF_DIBV5, and Windows re-synthesises the bitmap
+    and metafile forms from those on demand.
+    """
+    return not (fmt in _GDI_FORMATS or 0x80 <= fmt <= 0x8F
+                or 0x200 <= fmt <= 0x3FF)
+
+
+def save_clipboard():
+    """Copy every format currently on the clipboard, for restore_clipboard().
+
+    Returns a list of (format, bytes) -- empty when the clipboard is empty --
+    or None when it could not be read or is too big to be worth holding. A
+    None means "nothing to put back", so the paste carries on and simply
+    leaves the transcript on the clipboard, as it always used to.
+    """
+    if not _AVAILABLE or not _open_clipboard():
+        return None
+    saved = []
+    total = 0
+    try:
+        fmt = _user32.EnumClipboardFormats(0)
+        while fmt:
+            if _is_memory_format(fmt):
+                # Delayed-rendered formats are produced by their owner right
+                # here; one that fails to render is skipped, not fatal.
+                handle = _user32.GetClipboardData(fmt)
+                size = _kernel32.GlobalSize(handle) if handle else 0
+                if size:
+                    total += size
+                    if total > CLIPBOARD_SAVE_LIMIT:
+                        logger.info("Clipboard holds over %d MB; not saving it.",
+                                    CLIPBOARD_SAVE_LIMIT // (1024 * 1024))
+                        return None
+                    pointer = _kernel32.GlobalLock(handle)
+                    if pointer:
+                        try:
+                            saved.append((fmt, ctypes.string_at(pointer, size)))
+                        finally:
+                            _kernel32.GlobalUnlock(handle)
+            fmt = _user32.EnumClipboardFormats(fmt)
+        return saved
+    finally:
+        _user32.CloseClipboard()
+
+
+def restore_clipboard(saved) -> bool:
+    """Put back what save_clipboard() captured, replacing whatever is there.
+
+    The restore is marked as not for clipboard history or cloud sync: the
+    same content already went into Win+V history when the user copied it,
+    and a second entry per dictation would bury everything else.
+    """
+    if not _AVAILABLE or saved is None:
+        return False
+    if not _open_clipboard():
+        logger.warning("Could not open the clipboard to restore it.")
+        return False
+    try:
+        _user32.EmptyClipboard()
+        entries = list(saved)
+        for name in ("CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"):
+            fmt = _user32.RegisterClipboardFormatW(name)
+            if fmt:
+                entries.append((fmt, bytes(4)))  # DWORD 0: "no"
+        for fmt, data in entries:
+            handle = _kernel32.GlobalAlloc(GMEM_MOVEABLE, max(len(data), 1))
+            if not handle:
+                continue
+            target = _kernel32.GlobalLock(handle)
+            if not target:
+                _kernel32.GlobalFree(handle)
+                continue
+            try:
+                ctypes.memmove(target, data, len(data))
+            finally:
+                _kernel32.GlobalUnlock(handle)
+            if not _user32.SetClipboardData(fmt, handle):
+                _kernel32.GlobalFree(handle)
+        return True
     finally:
         _user32.CloseClipboard()
 
