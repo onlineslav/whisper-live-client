@@ -149,6 +149,9 @@ class WhisperTypeApp:
         # may fire, or one left over from the previous capture hangs up on the
         # server while it is still sending this one's last words.
         self._disconnect_token = 0
+        # True while an on-demand session is open only to make the server load
+        # its model, and is to be hung up once it has. See _maybe_autoconnect.
+        self._warming_model = False
         self.connection_status = "Disconnected"
         self.connection_detail = ""
         # What the tray is currently saying, and since when -- the elapsed
@@ -502,10 +505,22 @@ class WhisperTypeApp:
         self._sync_icon_state()
 
     def _maybe_autoconnect(self):
-        """Open the socket, unless the user asked us to wait for a capture."""
-        if self.settings.get("connect_on_demand", False):
+        """Open the socket, or in on-demand mode get the model loaded.
+
+        On-demand still dials once when the server comes up. WhisperLive loads
+        its model on the first connection, not when the container starts, so
+        without this the first hotkey after every login paid for the load.
+        With one shared model the server keeps it after we hang up, and later
+        on-demand connects find it warm. Without sharing the model dies with
+        the connection, so dialling would buy nothing.
+        """
+        if not self.settings.get("connect_on_demand", False):
+            self.websocket_client.connect()
             return
-        self.websocket_client.connect()
+        if self.settings.get("share_one_model", True) and not self.is_capturing:
+            self.logger.info("Connecting once so the server loads its model.")
+            self._warming_model = True
+            self.websocket_client.connect()
 
     def on_tray_activated(self, reason):
         # Left or double click: report status where it cannot be missed. The
@@ -598,13 +613,13 @@ class WhisperTypeApp:
         self.audio_capture.audio_chunk_ready.connect(self.websocket_client.send_audio)
         self.connection_status = "Disconnected"
         self.connection_detail = ""
-        if not self.settings.get("connect_on_demand", False):
-            # Only worth dialling if there is something to dial. When we are
-            # starting the server ourselves, the connect happens on the
-            # manager's "running" state instead of against a closed port.
-            if (not self.server_manager.manages_server()
-                    or self.server_manager.state == server_manager.STATE_RUNNING):
-                self.websocket_client.connect()
+        self._warming_model = False
+        # Only worth dialling if there is something to dial. When we are
+        # starting the server ourselves, the connect happens on the manager's
+        # "running" state instead of against a closed port.
+        if (not self.server_manager.manages_server()
+                or self.server_manager.state == server_manager.STATE_RUNNING):
+            self._maybe_autoconnect()
 
     def load_settings(self):
         try:
@@ -703,6 +718,17 @@ class WhisperTypeApp:
     def on_connection_status_changed(self, status, detail=""):
         self.connection_status = status
         self.connection_detail = detail
+
+        # Only "Ready" ends a warm-up: after an error the client redials on
+        # its own, and that session's "Ready" is the one to hang up.
+        if self._warming_model and status == "Ready":
+            self._warming_model = False
+            # A capture that started mid-warm-up is waiting on this very
+            # session, so it stays open; that capture hangs up when it ends.
+            if status == "Ready" and not self.is_capturing:
+                self.logger.info("Model loaded; closing the warm-up connection.")
+                self.websocket_client.disconnect()
+                return
 
         # "Ready", not "Loading": the socket being open only means the server
         # accepted us, and audio streamed before SERVER_READY is audio spoken
