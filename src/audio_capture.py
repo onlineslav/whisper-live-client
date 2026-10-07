@@ -95,6 +95,12 @@ class AudioCapture(QObject):
         preroll = collections.deque(maxlen=self._preroll_chunks)
         speaking = False
         silent_run = 0
+        # For the summary logged when the capture ends. A box stuck on
+        # "Listening..." over a moving meter is either a server that has
+        # stopped transcribing or a mic too quiet to open the gate, and only
+        # these numbers tell the two apart.
+        levels = []
+        sent = 0
         try:
             self._stream = self._p.open(format=self.format,
                                         channels=self.channels,
@@ -113,6 +119,7 @@ class AudioCapture(QObject):
                 self.level_changed.emit(dbfs_from_rms(rms))
                 if self._meter_only:
                     continue
+                levels.append(rms)
                 is_speech = rms >= self._silence_threshold
                 if is_speech:
                     silent_run = 0
@@ -121,15 +128,18 @@ class AudioCapture(QObject):
                         # syllable is not clipped, then mark as speaking.
                         for buffered in preroll:
                             self.audio_chunk_ready.emit(buffered)
+                            sent += 1
                         preroll.clear()
                         speaking = True
                     self.audio_chunk_ready.emit(data)
+                    sent += 1
                 elif speaking:
                     # Silence after speech: keep streaming through the hangover
                     # window (covers word tails and brief pauses), then stop.
                     silent_run += 1
                     if silent_run <= self._hangover_chunks:
                         self.audio_chunk_ready.emit(data)
+                        sent += 1
                     else:
                         speaking = False
                         preroll.append(data)
@@ -140,6 +150,17 @@ class AudioCapture(QObject):
         except Exception:
             self.logger.exception("Audio capture failed to open stream.")
         finally:
+            if levels:
+                levels.sort()
+                seconds = self.chunk_size / self.rate
+                self.logger.info(
+                    "Capture audio: %.1fs recorded, %.1fs sent past the speech gate. "
+                    "Level: quietest-tenth %.0f dBFS, median %.0f, loudest %.0f; gate %.0f.",
+                    len(levels) * seconds, sent * seconds,
+                    dbfs_from_rms(levels[len(levels) // 10]),
+                    dbfs_from_rms(levels[len(levels) // 2]),
+                    dbfs_from_rms(levels[-1]),
+                    dbfs_from_rms(self._silence_threshold))
             # Park the meter at silence: the last chunk read is usually
             # mid-speech, and without this the meter would stay pinned there
             # until the next capture starts.
