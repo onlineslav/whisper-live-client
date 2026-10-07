@@ -3,6 +3,7 @@ import collections
 import json
 import logging
 import threading
+import time
 import websockets
 
 import payload_log
@@ -18,6 +19,19 @@ from PySide6.QtCore import QObject, Signal
 # this allows 60s at 16 kHz float32 mono (under 4 MB) -- generous enough to
 # cover a cold load, bounded so a wedged server cannot grow it forever.
 MAX_PENDING_AUDIO_BYTES = 16000 * 4 * 60
+
+# float32 mono at 16 kHz.
+BYTES_PER_SECOND = 16000 * 4
+
+# When a session looks stalled: this much audio sent, and this long since the
+# first of it went, with not one reply. Only speech reaches the socket at all
+# (AudioCapture gates silence out), and a working server answers speech in
+# about a second -- so three seconds of it met by eight of silence is not a
+# server thinking. It is only a suspicion: loud noise that the server's VAD
+# throws away looks the same from here, which is why the app confirms it with
+# a health probe before doing anything drastic (see server_health).
+STALL_AUDIO_S = 3.0
+STALL_WAIT_S = 8.0
 
 # Silence never reaches the decoder as silence: the faster-whisper VAD cuts it
 # out first. The defaults (min_silence_duration_ms 2000, speech_pad_ms 400)
@@ -81,6 +95,18 @@ class WebSocketClient(QObject):
         # queued just after the flush and sit in the buffer for good -- and a
         # chunk sent directly could overtake older ones still being flushed.
         self._audio_lock = threading.Lock()
+        # Audio sent on this session that no reply has followed yet, oldest
+        # first, and when the first of it went. If the session dies, or is
+        # dropped as stalled, this is what the server heard and never
+        # answered for -- so it is sent again to the next session rather than
+        # lost with this one. A reply is the server saying it has caught up,
+        # and clears it. Guarded by _audio_lock.
+        self._unanswered = collections.deque()
+        self._unanswered_bytes = 0
+        self._unanswered_since = None
+        # Bumped for every new connection, so a caller can tell whether the
+        # session it was worried about is still the current one.
+        self.session_id = 0
 
     def connect(self):
         """Start the connection thread, unless one is already dialling.
@@ -160,6 +186,7 @@ class WebSocketClient(QObject):
                     self.websocket = websocket
                     with self._audio_lock:
                         self._server_ready = False
+                    self.session_id += 1
                     self._emit_status("Loading", f"Loading the {self.model} model")
                     self.logger.info("WebSocket connected; awaiting SERVER_READY.")
                     self._eos_sent = False
@@ -215,11 +242,19 @@ class WebSocketClient(QObject):
                         payload_log.log_raw(message)
                         if self._handle_control_message(message):
                             continue
+                        self._mark_answered()
                         self.message_received.emit(message)
                         self.logger.debug("Message received (%d bytes).", len(message))
 
-            except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK, OSError) as e:
+            # InvalidHandshake too: while the container restarts, Docker
+            # Desktop's port proxy still accepts the connection and then hangs
+            # up before the server can answer. That is a server not up yet,
+            # not something unexpected, and is retried as soon as any drop.
+            except (websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK,
+                    websockets.exceptions.InvalidHandshake, OSError) as e:
                 self._server_ready = False
+                if not self._eos_sent:
+                    self._requeue_unanswered()
                 self._emit_status("Disconnected", self._closed_detail(e))
                 if self._eos_sent and not self.reconnect_after_capture:
                     # Leave the socket closed until the next capture asks for
@@ -236,6 +271,8 @@ class WebSocketClient(QObject):
                     await self._interruptible_sleep(1)
             except Exception:
                 self._server_ready = False
+                if not self._eos_sent:
+                    self._requeue_unanswered()
                 self._emit_status("Error", "Unexpected connection error — retrying")
                 self.logger.exception("Unexpected WebSocket error; will retry.")
                 await self._interruptible_sleep(5)
@@ -336,7 +373,14 @@ class WebSocketClient(QObject):
             self._dispatch_audio(audio_chunk)
 
     def _dispatch_audio(self, audio_chunk):
+        """Send one chunk. Called with _audio_lock held."""
         self.logger.debug("Sending audio chunk (%d bytes).", len(audio_chunk))
+        if self._unanswered_since is None:
+            self._unanswered_since = time.monotonic()
+        self._unanswered.append(audio_chunk)
+        self._unanswered_bytes += len(audio_chunk)
+        while self._unanswered_bytes > MAX_PENDING_AUDIO_BYTES and self._unanswered:
+            self._unanswered_bytes -= len(self._unanswered.popleft())
         fut = asyncio.run_coroutine_threadsafe(self.websocket.send(audio_chunk), self.loop)
         fut.add_done_callback(self._on_send_done)
 
@@ -345,6 +389,56 @@ class WebSocketClient(QObject):
             fut.result()
         except Exception:
             self.logger.debug("Audio chunk dropped: connection was transitioning.")
+
+    def _mark_answered(self):
+        """The server replied: everything sent so far has been heard."""
+        with self._audio_lock:
+            self._clear_unanswered()
+
+    def _clear_unanswered(self):
+        self._unanswered.clear()
+        self._unanswered_bytes = 0
+        self._unanswered_since = None
+
+    def _requeue_unanswered(self):
+        """Hold this session's unanswered audio for the next one.
+
+        It goes in front of anything already held: it was spoken first.
+        """
+        with self._audio_lock:
+            if not self._unanswered:
+                return
+            seconds = self._unanswered_bytes / BYTES_PER_SECOND
+            self._pending_audio.extendleft(reversed(self._unanswered))
+            self._pending_bytes += self._unanswered_bytes
+            self._clear_unanswered()
+            while self._pending_bytes > MAX_PENDING_AUDIO_BYTES and self._pending_audio:
+                self._pending_bytes -= len(self._pending_audio.popleft())
+        self.logger.info("Holding %.1fs of unanswered audio to send again on reconnect.", seconds)
+
+    def stall_suspected(self) -> bool:
+        """True if this session has been sent speech and has not answered it.
+
+        See STALL_AUDIO_S. A suspicion only; the app confirms it with a probe.
+        """
+        with self._audio_lock:
+            if not self._server_ready or self._unanswered_since is None:
+                return False
+            return (self._unanswered_bytes >= STALL_AUDIO_S * BYTES_PER_SECOND
+                    and time.monotonic() - self._unanswered_since >= STALL_WAIT_S)
+
+    def drop_session(self):
+        """Close the current session; the client redials on its own.
+
+        For a session the server has stopped serving. What it was sent and did
+        not answer is held and sent again to the next one, as for any other
+        drop mid-capture.
+        """
+        websocket, loop = self.websocket, self.loop
+        if not (self.is_running and websocket and loop and loop.is_running()):
+            return
+        self.logger.warning("Dropping session %d: the server stopped answering it.", self.session_id)
+        asyncio.run_coroutine_threadsafe(websocket.close(), loop)
 
     def send_eos(self):
         """Sends the End of Stream message."""
@@ -361,6 +455,7 @@ class WebSocketClient(QObject):
                 self._server_ready = False
                 self._pending_audio.clear()
                 self._pending_bytes = 0
+                self._clear_unanswered()
             # WhisperLive expects a binary sentinel
             self.logger.debug("Sending EOS marker (binary END_OF_AUDIO).")
             asyncio.run_coroutine_threadsafe(self.websocket.send(b"END_OF_AUDIO"), self.loop)
@@ -373,6 +468,7 @@ class WebSocketClient(QObject):
         with self._audio_lock:
             self._pending_audio.clear()
             self._pending_bytes = 0
+            self._clear_unanswered()
 
     @property
     def is_ready(self) -> bool:

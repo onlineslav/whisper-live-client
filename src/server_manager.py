@@ -19,6 +19,7 @@ Only local servers are managed. If `server_address` points at another machine,
 this stays out of the way entirely -- see `is_local_address`.
 """
 
+import json
 import logging
 import os
 import re
@@ -89,7 +90,15 @@ APP_POLL_S = 20.0
 
 MODEL_FETCH_CONTAINER = "whispertype-modelfetch"
 LEGACY_MODEL_FETCH_CONTAINER = "whisperboard-modelfetch"
-SERVER_BASE_COMMAND = ["python", "run_server.py"]
+# The server runs behind server_patch.py, passed in as `python -c`, which
+# hardens the stock server against a stall and then runs run_server.py with
+# the arguments that follow it. See that module. The source travels in the
+# command itself, so there is nothing to mount, and a change to the patch is a
+# change to the command -- which recreates the container (_ensure_container).
+SERVER_PATCH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_patch.py")
+# Where the evidence from a stalled server is kept: its log, thread stacks
+# included, from just before it was restarted.
+STALL_LOG_TAIL_LINES = 600
 # Model names we will interpolate into a python -c inside the container.
 _SAFE_MODEL = re.compile(r"^[A-Za-z0-9._/-]+$")
 IMAGE_CPU = "ghcr.io/collabora/whisperlive-cpu:latest"
@@ -268,6 +277,12 @@ def is_port_open(host: str, port: int, timeout: float = PROBE_TIMEOUT_S) -> bool
         return False
 
 
+def server_patch_source() -> str:
+    """The source of server_patch.py, as the container is to run it."""
+    with open(SERVER_PATCH_FILE, encoding="utf-8") as f:
+        return f.read()
+
+
 def _format_bytes(n: float) -> str:
     if n >= 1e9:
         return f"{n / 1e9:.1f} GB"
@@ -289,6 +304,10 @@ class ServerManager(QObject):
     # Progress of the model the server is currently fetching, ready to show as
     # it is; empty string when there is nothing being downloaded.
     model_progress = Signal(str)
+    # The container came back up without us starting it: Docker's restart
+    # policy, after the server exited -- which is what server_patch.py makes a
+    # hung server do. A fresh server has no model loaded yet.
+    restarted = Signal()
 
     def __init__(self, settings: dict):
         super().__init__()
@@ -316,6 +335,9 @@ class ServerManager(QObject):
         # remembered: neither answer changes while we are the one changing it.
         self._legacy_retired = False
         self._cache_volume = None
+        # When our container last started, as Docker reports it. A change the
+        # idle probe sees is a restart someone else did.
+        self._started_at = None
 
     # -- configuration -----------------------------------------------------
 
@@ -530,6 +552,23 @@ class ServerManager(QObject):
         """Stop the container WhisperType started. Non-blocking."""
         self._run_async(self._stop_blocking, "server-stop")
 
+    def restart_stalled_server(self, reason: str, diagnostics_dir: str) -> bool:
+        """Restart a server that is up but has stopped transcribing. Non-blocking.
+
+        Its log is saved to `diagnostics_dir` first, with every thread's stack
+        in it (server_patch.py dumps them on SIGUSR1) -- a restart clears the
+        state that would say what went wrong, and that is the only chance to
+        keep it. False if there is no container of ours to restart, or the
+        worker is already busy with one.
+        """
+        if not self.can_manage_server() or self._paused_for:
+            return False
+        if self.is_busy():
+            return False
+        self._run_async(lambda: self._restart_blocking(reason, diagnostics_dir),
+                        "server-restart")
+        return True
+
     def shutdown(self):
         """Abandon any in-flight Docker work; called on app exit."""
         self._stop_event.set()
@@ -550,6 +589,10 @@ class ServerManager(QObject):
     def is_busy(self) -> bool:
         thread = self._thread
         return bool(thread and thread.is_alive())
+
+    def is_restarting(self) -> bool:
+        thread = self._thread
+        return bool(thread and thread.is_alive() and thread.name == "server-restart")
 
     # -- worker plumbing ---------------------------------------------------
 
@@ -638,6 +681,22 @@ class ServerManager(QObject):
         alive = None
         if self.manages_server() or self.can_manage_server():
             alive = self._container_is_running()
+            if (alive is False and self.manages_server()
+                    and self.state == STATE_RUNNING):
+                # It was up, nobody here stopped it -- Stop Server leaves the
+                # state DISABLED, and standing down for an app returned above
+                # -- and Docker has not brought it back. Waiting for the next
+                # hotkey to notice would put a cold start in front of it.
+                self.logger.warning("The server container stopped on its own; starting it again.")
+                self._ensure_running_blocking()
+                return
+            if alive:
+                started_at = self._container_field("{{.State.StartedAt}}")
+                if self._started_at and started_at and started_at != self._started_at:
+                    self.logger.warning("The server container restarted on its own (at %s).",
+                                        started_at)
+                    self.restarted.emit()
+                self._started_at = started_at or self._started_at
         if alive is None:
             alive = is_port_open(host, port)
 
@@ -806,12 +865,18 @@ class ServerManager(QObject):
             ports = self._container_field(
                 "{{range $p, $conf := .NetworkSettings.Ports}}"
                 "{{if $conf}}{{(index $conf 0).HostPort}} {{end}}{{end}}") or ""
-            command = self._container_field('{{join .Config.Cmd " "}}') or ""
-            # The command carries the model, so a model change shows up here as
-            # a mismatch and the container is rebuilt around the new one.
+            # As JSON, because the patch source in it is full of whitespace
+            # that joining and splitting would not survive.
+            try:
+                command = json.loads(self._container_field("{{json .Config.Cmd}}") or "null")
+            except ValueError:
+                command = None
+            # The command carries the model and the server patch, so a change
+            # to either shows up here as a mismatch and the container is
+            # rebuilt around the new one.
             matches = (image in self._acceptable_images()
                        and str(host_port) in ports.split()
-                       and command.split() == desired_command)
+                       and command == desired_command)
             if matches and running == "true":
                 return True
             if matches:
@@ -835,7 +900,7 @@ class ServerManager(QObject):
         Stated in full because Docker replaces the image's CMD outright when
         arguments follow the image name rather than appending to it.
         """
-        command = SERVER_BASE_COMMAND + ["--port", str(CONTAINER_PORT)]
+        command = ["python", "-c", server_patch_source(), "--port", str(CONTAINER_PORT)]
         if model_path:
             command += ["-fw", model_path]
         return command
@@ -1028,6 +1093,50 @@ class ServerManager(QObject):
 
         self._emit(STATE_FAILED, "The container started but nothing is listening on the port")
         return False
+
+    def _restart_blocking(self, reason: str, diagnostics_dir: str):
+        if self._container_is_running() is None:
+            # Not a container of ours -- a server started by hand. Nothing
+            # here can restart it; the caller has already said what is wrong.
+            self.logger.warning("Server stalled (%s), but it is not our container.", reason)
+            return
+        self._emit(STATE_STARTING, "Restarting the server — it stopped transcribing")
+        self._save_stall_diagnostics(reason, diagnostics_dir)
+        # A short grace: the threads a clean shutdown would wait for are the
+        # ones that are stuck.
+        ok, _, err = self._docker("restart", "-t", "2", CONTAINER_NAME, timeout=90)
+        if not ok:
+            self.logger.warning("docker restart failed (%s); recreating the container.", err)
+            self._ensure_running_blocking()
+            return
+        host, port = parse_address(self.address)
+        self._await_port(host, port)
+
+    def _save_stall_diagnostics(self, reason: str, diagnostics_dir: str):
+        """Keep the stalled server's log, thread stacks included."""
+        # From inside, not `docker kill --signal`: Docker counts any kill as
+        # the user stopping the container, and stops honouring its restart
+        # policy from then on.
+        self._docker("exec", CONTAINER_NAME, "python", "-c",
+                     "import os, signal; os.kill(1, signal.SIGUSR1)", timeout=15)
+        # faulthandler writes from a signal handler; give it a moment to land.
+        time.sleep(1.0)
+        ok, out, err = self._docker("logs", "--timestamps", "--tail",
+                                    str(STALL_LOG_TAIL_LINES), CONTAINER_NAME, timeout=30)
+        try:
+            os.makedirs(diagnostics_dir, exist_ok=True)
+            path = os.path.join(diagnostics_dir,
+                                time.strftime("stall-%Y%m%d-%H%M%S.log"))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"Reason: {reason}\n\n")
+                # `docker logs` replays the container's stdout and stderr on
+                # the CLI's own, so the server's log is split across both;
+                # the timestamps put it back in order.
+                lines = (out + "\n" + err).splitlines()
+                f.write("\n".join(sorted(line for line in lines if line.strip())) + "\n")
+            self.logger.warning("Server stalled (%s); its log is saved to %s", reason, path)
+        except OSError:
+            self.logger.exception("Could not save the stalled server's log.")
 
     def _stop_blocking(self):
         self._emit(STATE_CHECKING, "Stopping the WhisperLive container")

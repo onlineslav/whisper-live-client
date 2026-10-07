@@ -5,7 +5,12 @@ a = Analysis(
     ['src/main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        # Sent into the server container as its launcher; see server_manager.
+        ('src/server_patch.py', '.'),
+        # The phrase the health probe speaks; see server_health.
+        ('src/assets/health_probe.wav', 'assets'),
+    ],
     hiddenimports=[
         'pynput.keyboard._win32', 
         'pynput.mouse._win32'

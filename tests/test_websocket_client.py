@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "src"))
@@ -24,6 +25,7 @@ os.environ.setdefault("WHISPERTYPE_PAYLOAD_LOG", "0")
 from PySide6.QtCore import QCoreApplication  # noqa: E402
 from websockets.asyncio.server import serve  # noqa: E402
 
+import websocket_client  # noqa: E402
 from websocket_client import WebSocketClient  # noqa: E402
 
 # Status signals are emitted on the client's thread and queued to this one,
@@ -34,8 +36,11 @@ APP = QCoreApplication.instance() or QCoreApplication([])
 class FakeServer:
     """A WhisperLive stand-in on a free local port, in its own thread."""
 
-    def __init__(self, ready_delay=0.0):
+    def __init__(self, ready_delay=0.0, answer=False):
         self.ready_delay = ready_delay
+        # Reply to every frame with a transcript, as a working server does to
+        # speech. Off by default: most tests are about what was sent.
+        self.answer = answer
         # One list of received audio frames per connection, in order.
         self.connections: list[list[bytes]] = []
         self._current = None
@@ -69,6 +74,9 @@ class FakeServer:
                     await websocket.close()
                     return
                 frames.append(message)
+                if self.answer:
+                    await websocket.send('{"uid": "t", "segments": '
+                                         '[{"start": "0", "end": "1", "text": "hi"}]}')
         except Exception:
             pass
 
@@ -103,9 +111,10 @@ def chunk(n: int) -> bytes:
 class ClientTestCase(unittest.TestCase):
     reconnect_after_capture = True
     ready_delay = 0.0
+    answer = False
 
     def setUp(self):
-        self.server = FakeServer(self.ready_delay)
+        self.server = FakeServer(self.ready_delay, self.answer)
         self.client = WebSocketClient(
             self.server.url, reconnect_after_capture=self.reconnect_after_capture)
         self.statuses = []
@@ -125,7 +134,8 @@ class DroppedConnection(ClientTestCase):
 
     def test_audio_spoken_through_a_drop_reaches_the_replacement(self):
         """What is said while the connection is down is held, then sent to
-        the new session ahead of anything newer."""
+        the new session ahead of anything newer -- and so is what the old
+        session was sent and never answered, ahead of that."""
         self.connect_and_wait()
         self.client.send_audio(chunk(1))
         self.assertTrue(wait_for(lambda: self.server.connections[0] == [chunk(1)]))
@@ -138,14 +148,76 @@ class DroppedConnection(ClientTestCase):
         self.assertTrue(wait_for(lambda: self.client.is_ready), "did not reconnect")
         self.client.send_audio(chunk(4))
         self.assertTrue(wait_for(lambda: len(self.server.connections) == 2
-                                 and len(self.server.connections[1]) == 3))
-        self.assertEqual(self.server.connections[1], [chunk(2), chunk(3), chunk(4)])
+                                 and len(self.server.connections[1]) == 4))
+        self.assertEqual(self.server.connections[1],
+                         [chunk(1), chunk(2), chunk(3), chunk(4)])
 
     def test_status_reports_the_drop(self):
         self.connect_and_wait()
         self.server.drop()
         self.assertTrue(wait_for(lambda: "Disconnected" in self.statuses))
         self.assertTrue(wait_for(lambda: self.statuses[-1] == "Ready"))
+
+
+class AnsweredAudio(ClientTestCase):
+    answer = True
+
+    def test_answered_audio_is_not_sent_again(self):
+        """A reply means the server has heard it; replaying it would type
+        the same words twice."""
+        self.connect_and_wait()
+        self.client.send_audio(chunk(1))
+        self.assertTrue(wait_for(lambda: self.client._unanswered_bytes == 0
+                                 and self.server.connections[0] == [chunk(1)]))
+        self.server.drop()
+        self.assertTrue(wait_for(lambda: not self.client.is_ready))
+        self.assertTrue(wait_for(lambda: self.client.is_ready), "did not reconnect")
+        self.client.send_audio(chunk(2))
+        self.assertTrue(wait_for(lambda: len(self.server.connections) == 2
+                                 and self.server.connections[1] == [chunk(2)]))
+
+    def test_an_answering_session_is_not_suspected(self):
+        self.connect_and_wait()
+        with patch.object(websocket_client, "STALL_AUDIO_S", 0.0),                 patch.object(websocket_client, "STALL_WAIT_S", 0.0):
+            self.client.send_audio(chunk(1))
+            self.assertTrue(wait_for(lambda: self.client._unanswered_bytes == 0))
+            self.assertFalse(self.client.stall_suspected())
+
+
+class StalledSession(ClientTestCase):
+    """A server that takes audio and never answers: the 2026-10-06 stall."""
+
+    def test_unanswered_speech_raises_a_suspicion(self):
+        self.connect_and_wait()
+        self.assertFalse(self.client.stall_suspected())
+        with patch.object(websocket_client, "STALL_AUDIO_S", 0.0),                 patch.object(websocket_client, "STALL_WAIT_S", 0.0):
+            self.client.send_audio(chunk(1))
+            self.assertTrue(self.client.stall_suspected())
+
+    def test_too_little_audio_is_not_a_suspicion(self):
+        self.connect_and_wait()
+        with patch.object(websocket_client, "STALL_WAIT_S", 0.0):
+            self.client.send_audio(chunk(1))
+            self.assertFalse(self.client.stall_suspected())
+
+    def test_dropping_a_stalled_session_replays_it_to_the_next(self):
+        self.connect_and_wait()
+        first = self.client.session_id
+        self.client.send_audio(chunk(1))
+        self.client.send_audio(chunk(2))
+        self.assertTrue(wait_for(lambda: len(self.server.connections[0]) == 2))
+        self.client.drop_session()
+        self.assertTrue(wait_for(lambda: self.client.session_id != first
+                                 and self.client.is_ready), "did not reconnect")
+        self.assertTrue(wait_for(lambda: len(self.server.connections) == 2
+                                 and self.server.connections[1] == [chunk(1), chunk(2)]))
+
+    def test_end_of_audio_forgets_unanswered_audio(self):
+        """It belongs to a capture that is over."""
+        self.connect_and_wait()
+        self.client.send_audio(chunk(1))
+        self.client.send_eos()
+        self.assertEqual(self.client._unanswered_bytes, 0)
 
 
 class SlowModelLoad(ClientTestCase):

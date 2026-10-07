@@ -18,11 +18,13 @@ from capture_box import CaptureBox
 import win_input
 import payload_log
 import server_manager
+import server_health
 import caret_target
 import target_overlay
 from target_overlay import TargetOverlay
 from live_type import LiveTyper
 from server_manager import ServerManager
+from server_health import HealthProbe
 from transcript import Transcript
 from win_focus import (
     get_foreground_window, focus_window, is_own_window, is_window,
@@ -89,6 +91,27 @@ TARGET_POLL_MS = 200
 # actually has to be right.
 IDLE_PROBE_MS = 60000
 
+# Stall defence. A server can stay up and keep answering SERVER_READY while
+# transcribing nothing at all -- see server_health. Three checks catch it:
+#  * during a capture, every second: has this session been sent speech and
+#    not answered it (WebSocketClient.stall_suspected)? If so, a probe
+#    confirms it before the server is restarted;
+#  * a few seconds after every capture, so a stall that starts as one capture
+#    ends is cleared before the next hotkey rather than discovered by it;
+#  * every ten minutes while idle, for anything else.
+# Each probe is one short phrase through the shared model: about 0.1s of GPU.
+STALL_CHECK_MS = 1000
+HEALTH_PROBE_AFTER_CAPTURE_MS = 5000
+HEALTH_PROBE_IDLE_MS = 10 * 60 * 1000
+# After a probe clears a suspicion, how long before the same capture may
+# raise another. Noise loud enough to pass the speech gate but thrown away by
+# the server's VAD looks like a stall from the client; without this it would
+# probe on a loop.
+STALL_RECHECK_S = 30.0
+# Logs saved from stalled servers, thread stacks included, for working out
+# what hung.
+STALL_DIAGNOSTICS_DIR = os.path.join(APP_DATA_DIR, "server-stalls")
+
 # Held for the lifetime of the process; releasing it would let a second
 # instance start. Module-level so it is never garbage collected.
 _instance_mutex = None
@@ -152,6 +175,14 @@ class WhisperTypeApp:
         # True while an on-demand session is open only to make the server load
         # its model, and is to be hung up once it has. See _maybe_autoconnect.
         self._warming_model = False
+        # Stall defence state; see STALL_CHECK_MS. The session a stall was
+        # found on, so it can be dropped if a restart somehow leaves it open;
+        # whether a capture is waiting out a restart, which changes what the
+        # box says; and when the current capture may next raise a suspicion.
+        self._stalled_session = None
+        self._server_recovering = False
+        self._next_stall_check = 0.0
+        self._stall_unfixable_notified = False
         self.connection_status = "Disconnected"
         self.connection_detail = ""
         # What the tray is currently saying, and since when -- the elapsed
@@ -200,10 +231,12 @@ class WhisperTypeApp:
         self.server_manager = ServerManager(self.settings)
         self.server_manager.state_changed.connect(self.on_server_state_changed)
         self.server_manager.model_progress.connect(self.on_model_progress)
+        self.server_manager.restarted.connect(self.on_server_restarted)
         self._init_tray_icon()
         self._init_hotkey_listener()
         self._init_websocket_client()
         self._init_status_timers()
+        self._init_health_checks()
         self._start_server_if_needed()
         
         # Connect signals
@@ -418,7 +451,9 @@ class WhisperTypeApp:
         so the status lines here cannot end up in the document.
         """
         status = self.connection_status
-        if status == "Loading":
+        if self._server_recovering:
+            headline = "The server stopped transcribing \u2014 restarting it\u2026"
+        elif status == "Loading":
             headline = "Reconnecting \u2014 loading the model\u2026"
         elif status == "Waiting":
             headline = "Reconnecting \u2014 the server is busy\u2026"
@@ -428,7 +463,8 @@ class WhisperTypeApp:
             headline = "Connection lost \u2014 retrying\u2026"
         lines = [headline]
         # Connecting and Loading details only restate the headline.
-        if self.connection_detail and status not in ("Connecting", "Loading"):
+        if (self.connection_detail and status not in ("Connecting", "Loading")
+                and not self._server_recovering):
             lines.append(self.connection_detail)
         lines.append("Keep talking: it catches up once reconnected. "
                      "Confirm keeps what you have so far.")
@@ -474,6 +510,93 @@ class WhisperTypeApp:
             return
         self.server_manager.probe()
 
+    def _init_health_checks(self):
+        self.health_probe = HealthProbe()
+        self.health_probe.finished.connect(self.on_health_probe_finished)
+
+        self._stall_timer = QTimer()
+        self._stall_timer.setInterval(STALL_CHECK_MS)
+        self._stall_timer.timeout.connect(self._check_for_stall)
+
+        self._idle_health_timer = QTimer()
+        self._idle_health_timer.setInterval(HEALTH_PROBE_IDLE_MS)
+        self._idle_health_timer.timeout.connect(lambda: self._run_health_probe("idle"))
+        self._idle_health_timer.start()
+
+    def _run_health_probe(self, context: str) -> bool:
+        """Probe the server, unless now is not the time. True if one started."""
+        if context != "capture":
+            # Background probes only where they are close to free. Without
+            # a shared model every connection loads its own copy, and a probe
+            # would cost a model load.
+            if not self.settings.get("share_one_model", True):
+                return False
+            # Mid-capture, the capture itself is the probe.
+            if self.is_capturing:
+                return False
+        # A server that is down, starting or stood down is server_manager's
+        # to report; a probe would only say "unreachable".
+        if (self.server_manager.manages_server()
+                and self.server_manager.state != server_manager.STATE_RUNNING):
+            return False
+        return self.health_probe.start(self.settings["server_address"],
+                                       self.settings.get("model", "distil-small.en"),
+                                       context)
+
+    def _check_for_stall(self):
+        """Once a second during a capture: is the server still answering?"""
+        if not self.is_capturing:
+            self._stall_timer.stop()
+            return
+        if (self._capture_waiting_for_connection or self._capture_interrupted
+                or self._server_recovering or self.health_probe.is_running()):
+            return
+        if time.monotonic() < self._next_stall_check:
+            return
+        if not self.websocket_client.stall_suspected():
+            return
+        self.logger.warning("Speech sent and not answered; probing the server.")
+        self._stalled_session = self.websocket_client.session_id
+        self._next_stall_check = time.monotonic() + STALL_RECHECK_S
+        payload_log.log_event("stall_suspected")
+        self._run_health_probe("capture")
+
+    def on_health_probe_finished(self, verdict: str, detail: str, context: str):
+        payload_log.log_event("health_probe", verdict=verdict, context=context)
+        if verdict != server_health.STALLED:
+            return
+        self._recover_stalled_server(detail)
+
+    def _recover_stalled_server(self, detail: str):
+        """The server is up but transcribes nothing. Restart it.
+
+        A capture in progress loses nothing: the restart drops its session,
+        and WebSocketClient holds what that session was sent and never
+        answered, then sends it again to the fresh server. The words come
+        through late rather than not at all.
+        """
+        if self.server_manager.is_restarting():
+            return  # already on it
+        if self.server_manager.can_manage_server() and self.server_manager.is_busy():
+            # Some routine check holds the worker for a moment. The restart
+            # must not be dropped behind it, so it waits its turn.
+            QTimer.singleShot(1000, lambda: self._recover_stalled_server(detail))
+            return
+        self.logger.error("The server has stopped transcribing (%s).", detail)
+        payload_log.log_event("server_stalled", detail=detail)
+        restarting = self.server_manager.restart_stalled_server(detail, STALL_DIAGNOSTICS_DIR)
+        if self.is_capturing and not self._capture_waiting_for_connection:
+            self._server_recovering = restarting
+            if not restarting:
+                # Nothing here can restart it, but a fresh session is still
+                # worth one try.
+                self.websocket_client.drop_session()
+        if not restarting and not self._stall_unfixable_notified:
+            self._stall_unfixable_notified = True
+            self._notify("The transcription server stopped responding",
+                         "It accepts connections but transcribes nothing. "
+                         "Restart the WhisperLive server.")
+
     def _start_server_if_needed(self):
         """Bring the server up at launch, so it is warm by the first hotkey.
 
@@ -492,6 +615,15 @@ class WhisperTypeApp:
 
     def on_server_state_changed(self, state: str, detail: str):
         if state == server_manager.STATE_RUNNING:
+            self._stall_unfixable_notified = False
+            # A restart kills every session on the old server, so the one
+            # the stall was found on should be gone. If it somehow is not,
+            # it is still pointing at nothing useful.
+            if (self._stalled_session is not None
+                    and self.websocket_client.session_id == self._stalled_session
+                    and self.websocket_client.stall_suspected()):
+                self.websocket_client.drop_session()
+            self._stalled_session = None
             self._maybe_autoconnect()
         elif state == server_manager.STATE_FAILED and not self._server_failure_notified:
             # Once per failure, not once per retry: the probe re-reports the
@@ -503,6 +635,11 @@ class WhisperTypeApp:
         if state != server_manager.STATE_FAILED:
             self._server_failure_notified = False
         self._sync_icon_state()
+
+    def on_server_restarted(self):
+        """The server restarted itself; get its model loaded again."""
+        if not self.is_capturing:
+            self._maybe_autoconnect()
 
     def _maybe_autoconnect(self):
         """Open the socket, or in on-demand mode get the model loaded.
@@ -733,6 +870,9 @@ class WhisperTypeApp:
         # "Ready", not "Loading": the socket being open only means the server
         # accepted us, and audio streamed before SERVER_READY is audio spoken
         # into a model that is not in memory yet.
+        if status == "Ready":
+            self._server_recovering = False
+
         if status == "Ready" and self.is_capturing and self._capture_waiting_for_connection:
             self._capture_waiting_for_connection = False
             self._begin_streaming()
@@ -834,6 +974,8 @@ class WhisperTypeApp:
             # than the previous capture's.
             self._transcript.reset()
             self._banked_text = ""
+            self._next_stall_check = 0.0
+            self._stall_timer.start()
             payload_log.log_event("capture_start")
             # Record the target window now, before the Capture Box steals focus.
             self._record_paste_target()
@@ -1175,6 +1317,7 @@ class WhisperTypeApp:
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
         payload_log.log_event("capture_confirmed")
+        self._probe_after_capture()
         # Marks the box settled before the work below, so nothing it does in
         # the meantime can treat this capture as still open.
         self.capture_box.set_busy(True)
@@ -1210,6 +1353,7 @@ class WhisperTypeApp:
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
         payload_log.log_event("capture_cancelled")
+        self._probe_after_capture()
         # Before the marker goes: the target still has the keyboard at this
         # point (a passive box never took it), which is what makes taking the
         # preview back possible at all.
@@ -1221,6 +1365,17 @@ class WhisperTypeApp:
         self._sync_icon_state()
         self.write_to_history(self._capture_text(), status="CANCELLED")
         self.logger.debug("Capture cancelled.")
+
+    def _probe_after_capture(self):
+        """Check the server a few seconds after a capture ends.
+
+        Late enough that the session this capture used has closed and its
+        replacement is up, so the probe is not part of that churn.
+        """
+        self._stall_timer.stop()
+        self._server_recovering = False
+        QTimer.singleShot(HEALTH_PROBE_AFTER_CAPTURE_MS,
+                          lambda: self._run_health_probe("after-capture"))
 
     def _schedule_on_demand_disconnect(self):
         if not self.settings.get("connect_on_demand", False):
