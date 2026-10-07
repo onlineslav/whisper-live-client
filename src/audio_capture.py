@@ -10,12 +10,40 @@ from PySide6.QtCore import QObject, Signal
 # -- it is the "no signal at all" rail the meter parks on between captures.
 SILENCE_DBFS = -100.0
 
+# The speech gate (see AudioCapture.__init__) opens this far above the mic's
+# own noise floor. A fixed threshold assumed a mic of one particular loudness:
+# at -38 dBFS it shut out an Audient iD14 whose speech peaks at -54 to
+# -41 dBFS, and every capture sat on "Listening..." with nothing sent -- while
+# the server, tested, transcribes speech that peaks at -55 dBFS.
+GATE_MARGIN_DB = 15.0
+# Never stricter than the old fixed gate, which suits a loud mic as it was...
+GATE_MAX_RMS = 0.012          # -38 dBFS
+# ...and never so lax that a near-silent digital input opens it on dither.
+GATE_MIN_RMS = 0.0005         # -66 dBFS
+# How much recent audio the noise floor is judged from, in chunks: about 30s
+# at 64ms each. Kept across captures, so a capture that starts talking at once
+# is judged by the room as the last one heard it.
+NOISE_WINDOW_CHUNKS = 470
+# The noise floor is this quantile of recent chunk levels: low enough to land
+# in the gaps between words even through continuous speech.
+NOISE_QUANTILE = 0.1
+
 
 def dbfs_from_rms(rms: float) -> float:
     """Convert an RMS level (float32 samples in -1..1) to dBFS."""
     if rms <= 0.0:
         return SILENCE_DBFS
     return max(SILENCE_DBFS, 20.0 * math.log10(rms))
+
+
+def gate_threshold(recent_levels) -> float:
+    """The RMS a chunk must reach to count as speech, given recent chunk levels."""
+    if not recent_levels:
+        return GATE_MAX_RMS
+    ordered = sorted(recent_levels)
+    floor = ordered[int(len(ordered) * NOISE_QUANTILE)]
+    gate = floor * 10 ** (GATE_MARGIN_DB / 20.0)
+    return min(GATE_MAX_RMS, max(GATE_MIN_RMS, gate))
 
 
 class AudioCapture(QObject):
@@ -44,12 +72,13 @@ class AudioCapture(QObject):
         # near-silent audio, and the server's own VAD leaks. Gating here means
         # silence never reaches the server, so it cannot hallucinate on it.
         #   - threshold: RMS of a chunk (float32 samples in -1..1) below this is
-        #     treated as silence. ~0.012 sits above mic noise floor, below speech.
+        #     treated as silence. Set from the mic's own noise floor, which is
+        #     tracked here across captures -- see gate_threshold.
         #   - hangover: keep streaming this many chunks after speech stops so
         #     trailing word tails and short inter-word pauses are not clipped.
         #   - preroll: chunks of pre-speech audio flushed on speech onset so the
         #     first syllable is not lost. (~64ms per chunk at 1024/16000.)
-        self._silence_threshold = 0.012
+        self._recent_levels = collections.deque(maxlen=NOISE_WINDOW_CHUNKS)
         self._hangover_chunks = 8
         self._preroll_chunks = 3
 
@@ -101,6 +130,7 @@ class AudioCapture(QObject):
         # these numbers tell the two apart.
         levels = []
         sent = 0
+        threshold = GATE_MAX_RMS
         try:
             self._stream = self._p.open(format=self.format,
                                         channels=self.channels,
@@ -120,7 +150,12 @@ class AudioCapture(QObject):
                 if self._meter_only:
                     continue
                 levels.append(rms)
-                is_speech = rms >= self._silence_threshold
+                self._recent_levels.append(rms)
+                # Recomputed every ~0.5s rather than every chunk: sorting 470
+                # levels 16 times a second is waste for a number that drifts.
+                if len(levels) % 8 == 1:
+                    threshold = gate_threshold(self._recent_levels)
+                is_speech = rms >= threshold
                 if is_speech:
                     silent_run = 0
                     if not speaking:
@@ -160,7 +195,7 @@ class AudioCapture(QObject):
                     dbfs_from_rms(levels[len(levels) // 10]),
                     dbfs_from_rms(levels[len(levels) // 2]),
                     dbfs_from_rms(levels[-1]),
-                    dbfs_from_rms(self._silence_threshold))
+                    dbfs_from_rms(threshold))
             # Park the meter at silence: the last chunk read is usually
             # mid-speech, and without this the meter would stay pinned there
             # until the next capture starts.
