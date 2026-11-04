@@ -1,5 +1,6 @@
 import ctypes
 import sys
+from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -24,6 +25,7 @@ from PySide6.QtCore import (
     QTimer,
     QPropertyAnimation,
     QAbstractAnimation,
+    QEvent,
 )
 from PySide6.QtGui import (
     QCursor,
@@ -321,6 +323,25 @@ def _blurred(pixmap: QPixmap, radius: int, saturation: int,
     return out
 
 
+def _when(timestamp: str) -> str:
+    """A history timestamp the way a person says it: "15:10", "Mon 09:02"."""
+    try:
+        then = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return timestamp
+    now = datetime.now()
+    if then.date() == now.date():
+        return then.strftime("%H:%M")
+    if (now.date() - then.date()).days < 7:
+        return then.strftime("%a %H:%M")
+    return f"{then.strftime('%b')} {then.day} {then.strftime('%H:%M')}"
+
+
+def _status_note(status: str) -> str:
+    """Flag the entries that never reached a document."""
+    return {"CANCELLED": " (cancelled)", "NOT_PASTED": " (not pasted)"}.get(status, "")
+
+
 def _clamp_int(value, low: int, high: int) -> int:
     try:
         value = int(value)
@@ -432,6 +453,12 @@ class CaptureBox(QWidget):
 
     confirmed = Signal(str)
     cancelled = Signal()
+    # Enter (or Confirm) while an earlier dictation is on show: paste that one
+    # instead of what is being said now. Carries the earlier text.
+    recall_confirmed = Signal(str)
+    # Confirm pressed again while the box is already finishing the last
+    # words: stop waiting and paste what is there.
+    hurry_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -459,6 +486,16 @@ class CaptureBox(QWidget):
         # keyboard, the buttons -- must not paste or cancel a sample. It is
         # the same widget otherwise, which is the point of previewing it.
         self._preview_mode = False
+        # Stepping back through earlier dictations with Left and Right while
+        # the capture keeps recording. The source is a callable returning
+        # history.Entry objects newest first, read on the first Left press;
+        # _history_index -1 is the live transcript, 0 the newest earlier one.
+        self._history_source = None
+        self._history = None
+        self._history_index = -1
+        # The live transcript as last set, kept while an earlier dictation is
+        # on show so stepping back to it is instant.
+        self._live_text = ""
 
         # Never shown (the window is frameless), but it makes the box
         # identifiable in window lists and in logs when tracing a stray paste.
@@ -554,6 +591,12 @@ class CaptureBox(QWidget):
         self.away_hint.setVisible(False)
         layout.addWidget(self.away_hint)
 
+        # Which earlier dictation is on show, shown only while one is.
+        self.history_hint = QLabel()
+        self.history_hint.setVisible(False)
+        self.history_hint.setWordWrap(True)
+        layout.addWidget(self.history_hint)
+
         # Buttons
         button_row = QHBoxLayout()
         # No automatic spacing: the row's only gaps are the two stretches
@@ -617,13 +660,26 @@ class CaptureBox(QWidget):
         self.confirm_button.clicked.connect(self.on_confirm)
         self.cancel_button.clicked.connect(self.on_cancel)
 
+        # Left and Right step through earlier dictations. Filtered on the
+        # children rather than heard in keyPressEvent: the read-only text
+        # field takes arrow keys for scrolling and never passes them up.
+        for widget in (self.text_area, self.confirm_button, self.cancel_button):
+            widget.installEventFilter(self)
+
     def on_confirm(self):
         if self._preview_mode:
             self.hide()
             return
         if self.confirm_button.is_busy():
-            # Already confirmed and waiting on the paste. A second confirm has
-            # nothing left to do and would emit the transcript twice.
+            # Already confirmed and finishing the last words. A second
+            # confirm means "paste what you have now".
+            self.hurry_requested.emit()
+            return
+        entry = self.browsed_entry()
+        if entry is not None:
+            self._closing = True
+            self.recall_confirmed.emit(entry.text)
+            self._fade_out_and_hide()
             return
         self._closing = True
         self.confirmed.emit(self.text_area.toPlainText())
@@ -1190,6 +1246,14 @@ class CaptureBox(QWidget):
                 painter.restore()
 
     def set_text(self, text):
+        self._live_text = text
+        if self._history_index >= 0:
+            # An earlier dictation is on show; the live text waits until the
+            # user steps back to it.
+            return
+        self._show_text(text)
+
+    def _show_text(self, text):
         self.text_area.setPlainText(text)
         # Block formatting does not survive setPlainText, so the spacing is
         # re-stamped on every update rather than set once.
@@ -1349,6 +1413,7 @@ class CaptureBox(QWidget):
         self._preview_mode = True
         self._closing = False
         self._reset_away()
+        self._reset_history_view()
         self.set_busy(False)
         self.meter.reset()
         self.adjustSize()
@@ -1400,6 +1465,7 @@ class CaptureBox(QWidget):
         self._preview_mode = False
         self._closing = False
         self._reset_away()
+        self._reset_history_view()
         self.set_busy(False)
         self.meter.reset()
         # Activated rather than merely requested, so the geometry measured
@@ -1487,14 +1553,97 @@ class CaptureBox(QWidget):
         except Exception:
             pass
 
+    # Earlier dictations. The capture records throughout; only what the box
+    # shows, and what Enter pastes, changes.
+
+    def set_history_source(self, source):
+        """`source()` returns earlier dictations (history.Entry), newest first."""
+        self._history_source = source
+
+    def browsed_entry(self):
+        """The earlier dictation on show, or None while the live one is."""
+        if self._history_index < 0 or not self._history:
+            return None
+        return self._history[self._history_index]
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.KeyPress and self._history_key(event):
+            return True
+        return super().eventFilter(watched, event)
+
+    def _history_key(self, event) -> bool:
+        """Step on Left/Right; True if the key was used."""
+        if event.key() not in (Qt.Key_Left, Qt.Key_Right):
+            return False
+        if (self._preview_mode or self._compact or self._closing
+                or self.confirm_button.is_busy()
+                or event.modifiers() & ~Qt.KeypadModifier):
+            return False
+        self.step_history(1 if event.key() == Qt.Key_Left else -1)
+        return True
+
+    def step_history(self, delta: int):
+        """Older (+1) or newer (-1). Newer than the newest is the live text."""
+        if self._history is None:
+            try:
+                self._history = list(self._history_source() if self._history_source else [])
+            except Exception:
+                self._history = []
+        index = max(-1, min(len(self._history) - 1, self._history_index + delta))
+        if index == self._history_index:
+            return
+        self._history_index = index
+        entry = self.browsed_entry()
+        if entry is None:
+            self.history_hint.setVisible(False)
+            self._show_text(self._live_text)
+        else:
+            self._style_hint(self.history_hint)
+            self.history_hint.setText(
+                f"\u25cf Still recording  \u00b7  Earlier {index + 1} of {len(self._history)}, "
+                f"{_when(entry.timestamp)}{_status_note(entry.status)}  \u00b7  "
+                f"Enter pastes this  \u00b7  \u2190 older  \u2192 newer")
+            self.history_hint.setVisible(True)
+            self._show_text(entry.text)
+        self._settle_layout()
+        self._keep_on_screen()
+
+    def show_note(self, text: str):
+        """A line under the transcript, e.g. while confirm finishes up."""
+        self._style_hint(self.history_hint)
+        self.history_hint.setText(text)
+        self.history_hint.setVisible(bool(text))
+        self._settle_layout()
+        self._keep_on_screen()
+
+    def _reset_history_view(self):
+        """Back to the live transcript, re-reading history on the next Left."""
+        self._history = None
+        self._history_index = -1
+        self._live_text = ""
+        self.history_hint.setVisible(False)
+
+    def _style_hint(self, label):
+        ink = QColor(self._text_color)
+        label.setStyleSheet(
+            "QLabel { color: rgba(%d, %d, %d, 0.8); background: transparent;"
+            " font-size: 12px; padding: 0 2px; }"
+            % (ink.red(), ink.green(), ink.blue()))
+
     def keyPressEvent(self, event: QKeyEvent):
         if self._preview_mode:
             # Confirming or cancelling a sample would mean pasting it.
             super().keyPressEvent(event)
             return
         if self.confirm_button.is_busy():
-            # Waiting on the paste. Both keys are no-ops at this point, and
-            # swallowing them stops one landing in the app underneath.
+            # Finishing the last words. Enter again pastes what is there now;
+            # anything else is swallowed so it does not land in the app
+            # underneath.
+            event.accept()
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self.hurry_requested.emit()
+            return
+        if self._history_key(event):
             event.accept()
             return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):

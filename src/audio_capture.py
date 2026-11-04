@@ -4,6 +4,7 @@ import logging
 import math
 import pyaudio
 import threading
+import time
 from PySide6.QtCore import QObject, Signal
 
 # Level reported for a digitally silent chunk. Real microphones never reach it
@@ -80,6 +81,10 @@ class AudioCapture(QObject):
         #     first syllable is not lost. (~64ms per chunk at 1024/16000.)
         self._recent_levels = collections.deque(maxlen=NOISE_WINDOW_CHUNKS)
         self._hangover_chunks = 8
+        # time.monotonic() of the last chunk sent past the speech gate. Read
+        # from the GUI thread to tell whether the server has everything that
+        # was said; a float assignment is atomic, so no lock.
+        self.last_sent_at = 0.0
         self._preroll_chunks = 3
 
         self._p = pyaudio.PyAudio()
@@ -164,10 +169,12 @@ class AudioCapture(QObject):
                         for buffered in preroll:
                             self.audio_chunk_ready.emit(buffered)
                             sent += 1
+                        self.last_sent_at = time.monotonic()
                         preroll.clear()
                         speaking = True
                     self.audio_chunk_ready.emit(data)
                     sent += 1
+                    self.last_sent_at = time.monotonic()
                 elif speaking:
                     # Silence after speech: keep streaming through the hangover
                     # window (covers word tails and brief pauses), then stop.
@@ -175,6 +182,7 @@ class AudioCapture(QObject):
                     if silent_run <= self._hangover_chunks:
                         self.audio_chunk_ready.emit(data)
                         sent += 1
+                        self.last_sent_at = time.monotonic()
                     else:
                         speaking = False
                         preroll.append(data)

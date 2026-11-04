@@ -26,6 +26,7 @@ from live_type import LiveTyper
 from server_manager import ServerManager
 from server_health import HealthProbe
 from transcript import Transcript
+import history
 from win_focus import (
     get_foreground_window, focus_window, is_own_window, is_window,
     get_window_title,
@@ -37,6 +38,24 @@ HISTORY_FILE = os.path.join(APP_DATA_DIR, "transcription_history.log")
 # server's last segments usually arrive before the box finishes hiding, and
 # every millisecond here is felt as lag between pressing Enter and seeing text.
 PASTE_START_DELAY_MS = 60
+
+# Confirm waits for the server to finish the last words before pasting -- see
+# _transcript_settled. Measured over 670 confirmed captures (Sep-Nov 2026): in
+# 23% the server was still adding text at the moment of confirming, and that
+# tail was lost. The wait never runs past FINISH_MAX_WAIT_S, and a second
+# Enter skips it.
+FINISH_MAX_WAIT_S = 1.5
+FINISH_POLL_MS = 50
+# No audio sent for this long: the speech gate has closed (the user stopped).
+FINISH_AUDIO_QUIET_S = 0.25
+# The text has not changed for this long.
+FINISH_TEXT_QUIET_S = 0.4
+# A server message that repeats the text this long after the last audio went
+# out comes from a decode that included that audio: nothing more is coming.
+FINISH_ANSWER_LAG_S = 0.5
+# Or nothing has moved at all for this long -- the server stops sending once
+# it has committed everything it holds, so a repeat may never come.
+FINISH_IDLE_S = 1.0
 
 # Milliseconds to wait after the Capture Box hides before restoring focus to
 # the target window. Windows needs a moment to finish tearing down the overlay
@@ -158,6 +177,15 @@ class WhisperTypeApp:
         self.is_capturing = False
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = 0.0
+        # Confirmed, with the mic still open while the server finishes the
+        # last words -- see on_capture_confirmed.
+        self._finishing = False
+        self._finish_started = 0.0
+        self._finish_text_at_confirm = ""
+        # time.monotonic() of the last server message that changed the text,
+        # and of the last one that repeated it unchanged.
+        self._last_text_change = 0.0
+        self._last_repeat_at = 0.0
         # The capture's text so far. The server only ever sends the tail
         # of it -- see transcript.py -- so it is assembled here.
         self._transcript = Transcript()
@@ -242,6 +270,12 @@ class WhisperTypeApp:
         # Connect signals
         self.capture_box.confirmed.connect(self.on_capture_confirmed)
         self.capture_box.cancelled.connect(self.on_capture_cancelled)
+        self.capture_box.recall_confirmed.connect(self.on_recall_confirmed)
+        self.capture_box.hurry_requested.connect(self.on_finish_hurried)
+        self.capture_box.set_history_source(lambda: history.recent(HISTORY_FILE))
+        self._finish_timer = QTimer()
+        self._finish_timer.setInterval(FINISH_POLL_MS)
+        self._finish_timer.timeout.connect(self._finish_tick)
         # Which window is in front, for as long as a capture is up. Decides
         # whether the box is faded (the user is elsewhere) and whether Enter
         # and Escape belong to the capture -- see _check_capture_foreground.
@@ -942,7 +976,12 @@ class WhisperTypeApp:
                 # again would duplicate it.
                 self.logger.debug("Dropping message from an interrupted session.")
                 return
-            self._transcript.update(message)
+            changed = self._transcript.update(message)
+            if isinstance(message, dict) and "segments" in message:
+                if changed:
+                    self._last_text_change = time.monotonic()
+                else:
+                    self._last_repeat_at = time.monotonic()
             full_text = self._capture_text()
 
             # An empty transcript leaves the box on its "Listening..."
@@ -964,6 +1003,11 @@ class WhisperTypeApp:
         # Ignore hotkey while settings window is open to prevent accidental activation during configuration
         if self.settings_window and self.settings_window.isVisible():
             self.logger.debug("Hotkey pressed while settings window open; ignoring.")
+            return
+        if self._finishing:
+            # Already confirmed and finishing the last words: paste now,
+            # rather than start a new capture over the top of it.
+            self._finish_capture("hurried")
             return
         if not self.is_capturing:
             self.is_capturing = True
@@ -1012,6 +1056,10 @@ class WhisperTypeApp:
         else:
             if self._capture_waiting_for_connection:
                 self.on_capture_cancelled()
+            elif self.capture_box.browsed_entry() is not None:
+                # An earlier dictation is on show: the hotkey pastes it, the
+                # same as Enter would.
+                self.capture_box.on_confirm()
             else:
                 self.on_capture_confirmed(self._capture_text())
 
@@ -1087,6 +1135,9 @@ class WhisperTypeApp:
         no transcript in it yet, only a status message, and confirming would
         paste that. The hotkey answers the same case the same way.
         """
+        if self._finishing:
+            self._finish_capture("hurried")
+            return
         if not self.is_capturing or not self.capture_box.isVisible():
             return
         if self._capture_waiting_for_connection:
@@ -1257,6 +1308,8 @@ class WhisperTypeApp:
         self._transcript.reset()
         self._banked_text = ""
         self._capture_interrupted = False
+        self._last_text_change = 0.0
+        self._last_repeat_at = 0.0
         payload_log.log_event("streaming_start")
         self.websocket_client.reset_eos()
         self.audio_capture.start_streaming()
@@ -1309,10 +1362,20 @@ class WhisperTypeApp:
             self.server_manager.ensure_running()
 
     def on_capture_confirmed(self, text):
+        """Confirm: let the server finish the last words, then paste.
+
+        Pasting the instant Enter lands lost the end of the sentence whenever
+        the server was still working on it. So the mic stays open (the speech
+        gate's hangover carries the word tails out) and the box spins until
+        the text settles -- at once when it already has, which is most of the
+        time, and never longer than FINISH_MAX_WAIT_S. Enter again, the
+        Confirm button again, or the hotkey pastes straight away.
+        """
         if not self.is_capturing:
             return
         self._foreground_timer.stop()
-        self._claim_capture_keys(False)
+        # Enter and Escape stay claimed while finishing, so a second Enter
+        # reaches us instead of the document. Released in _finish_capture.
         self.is_capturing = False
         self._capture_waiting_for_connection = False
         self._post_capture_grace_until = time.time() + 8.0
@@ -1321,13 +1384,85 @@ class WhisperTypeApp:
         # Marks the box settled before the work below, so nothing it does in
         # the meantime can treat this capture as still open.
         self.capture_box.set_busy(True)
+        self._finishing = True
+        self._finish_started = time.monotonic()
+        self._finish_text_at_confirm = self._capture_text()
+        self.logger.debug("Capture confirmed.")
+        if self._transcript_settled(self._finish_started):
+            self._finish_capture("settled")
+            return
+        self.capture_box.show_note("Finishing the last words \u00b7 Enter again to paste now")
+        self._finish_timer.start()
+
+    def _transcript_settled(self, now: float) -> bool:
+        """Whether the server has transcribed everything that was said."""
+        audio_last = self.audio_capture.last_sent_at
+        if now - audio_last < FINISH_AUDIO_QUIET_S:
+            return False
+        if now - self._last_text_change < FINISH_TEXT_QUIET_S:
+            return False
+        if self._last_repeat_at - audio_last >= FINISH_ANSWER_LAG_S:
+            return True
+        return now - max(audio_last, self._last_text_change) >= FINISH_IDLE_S
+
+    def _finish_tick(self):
+        now = time.monotonic()
+        if self._transcript_settled(now):
+            self._finish_capture("settled")
+        elif now - self._finish_started >= FINISH_MAX_WAIT_S:
+            self._finish_capture("timeout")
+
+    def on_finish_hurried(self):
+        """Enter (or Confirm) a second time while finishing: paste now."""
+        if self._finishing:
+            self._finish_capture("hurried")
+
+    def _finish_capture(self, reason: str):
+        """Close the mic and the session, and paste what the capture has."""
+        if not self._finishing:
+            return
+        self._finishing = False
+        self._finish_timer.stop()
+        self._claim_capture_keys(False)
+        waited = time.monotonic() - self._finish_started
+        added = len(self._capture_text()) - len(self._finish_text_at_confirm)
+        payload_log.log_event("confirm_finished", reason=reason,
+                              waited=round(waited, 3), chars_added=added)
+        self.logger.info("Confirm finished (%s) after %.2fs; %+d chars since confirm.",
+                         reason, waited, added)
         self.audio_capture.stop_streaming()
         self.websocket_client.send_eos()
         self._schedule_on_demand_disconnect()
         self._sync_icon_state()
-        self.logger.debug("Capture confirmed.")
         self._dismiss_capture_box()
         QTimer.singleShot(PASTE_START_DELAY_MS, self._do_paste)
+
+    def on_recall_confirmed(self, text):
+        """Enter on an earlier dictation: paste that, and end this capture.
+
+        What was being said is not pasted, but it is kept: it goes into the
+        history as NOT_PASTED, where Left finds it next time.
+        """
+        if not self.is_capturing:
+            return
+        self._foreground_timer.stop()
+        self._claim_capture_keys(False)
+        self.is_capturing = False
+        self._capture_waiting_for_connection = False
+        self._post_capture_grace_until = time.time() + 8.0
+        payload_log.log_event("capture_recalled")
+        self._probe_after_capture()
+        current = self._capture_text().strip()
+        self._undo_live_typing()
+        self.audio_capture.stop_streaming()
+        self.websocket_client.send_eos()
+        self._schedule_on_demand_disconnect()
+        self._sync_icon_state()
+        if current:
+            self.write_to_history(current, status="NOT_PASTED")
+        self.logger.debug("Pasting an earlier dictation (%d chars).", len(text))
+        self._dismiss_capture_box()
+        QTimer.singleShot(PASTE_START_DELAY_MS, lambda: self._do_paste(text))
 
     def _dismiss_capture_box(self):
         """Take the box down, on the way to pasting what it was holding.
@@ -1520,7 +1655,7 @@ class WhisperTypeApp:
             self.settings.get("capture_frost_levelling",
                               DEFAULT_SETTINGS["capture_frost_levelling"]))
 
-    def _do_paste(self):
+    def _do_paste(self, text=None):
         """Put the transcript on the clipboard and paste it into the target.
 
         Split across timer hops rather than run straight through: each stage
@@ -1530,7 +1665,7 @@ class WhisperTypeApp:
         """
         # Read the final transcription now -- the box may have updated between
         # confirm and here -- and log it before anything else can fail.
-        text = self._capture_text().strip()
+        text = (self._capture_text() if text is None else text).strip()
         self.write_to_history(text, status="CONFIRMED")
         if not text:
             self.logger.debug("Nothing transcribed; skipping paste.")
