@@ -1391,7 +1391,6 @@ class WhisperTypeApp:
         if self._transcript_settled(self._finish_started):
             self._finish_capture("settled")
             return
-        self.capture_box.show_note("Finishing the last words \u00b7 Enter again to paste now")
         self._finish_timer.start()
 
     def _transcript_settled(self, now: float) -> bool:

@@ -1,6 +1,5 @@
 import ctypes
 import sys
-from datetime import datetime
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -58,6 +57,8 @@ ANCHOR_OFFSET_Y = 18
 # up, but faded enough to read what is underneath it, and to say at a glance
 # that it is still listening rather than in the way.
 AWAY_OPACITY = 0.6
+# The older/newer arrows over the transcript's corner, in px.
+HISTORY_ARROW_SIZE = 22
 AWAY_FADE_MS = 180
 
 DEFAULT_FONT_SIZE_PX = 14
@@ -323,25 +324,6 @@ def _blurred(pixmap: QPixmap, radius: int, saturation: int,
     return out
 
 
-def _when(timestamp: str) -> str:
-    """A history timestamp the way a person says it: "15:10", "Mon 09:02"."""
-    try:
-        then = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return timestamp
-    now = datetime.now()
-    if then.date() == now.date():
-        return then.strftime("%H:%M")
-    if (now.date() - then.date()).days < 7:
-        return then.strftime("%a %H:%M")
-    return f"{then.strftime('%b')} {then.day} {then.strftime('%H:%M')}"
-
-
-def _status_note(status: str) -> str:
-    """Flag the entries that never reached a document."""
-    return {"CANCELLED": " (cancelled)", "NOT_PASTED": " (not pasted)"}.get(status, "")
-
-
 def _clamp_int(value, low: int, high: int) -> int:
     try:
         value = int(value)
@@ -591,11 +573,18 @@ class CaptureBox(QWidget):
         self.away_hint.setVisible(False)
         layout.addWidget(self.away_hint)
 
-        # Which earlier dictation is on show, shown only while one is.
-        self.history_hint = QLabel()
-        self.history_hint.setVisible(False)
-        self.history_hint.setWordWrap(True)
-        layout.addWidget(self.history_hint)
+        # Older / newer: two faint arrows over the transcript's bottom-right
+        # corner. Clickable, but mostly a reminder that Left and Right page
+        # through earlier dictations. A lit arrow means there is somewhere to
+        # go that way, so a lit "newer" also says an earlier one is on show.
+        self._older_arrow = QPushButton("\u2039", self.text_area)
+        self._newer_arrow = QPushButton("\u203a", self.text_area)
+        for arrow, step in ((self._older_arrow, 1), (self._newer_arrow, -1)):
+            arrow.setFocusPolicy(Qt.NoFocus)
+            arrow.setCursor(Qt.PointingHandCursor)
+            arrow.setFixedSize(HISTORY_ARROW_SIZE, HISTORY_ARROW_SIZE)
+            arrow.clicked.connect(lambda _=False, step=step: self.step_history(step))
+        self.text_area.viewport().installEventFilter(self)
 
         # Buttons
         button_row = QHBoxLayout()
@@ -1124,6 +1113,7 @@ class CaptureBox(QWidget):
     def _apply_text_color(self):
         """The box-wide ink. Children with a stylesheet of their own win."""
         self.setStyleSheet(f"color: {self._text_color}; font-size: 14px;")
+        self._sync_history_arrows()
 
     def _apply_accent_color(self):
         accent = QColor(self._accent_color)
@@ -1567,9 +1557,42 @@ class CaptureBox(QWidget):
         return self._history[self._history_index]
 
     def eventFilter(self, watched, event):
+        if watched is self.text_area.viewport():
+            # The viewport narrows when the scrollbar appears; the arrows
+            # follow its corner rather than sit on the scrollbar.
+            if event.type() == QEvent.Resize:
+                self._place_history_arrows()
+            return False
         if event.type() == QEvent.KeyPress and self._history_key(event):
             return True
         return super().eventFilter(watched, event)
+
+    def _place_history_arrows(self):
+        corner = self.text_area.viewport().geometry().bottomRight()
+        size = HISTORY_ARROW_SIZE
+        y = corner.y() - size - 2
+        self._newer_arrow.move(corner.x() - size - 2, y)
+        self._older_arrow.move(corner.x() - 2 * size - 2, y)
+
+    def _sync_history_arrows(self):
+        """Light each arrow that has somewhere to go."""
+        if not hasattr(self, "_older_arrow"):
+            return  # Colours are applied once during construction, before these exist.
+        ink = QColor(self._text_color)
+        older = self._history is None or self._history_index < len(self._history) - 1
+        newer = self._history_index >= 0
+        for arrow, lit in ((self._older_arrow, older), (self._newer_arrow, newer)):
+            arrow.setStyleSheet(
+                "QPushButton { color: rgba(%(r)d, %(g)d, %(b)d, %(a).2f);"
+                " background: transparent; border: none; border-radius: %(rad)dpx;"
+                " font-size: 18px; padding: 0 0 3px 0; }"
+                "QPushButton:hover { background: rgba(%(r)d, %(g)d, %(b)d, 0.10); }"
+                % {"r": ink.red(), "g": ink.green(), "b": ink.blue(),
+                   "a": 0.55 if lit else 0.15, "rad": HISTORY_ARROW_SIZE // 2})
+        visible = not self._preview_mode
+        self._older_arrow.setVisible(visible)
+        self._newer_arrow.setVisible(visible)
+        self._place_history_arrows()
 
     def _history_key(self, event) -> bool:
         """Step on Left/Right; True if the key was used."""
@@ -1594,41 +1617,15 @@ class CaptureBox(QWidget):
             return
         self._history_index = index
         entry = self.browsed_entry()
-        if entry is None:
-            self.history_hint.setVisible(False)
-            self._show_text(self._live_text)
-        else:
-            self._style_hint(self.history_hint)
-            self.history_hint.setText(
-                f"\u25cf Still recording  \u00b7  Earlier {index + 1} of {len(self._history)}, "
-                f"{_when(entry.timestamp)}{_status_note(entry.status)}  \u00b7  "
-                f"Enter pastes this  \u00b7  \u2190 older  \u2192 newer")
-            self.history_hint.setVisible(True)
-            self._show_text(entry.text)
-        self._settle_layout()
-        self._keep_on_screen()
-
-    def show_note(self, text: str):
-        """A line under the transcript, e.g. while confirm finishes up."""
-        self._style_hint(self.history_hint)
-        self.history_hint.setText(text)
-        self.history_hint.setVisible(bool(text))
-        self._settle_layout()
-        self._keep_on_screen()
+        self._show_text(self._live_text if entry is None else entry.text)
+        self._sync_history_arrows()
 
     def _reset_history_view(self):
         """Back to the live transcript, re-reading history on the next Left."""
         self._history = None
         self._history_index = -1
         self._live_text = ""
-        self.history_hint.setVisible(False)
-
-    def _style_hint(self, label):
-        ink = QColor(self._text_color)
-        label.setStyleSheet(
-            "QLabel { color: rgba(%d, %d, %d, 0.8); background: transparent;"
-            " font-size: 12px; padding: 0 2px; }"
-            % (ink.red(), ink.green(), ink.blue()))
+        self._sync_history_arrows()
 
     def keyPressEvent(self, event: QKeyEvent):
         if self._preview_mode:
