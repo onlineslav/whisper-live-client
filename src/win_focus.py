@@ -165,3 +165,19 @@ def focus_window(hwnd, attempts: int = 3, settle: float = 0.03) -> bool:
             time.sleep(0.005)
 
     return _user32.GetForegroundWindow() == hwnd
+
+
+# ayaNet's Pause islands (windows titled "ayaNet: dump", "ayaNet: guardian",
+# ...) have dictation of their own, built on the same server, and listen for
+# F13 themselves. The hotkey hook here doesn't swallow the key, so both would
+# start at once; this is how WhisperType steps aside.
+AYANET_WINDOW_PREFIX = "ayaNet: "
+AYANET_VOICE_KEY = "<f13>"
+
+
+def ayanet_takes_hotkey(hotkey: str, title: str) -> bool:
+    """True if this press belongs to ayaNet's own voice, not to a new capture:
+    the hotkey is F13 (the islands' voice key) and an ayaNet window is in front.
+    """
+    return (hotkey.replace(" ", "").lower() == AYANET_VOICE_KEY
+            and title.startswith(AYANET_WINDOW_PREFIX))

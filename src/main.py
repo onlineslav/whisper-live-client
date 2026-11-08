@@ -29,7 +29,7 @@ from transcript import Transcript
 import history
 from win_focus import (
     get_foreground_window, focus_window, is_own_window, is_window,
-    get_window_title,
+    get_window_title, ayanet_takes_hotkey,
 )
 
 HISTORY_FILE = os.path.join(APP_DATA_DIR, "transcription_history.log")
@@ -1003,6 +1003,12 @@ class WhisperTypeApp:
         # Ignore hotkey while settings window is open to prevent accidental activation during configuration
         if self.settings_window and self.settings_window.isVisible():
             self.logger.debug("Hotkey pressed while settings window open; ignoring.")
+            return
+        if not self.is_capturing and ayanet_takes_hotkey(
+                self.settings.get("capture_hotkey", ""),
+                get_window_title(get_foreground_window())):
+            # An ayaNet island is in front: its own voice takes this press.
+            self.logger.debug("Hotkey pressed in an ayaNet island; its own voice has it.")
             return
         if self._finishing:
             # Already confirmed and finishing the last words: paste now,
